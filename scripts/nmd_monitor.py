@@ -130,16 +130,48 @@ def _run(argv, timeout):
 
 
 _SOCKET_CODE = '''import socket,ssl,sys,time,json
-kind,host,port,timeout=sys.argv[1:]; t=time.monotonic(); socket.setdefaulttimeout(float(timeout))
+kind,host,port,timeout=sys.argv[1:]
+start=time.monotonic(); deadline=start+float(timeout); s=None
+def remaining():
+ budget=deadline-time.monotonic()
+ if budget<=0: raise socket.timeout()
+ return budget
 try:
- a=socket.getaddrinfo(host,int(port) if port else None,type=socket.SOCK_STREAM); d=time.monotonic()-t
- if kind=='dns': print(json.dumps({'dns':d})); sys.exit(0)
- s=socket.create_connection((host,int(port)),timeout=float(timeout)); c=time.monotonic()-t
- if kind=='tls': s=ssl.create_default_context().wrap_socket(s,server_hostname=host)
- print(json.dumps({'dns':d,'connect':c,'total':time.monotonic()-t})); s.close()
+ # getaddrinfo itself is bounded by the parent process deadline.
+ addresses=socket.getaddrinfo(host,int(port) if port else None,type=socket.SOCK_STREAM)
+ timings={'dns':time.monotonic()-start}
+ remaining()
+ if kind=='dns': print(json.dumps(timings)); sys.exit(0)
+ error=OSError('no_addresses')
+ for family,socktype,proto,_,address in addresses:
+  remaining()
+  try:
+   s=socket.socket(family,socktype,proto)
+   s.settimeout(remaining()); s.connect(address)
+   remaining()
+   break
+  except OSError as exc:
+   if s is not None: s.close()
+   s=None; error=exc
+ if s is None:
+  remaining()
+  raise error
+ timings['connect']=time.monotonic()-start
+ if kind=='tls':
+  context=ssl.create_default_context()
+  s.settimeout(remaining())
+  s=context.wrap_socket(s,server_hostname=host)
+  remaining()
+  timings['tls']=time.monotonic()-start
+ timings['total']=time.monotonic()-start
+ print(json.dumps(timings))
 except socket.gaierror: sys.exit(6)
+except (socket.timeout,TimeoutError): sys.exit(28)
+except ssl.SSLCertVerificationError: sys.exit(60)
 except ssl.SSLError: sys.exit(35)
 except (OSError,ValueError): sys.exit(7)
+finally:
+ if s is not None: s.close()
 '''
 
 

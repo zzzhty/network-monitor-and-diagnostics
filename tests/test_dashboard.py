@@ -1,8 +1,10 @@
 """Dependency-free UI guardrails, plus optional actual Chromium fixture tests.
 
-Browser CI: npm install --no-save --prefix web playwright@1.57.0
-           web/node_modules/.bin/playwright install --with-deps chromium
-           node web/tests/dashboard.spec.cjs
+Browser CI uses mcr.microsoft.com/playwright:v1.57.0-noble with playwright@1.57.0.
+Local setup: npm install --no-save --package-lock=false --prefix web playwright@1.57.0
+             web/node_modules/.bin/playwright install chromium
+             node web/tests/dashboard.spec.cjs
+Linux hosts without browser system dependencies also need install --with-deps.
 Local overrides: PLAYWRIGHT_MODULE and CHROMIUM_PATH.
 No real network probes or changes: the fixture server binds loopback only.
 """
