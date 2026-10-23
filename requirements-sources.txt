@@ -1,0 +1,2 @@
+# Optional source import/render only; monitor and legacy deployment remain stdlib.
+PyYAML==6.0.3

@@ -1,0 +1,21 @@
+# 二进制资产由 fetch-assets.sh 下载, 不入库
+mihomo.deb
+geoip.metadb
+GeoSite.dat
+__pycache__/
+
+# Local diagnostic state and browser test dependencies
+node_modules/
+*.sqlite3
+*.sqlite3-*
+
+# Desktop shell build artifacts
+apps/desktop/src-tauri/target/
+
+# Per-host legacy endpoints stay outside Git.
+nmd-local.env
+nmd-local.env.*
+!examples/nmd-local.env.example
+
+# Tauri regenerates these schemas during builds.
+/apps/desktop/src-tauri/gen/

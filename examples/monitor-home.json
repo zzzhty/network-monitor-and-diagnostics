@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "retention_hours": 168,
+  "max_samples": 100000,
+  "probes": [
+    {
+      "id": "home-gateway-tcp",
+      "type": "tcp",
+      "target": "192.0.2.1:443",
+      "path": "system",
+      "enabled": false
+    },
+    {
+      "id": "home-service-http",
+      "type": "http",
+      "target": "http://198.51.100.10/health",
+      "path": "system",
+      "enabled": false
+    }
+  ]
+}

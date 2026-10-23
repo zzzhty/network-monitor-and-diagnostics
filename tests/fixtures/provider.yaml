@@ -1,0 +1,32 @@
+# Synthetic only. Local settings in a full Clash response must never be imported.
+mode: global
+external-controller: 0.0.0.0:9999
+secret: SYNTHETIC_UNTRUSTED_CONTROLLER
+dns:
+  nameserver: [192.0.2.53]
+tun:
+  route-exclude-address: []
+rules: [MATCH,DIRECT]
+proxy-groups:
+  - {name: dangerous, type: fallback, proxies: [DIRECT]}
+proxies:
+  - name: https://label.example.invalid/SYNTHETIC_LABEL_SECRET
+    type: socks5
+    server: 192.0.2.20
+    port: 1080
+    username: SYNTHETIC_USER
+    password: SYNTHETIC_PASSWORD
+    interface-name: tailscale0
+    routing-mark: 233
+    dialer-proxy: dangerous
+  - name: same-label-as-other-provider
+    type: vless
+    server: vless.example.invalid
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000000
+    tls: true
+    servername: tls.example.invalid
+    network: ws
+    ws-opts:
+      path: /example
+      headers: {Host: tls.example.invalid}

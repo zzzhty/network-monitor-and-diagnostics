@@ -1,0 +1,117 @@
+# ============================================================
+# mihomo 本机分流网关模板 (Ubuntu 24.04)
+# 架构: TUN 全局接管 → CN/私网/tailnet 直连, 其余经 VPS socks5 出海
+# 上游出口: 203.0.113.20:1080 为文档占位；由 NMD_VPS_TS_IP 注入真实 Tailnet 地址。
+# 运维手册: 仓库内 runbook.md
+# ============================================================
+
+mode: rule
+log-level: info
+ipv6: false
+
+# 性能优化
+tcp-concurrent: true
+unified-delay: true
+
+# 备用手动代理入口 (调试用; TUN 已覆盖全局流量)
+mixed-port: 7890
+bind-address: 127.0.0.1
+external-controller: 127.0.0.1:9090
+
+# geodata 走代理自动更新 (GitHub 经 VPS 可达)
+geo-auto-update: true
+geo-update-interval: 72
+
+tun:
+  enable: true
+  stack: mixed
+  device: mihomo
+  auto-route: true
+  # 保持低于 Tailscale 的 5210–5270 规则优先级；两者不要共用路由表。
+  iproute2-table-index: 2022
+  iproute2-rule-index: 9000
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+  # tailnet、bootstrap DNS 和官方控制/日志网段不能依赖 TUN。
+  # 公网范围来源见 runbook；DERP/其他节点传输由 tailscaled 的 fwmark 绕过。
+  route-exclude-address:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+    - fc00::/7
+    - fe80::/10
+    - 100.64.0.0/10
+    - fd7a:115c:a1e0::/48
+    - 203.0.113.10/32
+    - 223.5.5.5/32
+    - 119.29.29.29/32
+    - 192.200.0.0/24
+    - 199.165.136.0/24
+    - 2606:b740:49::/48
+    - 2606:b740:1::/48
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    # NetworkManager 绑定物理网卡探测，无法访问 TUN 内的 fake-ip。
+    - 'connectivity-check.ubuntu.com'
+    - '+.tailscale.com'
+    - '+.tailscale.io'
+    - '+.ts.net'
+    - '+.lan'
+    - '+.local'
+    - '+.home.arpa'
+    - 'localhost.*'
+  # MagicDNS 设备名继续可用 (绑定 tailscale0 接口, 绕开 物理网卡 默认绑定)
+  nameserver-policy:
+    '+.ts.net': '100.100.100.100#tailscale0'
+  # 直连域名用国内公共 DNS 解析; 海外域名以域名形式送 VPS 远端解析(无污染)
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80]
+
+proxies:
+  - name: VPS
+    type: socks5
+    server: 203.0.113.20
+    port: 1080
+    udp: true
+    # 关键修复: 显式绑定 tailscale0, 否则 auto-detect-interface 绑定 物理网卡
+    # 导致 100.x 尾网地址 dial i/o timeout
+    interface-name: tailscale0
+
+rules:
+  # 系统联网检测直连，不依赖 VPS 是否就绪。
+  - DOMAIN,connectivity-check.ubuntu.com,DIRECT
+  # 即使 VPS 失效，Tailscale 登录、控制和 DERP 也必须直连。
+  - PROCESS-NAME,tailscaled,DIRECT
+  - DOMAIN-SUFFIX,tailscale.com,DIRECT
+  - DOMAIN-SUFFIX,tailscale.io,DIRECT
+  # tailnet 设备互访 & VPS 隧道端点 → 直连 (双保险, 路由层已排除)
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR6,fd7a:115c:a1e0::/48,DIRECT,no-resolve
+  - IP-CIDR,192.200.0.0/24,DIRECT,no-resolve
+  - IP-CIDR,199.165.136.0/24,DIRECT,no-resolve
+  # 国内域名 → 直连
+  - GEOSITE,cn,DIRECT
+  # 私网 (LAN/docker) → 直连
+  - GEOIP,private,DIRECT,no-resolve
+  # 国内 IP → 直连
+  - GEOIP,CN,DIRECT
+  # 其余全部经 VPS 出海
+  - MATCH,VPS
