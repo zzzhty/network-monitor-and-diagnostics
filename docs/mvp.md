@@ -91,6 +91,14 @@ mihomo。path=proxy 只用于 HTTP 探测且需要显式 proxy 地址，不继�
 DNS / TCP / TLS 只支持 system 路径。URL 不支持凭据、查询参数或片段；不要在配置中
 放密码或令牌。HTTP 探测需要 /usr/bin/curl，其余探测使用 Python 标准库。
 
+DNS / TCP / TLS 每次探测只调用一次系统解析；TCP 按解析结果顺序尝试多个地址，
+共用 `timeout_seconds` 总预算，TLS 握手只使用剩余预算。系统解析调用无法由 socket
+超时中断，仍由父进程在 `timeout_seconds + 0.5` 秒终止整个探测进程组。
+成功时的 `dns`、`connect`、`tls`、`total` 都是从探测开始算起的累计秒数，与 HTTP
+计时含义一致；`tls - connect` 才是 TLS 阶段耗时。DNS-only 保留单独的 `dns` 字段。
+超时报告 `timeout`，证书校验失败报告 `tls_verify_error`，其他握手错误报告 `tls_error`；
+错误结果不保存目标、底层异常文本或部分计时。
+
 ## 解释结果
 
 不能把“未能观测”当成“网络断开”。缺少系统命令、权限不足、未配置的目标、禁用探测、
@@ -205,6 +213,20 @@ user/system 切换需按 [迁移 runbook](../runbook.md#旧安装与-scope-迁�
 
 本地离线测试应只使用临时目录、假命令结果、假探测和本机测试服务；不要运行真实
 网络故障演练来验证界面。本版不因离线测试通过就宣称实际部署成功。
+
+`python3 -m unittest discover -s tests -p test_socket_probe.py -v` 运行真实隔离探测
+子进程，但用 fixture 替换 DNS、socket 与 SSL 边界，不解析或连接外部目标；覆盖错误
+分类、多地址回退、累计计时、共享预算及阻塞解析时的父进程终止。
+
+浏览器 CI 使用官方 `mcr.microsoft.com/playwright:v1.57.0-noble` 预装浏览器及系统依赖，
+与 npm 的 `playwright@1.57.0` 一起固定版本（升级需同步修改并验证）。安装依赖限时
+3 分钟，预装浏览器检查限时 1 分钟，fixture 限时 3 分钟，整个 job 限时 15 分钟，
+为容器启动和证据上传留出时间。`dashboard-browser-evidence` 保留安装、浏览器版本/
+路径、测试日志和已生成的合成截图 7 天；失败不会因 `tee` 或上传步骤变成成功。
+容器拉取失败发生在步骤开始前，需查看 Actions 自带的初始化日志。
+本地可按 `tests/test_dashboard.py` 的说明安装相同版本并运行
+`node web/tests/dashboard.spec.cjs`；fixture 只使用回环 HTTP 服务和合成数据。
+本地通过不证明修改后的 GitHub Actions 已运行；未推送时远端 CI 仍待验证。
 
 先前的 [CI 运行 39197765374](https://github.com/zzzhty/network-monitor-and-diagnostics/actions/runs/39197765374)
 记录了原诊断 MVP 的 Linux 与 Chromium 检查；它不证明本次 scope 改动已完成真实系统安装
