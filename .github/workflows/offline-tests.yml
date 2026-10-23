@@ -85,7 +85,7 @@ jobs:
       run:
         shell: bash
     env:
-      BROWSER_ARTIFACTS: ${{ runner.temp }}/nmd-browser
+      BROWSER_ARTIFACTS: /tmp/nmd-browser
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -120,13 +120,13 @@ jobs:
             node web/tests/dashboard.spec.cjs
           } 2>&1 | tee "$BROWSER_ARTIFACTS/fixtures.log"
         env:
-          DASHBOARD_SCREENSHOT: ${{ runner.temp }}/nmd-browser/dashboard.png
+          DASHBOARD_SCREENSHOT: /tmp/nmd-browser/dashboard.png
       - name: Save browser stage logs and synthetic screenshot
         if: always()
         timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: dashboard-browser-evidence
-          path: ${{ runner.temp }}/nmd-browser/
+          path: /tmp/nmd-browser/
           retention-days: 7
           if-no-files-found: warn
