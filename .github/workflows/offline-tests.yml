@@ -43,7 +43,7 @@ jobs:
           node --check web/app.js
           python3 -m compileall -q scripts tests
       - name: Synthetic macOS diagnostics and loopback API
-        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests:scripts python3 -m unittest test_macos test_monitor test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state -v
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests:scripts python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state -v
         # No system metadata collection, external probes, source secrets, service install or new dependencies.
   desktop-shell:
     strategy:
@@ -75,26 +75,58 @@ jobs:
           cargo test --locked
   dashboard-browser:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # Keep the image and npm package versions identical. Browsers and their OS
+    # dependencies are already installed; no apt or browser download on each run.
+    container:
+      image: mcr.microsoft.com/playwright:v1.57.0-noble
+      options: --init --ipc=host
+    defaults:
+      run:
+        shell: bash
+    env:
+      BROWSER_ARTIFACTS: /tmp/nmd-browser
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Install pinned browser test dependency
-        run: npm install --no-save --package-lock=false --prefix web playwright@1.57.0
-      - name: Install Chromium for isolated UI tests
-        run: web/node_modules/.bin/playwright install --with-deps chromium
-      - name: JavaScript syntax and browser fixtures
+        timeout-minutes: 3
         run: |
-          node --check web/app.js
-          node web/tests/dashboard.spec.cjs
+          mkdir -p "$BROWSER_ARTIFACTS"
+          {
+            date -u
+            node --version
+            npm --version
+            npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund --fetch-retries=1 --fetch-timeout=60000 --prefix web playwright@1.57.0
+          } 2>&1 | tee "$BROWSER_ARTIFACTS/install.log"
+      - name: Verify preinstalled Chromium and package version
+        timeout-minutes: 1
+        run: |
+          node - <<'JS' 2>&1 | tee "$BROWSER_ARTIFACTS/browser.log"
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          assert.equal(require('./web/node_modules/playwright/package.json').version, '1.57.0');
+          const executable = require('./web/node_modules/playwright').chromium.executablePath();
+          console.log({ playwright: '1.57.0', executable });
+          assert.ok(fs.existsSync(executable), 'Matching Chromium must be preinstalled');
+          JS
+      - name: JavaScript syntax and browser fixtures
+        timeout-minutes: 3
+        run: |
+          {
+            date -u
+            node --check web/app.js
+            node web/tests/dashboard.spec.cjs
+          } 2>&1 | tee "$BROWSER_ARTIFACTS/fixtures.log"
         env:
-          DASHBOARD_SCREENSHOT: /tmp/nmd-dashboard-mvp.png
-      - name: Save synthetic dashboard screenshot
+          DASHBOARD_SCREENSHOT: /tmp/nmd-browser/dashboard.png
+      - name: Save browser stage logs and synthetic screenshot
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
-          name: dashboard-screenshot
-          path: /tmp/nmd-dashboard-mvp.png
+          name: dashboard-browser-evidence
+          path: /tmp/nmd-browser/
           retention-days: 7
           if-no-files-found: warn
