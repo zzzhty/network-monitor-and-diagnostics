@@ -1,0 +1,4 @@
+{
+  "kind": "subscription",
+  "url": "https://subscription.example.invalid/clash?token=SYNTHETIC_ONLY"
+}

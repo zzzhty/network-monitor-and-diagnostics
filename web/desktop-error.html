@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>NMD · 本地面板不可用</title>
+<style>
+body { font: 16px/1.7 system-ui, sans-serif; color: #e9edf8; background: #182033; margin: 3rem; max-width: 42rem; }
+a { display: inline-block; color: #182033; background: #a8bbff; padding: .5rem 1.2rem; border-radius: .5rem; margin: 1rem 1rem 0 0; text-decoration: none; }
+code { color: #c8d5ff; }
+</style>
+</head>
+<body>
+<h1>本地面板未能启动</h1>
+<p>请检查窗口标题中的原因。确认 NMD CLI 已安装；自定义安装时，将 <code>nmd</code> 放在桌面程序同一目录，或确保它位于 PATH 中。</p>
+<p>也可在终端运行 <code>nmd gui</code> 查看启动错误。检查本地端口 8765–8796 是否可用，再选择重试。重试仅重新连接或启动本地面板；不会启动监控或修改网络设置。</p>
+<p>此错误页面随程序提供，无需访问任何远端页面。</p>
+<a href="nmd-startup://retry">重试连接</a>
+<a href="nmd-startup://quit">退出</a>
+</body>
+</html>

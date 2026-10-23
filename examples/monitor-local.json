@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "retention_hours": 168,
+  "max_samples": 100000,
+  "probes": []
+}

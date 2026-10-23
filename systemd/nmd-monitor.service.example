@@ -1,0 +1,27 @@
+# EXAMPLE ONLY: not installed or enabled by any MVP command.
+# Replace REPLACE_WITH_MONITOR_USER / GROUP with an existing dedicated non-root account.
+# Replace /ABSOLUTE/PATH/TO/REPO with a reviewed, readable deployment directory.
+# Do not use this template unchanged. No real network deployment is performed.
+# New NMD state directory; old monitor data is not migrated automatically.
+[Unit]
+Description=Network Monitor & Diagnostics (NMD) local monitor (example)
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_MONITOR_USER
+Group=REPLACE_WITH_MONITOR_GROUP
+ExecStart=/usr/bin/python3 /ABSOLUTE/PATH/TO/REPO/scripts/observability.py monitor run --config /ABSOLUTE/PATH/TO/REPO/examples/monitor-local.json --state-dir /var/lib/nmd-monitor
+Restart=on-failure
+RestartSec=5s
+StateDirectory=nmd-monitor
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nmd-monitor
+
+[Install]
+WantedBy=multi-user.target

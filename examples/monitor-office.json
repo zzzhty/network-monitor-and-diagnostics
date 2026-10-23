@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "retention_hours": 168,
+  "max_samples": 100000,
+  "probes": [
+    {
+      "id": "office-service-tls",
+      "type": "tls",
+      "target": "192.0.2.20:443",
+      "path": "system",
+      "enabled": false
+    },
+    {
+      "id": "office-service-http",
+      "type": "http",
+      "target": "http://198.51.100.20/health",
+      "path": "system",
+      "enabled": false
+    }
+  ]
+}

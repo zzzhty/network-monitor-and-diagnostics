@@ -1,0 +1,100 @@
+name: Offline regression tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Shell syntax
+        run: |
+          for script in install.sh fetch-assets.sh nmd local-setup.sh vps-setup.sh; do
+            bash -n "$script"
+          done
+      - name: Python syntax
+        run: python3 -m compileall -q scripts tests
+      - name: Source YAML dependency
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
+          echo "PYTHONPATH=$RUNNER_TEMP/nmd-source-deps" >> "$GITHUB_ENV"
+      - name: Isolated regression tests
+        # live_proxy_failure.py is intentionally excluded: it mutates real networking.
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+  macos-tests:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Portable syntax
+        run: |
+          bash -n nmd
+          node --check web/app.js
+          python3 -m compileall -q scripts tests
+      - name: Synthetic macOS diagnostics and loopback API
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests:scripts python3 -m unittest test_macos test_monitor test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state -v
+        # No system metadata collection, external probes, source secrets, service install or new dependencies.
+  desktop-shell:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Tauri Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+      - name: Ensure Rust toolchain
+        if: runner.os != 'Linux'
+        run: command -v cargo >/dev/null 2>&1 || rustup default stable
+      - name: Rust checks (locked)
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+  dashboard-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned browser test dependency
+        run: npm install --no-save --package-lock=false --prefix web playwright@1.57.0
+      - name: Install Chromium for isolated UI tests
+        run: web/node_modules/.bin/playwright install --with-deps chromium
+      - name: JavaScript syntax and browser fixtures
+        run: |
+          node --check web/app.js
+          node web/tests/dashboard.spec.cjs
+        env:
+          DASHBOARD_SCREENSHOT: /tmp/nmd-dashboard-mvp.png
+      - name: Save synthetic dashboard screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-screenshot
+          path: /tmp/nmd-dashboard-mvp.png
+          retention-days: 7
+          if-no-files-found: warn

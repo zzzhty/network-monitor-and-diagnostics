@@ -1,0 +1,6 @@
+{
+  "kind": "proxy",
+  "display_name": "公网 VPS 示例",
+  "server": "192.0.2.20",
+  "port": 1080
+}

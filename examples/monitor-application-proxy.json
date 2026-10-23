@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "retention_hours": 168,
+  "max_samples": 100000,
+  "probes": [
+    {
+      "id": "application-system-http",
+      "type": "http",
+      "target": "http://203.0.113.10/health",
+      "path": "system",
+      "enabled": false
+    },
+    {
+      "id": "application-proxy-http",
+      "type": "http",
+      "target": "http://203.0.113.10/health",
+      "path": "proxy",
+      "proxy": "socks5h://127.0.0.1:7890",
+      "enabled": false
+    }
+  ]
+}

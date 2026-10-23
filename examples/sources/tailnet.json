@@ -1,0 +1,7 @@
+{
+  "kind": "tailnet",
+  "server": "<YOUR_TAILNET_IPV4>",
+  "port": 1080,
+  "udp": true,
+  "expected_egress_ip": "198.51.100.10"
+}

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve the checkout through symlinks using the same Python required by the CLI.
+# BSD readlink has no portable -f; preserve stdin and arguments as separate values.
+exec python3 -c 'import os, sys
+script = os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "scripts", "manager.py")
+os.execv(sys.executable, [sys.executable, script, *sys.argv[2:]])' "${BASH_SOURCE[0]}" "$@"
