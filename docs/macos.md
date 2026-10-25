@@ -23,7 +23,7 @@ cd ~/Projects/network-monitor-and-diagnostics
 
 只读面板与采集器独立。启动普通 `gui` 或刷新页面不会启动采集；`monitor status` 只读取
 已有 SQLite，状态不存在时返回 `no_data` 且不创建目录。Linux 的新出口控制界面与自动故障切换保留。macOS 和 demo 的控制按钮禁用，
-macOS 拒绝三个控制 POST 端点及 `monitor run --sources-dir`，不会执行来源自动评估。
+macOS 拒绝通道保存/重命名、策略、测速和选择等五类 POST 端点及 `monitor run --sources-dir`，不会执行来源自动评估。
 macOS 的 `/api/sources` 固定为
 未配置状态，不读取私有来源注册表或查询控制器。
 

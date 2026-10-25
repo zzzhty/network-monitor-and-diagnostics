@@ -58,6 +58,12 @@ class ScopeInstallTests(unittest.TestCase):
         self.config = self.paths["config_dir"]
         self.state = self.paths["state_dir"]
         self.unit = self.paths["unit_file"]
+        # Existing parent directories are fixture inputs, not installer output.
+        # Model a private user home independently of the invoking shell's umask.
+        for parent in (self.base / "user", self.base / "user/.config",
+                       self.base / "user/.config/systemd",
+                       self.base / "user/.local", self.base / "user/.local/state"):
+            parent.mkdir(mode=0o700)
         self.path_patch = patch.object(install_scope, "paths", return_value=self.paths)
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
@@ -178,6 +184,7 @@ class ScopeInstallTests(unittest.TestCase):
         self.config.mkdir(parents=True, mode=0o700)
         config = self.config / "monitor.json"
         config.write_text('{"probes":"not-a-list"}')
+        config.chmod(0o600)
         with self.assertRaises(ValueError):
             self.install()
         self.assertEqual(config.read_text(), '{"probes":"not-a-list"}')

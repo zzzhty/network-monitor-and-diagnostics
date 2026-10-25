@@ -184,6 +184,51 @@ class StoreTests(unittest.TestCase):
         for t in range(120): self.store.record([row('success')], t)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM samples').fetchone()[0], 100)
 
+    def test_sample_retention_intersects_time_with_newest_ids(self):
+        self.store.config.update(max_samples=100, retention_hours=24)
+        now = 200000
+        cutoff = now - 24 * 3600
+        for count in (0, 1, 99, 100, 101, 207):
+            for offsets in ((1,), (-1,), (-1, 0, 1), (1, 0, -1)):
+                with self.subTest(count=count, offsets=offsets):
+                    # Sparse ids and out-of-order times model pruned history
+                    # and clock changes. The two retention rules intersect.
+                    rows = [(3 * i + 5, cutoff + offsets[i % len(offsets)],
+                             dict(row('success'), id=f'fixture-{i}')) for i in range(count)]
+                    self.store.db.execute('DELETE FROM samples')
+                    self.store.db.executemany('INSERT INTO samples VALUES(?,?,?)',
+                                             [(key, ts, json.dumps(payload)) for key, ts, payload in rows])
+                    self.store.record([], now=now)
+                    actual = [(key, ts, json.loads(payload)) for key, ts, payload in
+                              self.store.db.execute('SELECT * FROM samples ORDER BY id')]
+                    self.assertEqual(actual, [r for r in rows[-100:] if r[1] >= cutoff])
+                    # Clearing all rows must not poison the next insertion.
+                    self.store.record([], now=now + 2 * 86400)
+                    self.store.record([row('success')], now=now + 2 * 86400 + 1)
+                    self.assertEqual(self.store.db.execute('SELECT count(*) FROM samples').fetchone()[0], 1)
+
+    def test_legacy_samples_survive_repeated_open_and_retention(self):
+        now = 200000
+        self.store.config.update(max_samples=100, retention_hours=24)
+        self.store.record([row('success')], now=now)
+        self.store.record([row('failure')], now=now + 1)
+        # Model a v1 database created before the optional timestamp index.
+        self.store.db.execute('DROP INDEX IF EXISTS samples_ts')
+        columns = self.store.db.execute('PRAGMA table_info(samples)').fetchall()
+        self.store.close()
+        before = m.read_snapshot(self.path)['samples']
+        for _ in range(2):
+            with patch.object(m.time, 'time', return_value=now + 2):
+                self.store = m.Store(self.path, {'max_samples': 100, 'retention_hours': 24})
+            self.assertEqual(self.store.db.execute('PRAGMA table_info(samples)').fetchall(), columns)
+            self.assertEqual(self.store.meta('schema_version'), 1)
+            self.assertEqual(m.read_snapshot(self.path)['samples'], before)
+            self.store.close()
+        self.store = m.Store(self.path, {'max_samples': 100, 'retention_hours': 24})
+        self.store.record([row('success')], now=now + 86401)
+        self.assertEqual([r[0] for r in self.store.db.execute('SELECT ts FROM samples ORDER BY id')],
+                         [now + 1, now + 86401])
+
     def test_private_and_exclusive(self):
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o700)
         self.assertEqual((self.path / 'monitor.sqlite3').stat().st_mode & 0o777, 0o600)

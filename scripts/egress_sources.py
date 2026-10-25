@@ -50,6 +50,10 @@ class SourceError(RuntimeError):
     """Messages are fixed error codes: never interpolate untrusted inputs."""
 
 
+class ControllerProbeError(SourceError):
+    """No trustworthy node result; keep the public delay error opaque."""
+
+
 def encode(value):
     return json.dumps(value, ensure_ascii=True, sort_keys=True, allow_nan=False).encode()
 
@@ -512,15 +516,22 @@ class Controller:
             conn.request("GET", target, headers={"Authorization": "Bearer " + self.secret})
             response = conn.getresponse()
             data = response.read(MAX_BYTES + 1)
-            if response.status != 200 or len(data) > MAX_BYTES:
+            if len(data) > MAX_BYTES:
+                raise ControllerProbeError("delay_test_failed")
+            # Pinned mihomo v1.19.30 getProxyDelay reports node failure/timeout
+            # as 503/504. Authentication, missing routes and malformed replies
+            # are controller faults, not evidence against a candidate node.
+            if response.status in (503, 504):
                 raise SourceError("delay_test_failed")
+            if response.status != 200:
+                raise ControllerProbeError("delay_test_failed")
             value = json.loads(data)
             if (not isinstance(value, dict) or type(value.get("delay")) not in (int, float)
                     or not math.isfinite(value["delay"]) or value["delay"] < 0):
-                raise SourceError("delay_test_failed")
+                raise ControllerProbeError("delay_test_failed")
             return int(round(value["delay"]))
         except (OSError, ValueError, http.client.HTTPException):
-            raise SourceError("delay_test_failed") from None
+            raise ControllerProbeError("delay_test_failed") from None
         finally:
             conn.close()
 
@@ -783,10 +794,15 @@ def auto_evaluate(directory, runtime, emit):
         try:
             client.delay("nmd-" + pin["source"], pin["node"])
             return True
-        except SourceError:
-            return False
+        except ControllerProbeError:
+            return None
+        except SourceError as exc:
+            return False if str(exc) == "delay_test_failed" else None
     primary_ok = healthy(roles["primary"])
     secondary_ok = healthy(roles["secondary"])
+    if primary_ok is None or secondary_ok is None:
+        emit("controller_unreachable", {})
+        return runtime
     if not primary_ok and not secondary_ok:
         if not runtime.get("both_unhealthy"):
             emit("both_unhealthy", {})

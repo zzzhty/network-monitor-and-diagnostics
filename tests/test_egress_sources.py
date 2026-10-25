@@ -292,7 +292,7 @@ class LocalControllerFixture(SourceFixture):
                 if "/healthcheck" in self.path:
                     test.delay_requests.append((self.path, self.headers.get("Authorization")))
                     node = unquote(self.path.split("?")[0].split("/")[4])
-                    code = 408 if node in test.failing_nodes else test.delay_code
+                    code = 504 if node in test.failing_nodes else test.delay_code
                     self.send_response(code)
                     self.end_headers()
                     self.wfile.write(e.encode({"delay": test.delay_ms, "message": "SYNTHETIC_DELAY_ERROR"}))
@@ -372,7 +372,7 @@ class ControllerTests(LocalControllerFixture):
         with self.assertRaisesRegex(e.SourceError, "node_not_found"):
             e.delay_test(self.directory, "DIRECT")
         self.assertEqual(len(self.delay_requests), 1)
-        self.delay_code = 408
+        self.delay_code = 504
         with self.assertRaisesRegex(e.SourceError, "delay_test_failed"):
             e.delay_test(self.directory, chosen)
         with self.assertRaisesRegex(e.SourceError, "invalid_delay_timeout"):
@@ -726,6 +726,7 @@ class InstalledCLITests(SourceFixture):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         subprocess.run(["git", "init", "--quiet", str(self.checkout)], check=True, capture_output=True)
         self.saved_config = self.base / "recorded-config"
+        self.saved_config.mkdir(mode=0o700)
         for key, value in (("home", self.checkout), ("scope", "user"), ("configDir", self.saved_config),
                            ("stateDir", self.base / "recorded-state")):
             manager.setting(self.checkout, key, value)

@@ -1,11 +1,13 @@
 """Automatic state regressions: private JSON fixtures and mocked controller only."""
 from contextlib import contextmanager, redirect_stdout
+import copy
+import http.client
 import io
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -42,6 +44,7 @@ class AutomaticStateTests(unittest.TestCase):
         self.failing = set()
         self.during_delay = None
         self.uncertain = False
+        self.real_controller = e.Controller
         test = self
         class Controller:
             def current(self):
@@ -75,6 +78,71 @@ class AutomaticStateTests(unittest.TestCase):
         runtime,_=self.evaluate(runtime)
         self.assertEqual(self.puts, [])
         return runtime
+
+    def test_controller_probe_faults_preserve_counters_and_never_switch(self):
+        runtime = self.ready_to_fail_over()
+        expected = copy.deepcopy(runtime)
+        before = self.store.path.read_bytes()
+        client = self.real_controller(self.store.load())
+        # Execute the real delay parser while current()/PUT remain mocked.
+        # Node errors are only the pinned core's HTTP 503/504 responses.
+        faults = [OSError('SYNTHETIC_SECRET'), http.client.HTTPException('SYNTHETIC_SECRET'),
+                  (401, b'{}'), (404, b'{}'), (500, b'{}'), (200, b'not json'),
+                  (200, b'{"delay":true}'), (200, b'{"delay":-1}'),
+                  (200, b'x' * (e.MAX_BYTES + 1))]
+        for fault in faults:
+            for affected in ({self.primary}, {self.secondary}, {self.primary, self.secondary}):
+                with self.subTest(fault=type(fault).__name__, affected=affected):
+                    self.actual = self.primary
+                    self.puts.clear()
+                    with self.store.edit() as value:
+                        value['selected'] = self.primary
+                    connection = Mock()
+                    def response():
+                        target = connection.request.call_args.args[1]
+                        hit = any('/' + node + '/healthcheck?' in target for node in affected)
+                        if hit and isinstance(fault, Exception):
+                            raise fault
+                        code, body = fault if hit else (200, b'{"delay":10}')
+                        return Mock(status=code, read=Mock(return_value=body))
+                    connection.getresponse.side_effect = response
+                    with patch.object(e.http.client, 'HTTPConnection', return_value=connection), \
+                            patch.object(self.controller, 'delay', side_effect=client.delay):
+                        # Several fault cycles must never satisfy the failover threshold.
+                        observed = copy.deepcopy(expected)
+                        for _ in range(4):
+                            observed, events = self.evaluate(observed)
+                            self.assertEqual(events, ['controller_unreachable'])
+                            self.assertEqual(observed, expected)
+                            self.assertEqual(self.puts, [])
+                    self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_valid_node_failures_still_switch_and_recover(self):
+        client = self.real_controller(self.store.load())
+        for failure_status in (503, 504):
+            with self.subTest(status=failure_status):
+                self.actual = self.primary
+                with self.store.edit() as value:
+                    value['selected'] = self.primary
+                self.puts.clear()
+                connection = Mock()
+                failing = {self.primary}
+                def response():
+                    target = connection.request.call_args.args[1]
+                    failed = any('/' + node + '/healthcheck?' in target for node in failing)
+                    return Mock(status=failure_status if failed else 200,
+                                read=Mock(return_value=b'{"message":"SYNTHETIC"}' if failed else b'{"delay":10}'))
+                connection.getresponse.side_effect = response
+                with patch.object(e.http.client, 'HTTPConnection', return_value=connection), \
+                        patch.object(self.controller, 'delay', side_effect=client.delay):
+                    runtime = {}
+                    for _ in range(4):
+                        runtime, _ = self.evaluate(runtime)
+                    self.assertEqual(self.puts, [self.secondary])
+                    failing.clear()
+                    for _ in range(4):
+                        runtime, _ = self.evaluate(runtime)
+                    self.assertEqual(self.puts, [self.secondary, self.primary])
 
     def test_disable_completed_during_probes_prevents_auto_put(self):
         runtime=self.ready_to_fail_over()

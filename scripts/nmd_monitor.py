@@ -366,6 +366,7 @@ class Store:
             self.db.execute('PRAGMA journal_mode=DELETE')
             self.db.executescript('''
             CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,ts REAL,payload TEXT);
+            CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
             CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY,probe TEXT,first_failure REAL,confirmed_at REAL,last_success REAL,recovery_first REAL,recovered_at REAL,end_reason TEXT);
             CREATE TABLE IF NOT EXISTS gaps(id INTEGER PRIMARY KEY,start REAL,end REAL,reason TEXT);
             CREATE TABLE IF NOT EXISTS auto_events(id INTEGER PRIMARY KEY,ts REAL,kind TEXT,detail TEXT);
@@ -453,8 +454,11 @@ class Store:
         n = self.config['max_samples']
         maximum = self.db.execute('SELECT COALESCE(MAX(id),0) FROM auto_events').fetchone()[0]
         self.setmeta('auto_event_id', max(self.meta('auto_event_id') or 0, maximum))
-        for table in ('samples', 'auto_events'):
-            self.db.execute(f'DELETE FROM {table} WHERE ts < ? OR id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT ?)', (cutoff, n))
+        # Retention runs every cycle; NOT IN would full-scan samples. With the ts
+        # index, an OR of two ranges (time cutoff, newest-n threshold id) deletes
+        # exactly the same rows index-driven.
+        self.db.execute('DELETE FROM samples WHERE ts < ? OR id < (SELECT MIN(id) FROM (SELECT id FROM samples ORDER BY id DESC LIMIT ?))', (cutoff, n))
+        self.db.execute('DELETE FROM auto_events WHERE ts < ? OR id NOT IN (SELECT id FROM auto_events ORDER BY id DESC LIMIT ?)', (cutoff, n))
         for table, column in [('incidents', 'confirmed_at'), ('gaps', 'end')]:
             condition = 'end_reason IS NOT NULL AND' if table == 'incidents' else ''
             self.db.execute(f'DELETE FROM {table} WHERE {condition} ({column} < ? OR id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT ?))', (cutoff, n))
