@@ -454,10 +454,12 @@ class Store:
         n = self.config['max_samples']
         maximum = self.db.execute('SELECT COALESCE(MAX(id),0) FROM auto_events').fetchone()[0]
         self.setmeta('auto_event_id', max(self.meta('auto_event_id') or 0, maximum))
-        # Retention runs every cycle; NOT IN would full-scan samples. With the ts
-        # index, an OR of two ranges (time cutoff, newest-n threshold id) deletes
-        # exactly the same rows index-driven.
-        self.db.execute('DELETE FROM samples WHERE ts < ? OR id < (SELECT MIN(id) FROM (SELECT id FROM samples ORDER BY id DESC LIMIT ?))', (cutoff, n))
+        # Freeze the newest-n boundary in this write transaction before deleting.
+        # SQLite 3.37 can evaluate a DELETE's self-reading subquery after its
+        # time-range deletions, incorrectly retaining older in-window samples.
+        boundary = self.db.execute('SELECT id FROM samples ORDER BY id DESC LIMIT 1 OFFSET ?', (n - 1,)).fetchone()
+        # Fewer than n rows need only time pruning; NULL disables id pruning.
+        self.db.execute('DELETE FROM samples WHERE ts < ? OR id < ?', (cutoff, boundary[0] if boundary else None))
         self.db.execute('DELETE FROM auto_events WHERE ts < ? OR id NOT IN (SELECT id FROM auto_events ORDER BY id DESC LIMIT ?)', (cutoff, n))
         for table, column in [('incidents', 'confirmed_at'), ('gaps', 'end')]:
             condition = 'end_reason IS NOT NULL AND' if table == 'incidents' else ''

@@ -204,22 +204,42 @@ capabilities/status；Linux 安装/更新、source/channel、网络管理、syst
 
 ## 6. 已验证与未验证（2026-10-25）
 
-2026-10-25 验证时，依据为基线 `880151f8d543d3513eba6b5fabad1e75cc2a87e5` 加当时未提交的第 0～3 步集成：
-fixture 权限修正、控制器故障分类、T03/T04 和 P02 索引/保留优化，加最终复审后的 T04
-参考模型修复。Linux、Python 3.13.15、SQLite 3.53.1 下，完整离线套件
-**317 项：316 passed / 1 skipped**，Python 语法检查通过。
-浏览器 fixture 按默认配置跳过；模拟 systemd、特权动作和 macOS 分支通过不构成实机证据。
+集成提交 `bdfecdc` 包含 fixture 权限修正、控制器故障分类、T03/T04、P02 和参考模型修复。
+其 [push CI](https://github.com/zzzhty/network-monitor-and-diagnostics/actions/runs/40171069256)
+中，Ubuntu 24.04 全套、macOS 显式模块、三个平台的桌面壳静态/单元测试及 Chromium
+合成页面均通过；Ubuntu 22.04 的 4 个断言失败揭示 P02 在 SQLite 3.37.2 上的保留回归。
+该失败记录仍保留，不能用较新 SQLite 的通过结果替代。
 
-P02 的两种预填规模复测中，12 对基线/候选的语义行和 metadata 一致，旧 reader 兼容。
-10 万行的真实 Store.record 调用从约 27.9 ms 降到 2.8 ms；代价为合成库约 +7.8% 空间、
-首次打开约多 9.8 ms、整批过期约 21→37 ms。这是 Linux 合成存储测量，不是整机或 GUI 提速。
+本次兼容修复以该提交为起点：在同一写事务内先读取删除前第 N 新的样本 ID，再按固定
+边界和时间窗口删除；不足 N 行时仅按时间清理。表、索引和 schema_version 均未改变。
+已有回归增加“最新 N 行全部过期但更早行仍在时间窗口内”的场景，防止回填旧样本。
+Linux 本地使用 Python 3.14.4 + 临时编译的真实 SQLite 3.37.2，以及 Python 3.13.15 +
+SQLite 3.53.1，两个环境各自 **45 项 monitor/timeline 测试通过**，完整套件各自
+**317 项：316 passed / 1 skipped**；Python 语法检查通过。默认跳过的浏览器项由单独
+CI 作业负责。修复提交的远端验收应查看对应 SHA 的 Actions 结果；CI 现在打印实际
+Python/SQLite 版本。macOS 的显式模块列表仍未包含 T03/T04 两个新模块。
 
-第 4 步仅文档与导航变化；最终复审后修正了参考模型中 incident/gap ID 永久递增的错误
-假设，补齐全清空及删除最大 ID 后重新生成证据和重启的回归，未改产品 schema。
-执行日志保存在仓库外的 `.glm53-batch/integration-steps-0-2/RESULT.md` 与
-`logs/fix-nmd-owner-tests.log`；帮助、链接和文档语义另核对。
-原 D02 的基线失败数/未能运行 help 说明保留在原任务报告，不代表当前状态。
+性能沿用原合成 Store 测量：20,160 / 100,000 行，每个引擎六轮不同顺序比较 P02 前基线、
+已推送版和修复版，各执行 128 个周期。每组单调时间回放的完整语义行/metadata 相同，
+旧 reader 与重复打开检查通过；异常时间顺序的正确性另由上述回归验证。
+
+| 10 万行，六轮中位数 | SQLite 3.37.2：已推送版→修复版 | SQLite 3.53.1：已推送版→修复版 |
+| --- | --- | --- |
+| Store.record | 3.20→1.61 ms | 2.84→1.26 ms |
+| record p95 | 3.54→1.84 ms | 3.15→1.42 ms |
+| 整批样本过期 | 43.7→45.2 ms | 37.6→45.1 ms |
+| 首次打开旧库（含既有索引创建） | 10.8→10.7 ms | 10.1→9.8 ms |
+
+两版合成库大小相同（17,752,064 B），仍比无索引基线大约 7.8%；reader 耗时接近。
+P02 前基线 record 分别约 24.3 / 27.6 ms，修复保留稳态收益，但没有消除索引空间、
+首次打开和大批过期成本；OFFSET 仍遍历最多 N 个 ID，不是常数复杂度。
+只在各自相同运行时内比较，不能把两种 Python/SQLite 的绝对时间差归因于引擎版本，
+也不能推导整机、GUI 或其他平台提速。
+
+执行记录仍在仓库外 `.glm53-batch/integration-steps-0-2/RESULT.md`；本次日志使用
+`logs/p02-fix-*`，测量输入和输出在 `p02-sqlite-fix/`。原 D02 报告、首次 CI 失败和此前
+红灯/绿灯、step3 性能记录均保留。
 
 未验证：真实 Tailnet/订阅/出口切换、apply/首次部署/停机或崩溃恢复、user/system 实机安装
-与跨 UID 迁移、浏览器交互、桌面壳原生运行、macOS 实机观测与长期运行；Windows 没有本次
-运行证据，也不能从桌面壳 CI 的存在推导完整 NMD 网络管理支持。本文没有执行这些操作。
+与跨 UID 迁移、桌面壳原生 GUI 运行、macOS 实机观测与长期运行。Chromium 合成页面通过
+不代表真实部署浏览器验收；跨平台桌面壳编译/单元测试不代表完整 NMD 网络管理支持。

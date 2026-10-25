@@ -21,8 +21,10 @@ jobs:
           for script in install.sh fetch-assets.sh nmd local-setup.sh vps-setup.sh; do
             bash -n "$script"
           done
-      - name: Python syntax
-        run: python3 -m compileall -q scripts tests
+      - name: Python syntax and SQLite runtime
+        run: |
+          python3 -c 'import sqlite3, sys; print(sys.version); print("SQLite", sqlite3.sqlite_version)'
+          python3 -m compileall -q scripts tests
       - name: Source YAML dependency
         run: |
           python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
