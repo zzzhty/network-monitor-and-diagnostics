@@ -188,24 +188,27 @@ class StoreTests(unittest.TestCase):
         self.store.config.update(max_samples=100, retention_hours=24)
         now = 200000
         cutoff = now - 24 * 3600
-        for count in (0, 1, 99, 100, 101, 207):
-            for offsets in ((1,), (-1,), (-1, 0, 1), (1, 0, -1)):
-                with self.subTest(count=count, offsets=offsets):
-                    # Sparse ids and out-of-order times model pruned history
-                    # and clock changes. The two retention rules intersect.
-                    rows = [(3 * i + 5, cutoff + offsets[i % len(offsets)],
-                             dict(row('success'), id=f'fixture-{i}')) for i in range(count)]
-                    self.store.db.execute('DELETE FROM samples')
-                    self.store.db.executemany('INSERT INTO samples VALUES(?,?,?)',
-                                             [(key, ts, json.dumps(payload)) for key, ts, payload in rows])
-                    self.store.record([], now=now)
-                    actual = [(key, ts, json.loads(payload)) for key, ts, payload in
-                              self.store.db.execute('SELECT * FROM samples ORDER BY id')]
-                    self.assertEqual(actual, [r for r in rows[-100:] if r[1] >= cutoff])
-                    # Clearing all rows must not poison the next insertion.
-                    self.store.record([], now=now + 2 * 86400)
-                    self.store.record([row('success')], now=now + 2 * 86400 + 1)
-                    self.assertEqual(self.store.db.execute('SELECT count(*) FROM samples').fetchone()[0], 1)
+        cases = [(count, offsets) for count in (0, 1, 99, 100, 101, 207)
+                 for offsets in ((1,), (-1,), (-1, 0, 1), (1, 0, -1))]
+        # An expired newest-N window must not backfill older in-window rows.
+        cases.append((101, (1,) + (-1,) * 100))
+        for count, offsets in cases:
+            with self.subTest(count=count, offsets=offsets):
+                # Sparse ids and out-of-order times model pruned history
+                # and clock changes. The two retention rules intersect.
+                rows = [(3 * i + 5, cutoff + offsets[i % len(offsets)],
+                         dict(row('success'), id=f'fixture-{i}')) for i in range(count)]
+                self.store.db.execute('DELETE FROM samples')
+                self.store.db.executemany('INSERT INTO samples VALUES(?,?,?)',
+                                         [(key, ts, json.dumps(payload)) for key, ts, payload in rows])
+                self.store.record([], now=now)
+                actual = [(key, ts, json.loads(payload)) for key, ts, payload in
+                          self.store.db.execute('SELECT * FROM samples ORDER BY id')]
+                self.assertEqual(actual, [r for r in rows[-100:] if r[1] >= cutoff])
+                # Clearing all rows must not poison the next insertion.
+                self.store.record([], now=now + 2 * 86400)
+                self.store.record([row('success')], now=now + 2 * 86400 + 1)
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM samples').fetchone()[0], 1)
 
     def test_legacy_samples_survive_repeated_open_and_retention(self):
         now = 200000
