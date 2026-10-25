@@ -23,6 +23,7 @@ class ChannelFixture(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
         self.directory = self.base / 'config/egress'
+        self.directory.parent.mkdir(mode=0o700)
         self.store = e.Store(self.directory)
         env = patch.dict(os.environ, {'HOME': str(self.base / 'home'),
                                      'XDG_CONFIG_HOME': str(self.base / 'config'),

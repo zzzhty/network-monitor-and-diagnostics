@@ -1,9 +1,11 @@
 # Network Monitor & Diagnostics (NMD) 运维
 
 本机分流模板为本仓库 `config.yaml`，Ubuntu 使用 systemd 和 systemd-resolved。
+故障排查与出口切换的操作者决策树（按只读观察/配置保存/显式网络修改/回滚分类）见
+[诊断与切换运维 Runbook](docs/diagnostics-runbook.md)。
 可选[多出口来源管理](docs/egress-sources.md)在已记录 scope 的 configDir/egress 中保留
 私有来源与缓存，通过 CLI 显式管理；订阅只导入节点，不接管本机配置。GUI 提供本机出口
-切换、单节点测速与自动模式开关；订阅刷新、来源增删与部署仍只在 CLI 中显式执行。
+切换、单节点测速、自动模式以及通道添加/重命名；订阅刷新、连接定义更新/删除与部署仍只在 CLI 中显式执行。
 未启用来源时，兼容原来的 VPS SOCKS5 `203.0.113.20:1080` 与 `NMD_VPS_PUB` 注入。
 
 ## 管理安装与 monitor 范围

@@ -38,6 +38,13 @@ class ScopeLifecycleTests(LifecycleFixture, unittest.TestCase):
     def unset(self, key):
         self.git(self.root, "config", "--unset", "nmd." + key)
 
+    def private_checkout(self):
+        # Only this test's temporary copy models a trusted system checkout.
+        # Keep actual ownership checks and each explicit unsafe-mode mutation.
+        for path in (self.source, *self.source.rglob("*")):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o022)
+
     def test_default_bootstrap_records_user_scope_and_xdg_paths(self):
         self.assert_ok(self.install("--manager-only"))
         for key, expected in {
@@ -139,6 +146,7 @@ class ScopeLifecycleTests(LifecycleFixture, unittest.TestCase):
 
             with self.subTest(path=untrusted_path), self.manager_module() as manager, \
                     patch.object(Path, "lstat", ownership):
+                self.private_checkout()
                 with self.assertRaises(manager.ManagerError) as caught:
                     manager.trusted_system_checkout(self.source, ancestors=False)
                 self.assertIn(str(untrusted_path), str(caught.exception))
@@ -153,6 +161,7 @@ class ScopeLifecycleTests(LifecycleFixture, unittest.TestCase):
             return os.stat_result(values)
 
         with self.manager_module() as manager, patch.object(Path, "lstat", root_ownership):
+            self.private_checkout()
             # A fully safe model is accepted before each specific weakness is
             # introduced. Real ownership and system paths remain untouched.
             manager.trusted_system_checkout(self.source, ancestors=False)
