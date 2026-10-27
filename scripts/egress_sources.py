@@ -718,12 +718,42 @@ def _fresh_runtime(auto):
             "pending_verify": None, "suspended": False, "both_unhealthy": False}
 
 
+def _runtime_view(runtime, auto):
+    """Derive display-only fields onto the runtime itself; never a parallel export."""
+    if not runtime:
+        return
+    if auto.get("paused"):
+        state = "paused"
+    elif runtime.get("suspended"):
+        state = "suspended"
+    elif runtime.get("pending_verify"):
+        state = "pending_verify"
+    elif runtime.get("both_unhealthy"):
+        state = "both_unhealthy"
+    elif runtime.get("target") is None:
+        state = "primary_failing" if runtime.get("primary_fail") else "engaging"
+    elif runtime["target"] == "secondary":
+        state = ("secondary_failing" if runtime.get("secondary_fail")
+                 else "recovering" if runtime.get("primary_recover")
+                 else "secondary_active")
+    else:
+        state = "primary_failing" if runtime.get("primary_fail") else "primary_active"
+    runtime["state"] = state
+    runtime["cooldown_remaining"] = max(0, auto["cooldown"] - runtime.get("cycles_since_switch", 0))
+
+
 def auto_evaluate(directory, runtime, emit):
     """One failover evaluation; operational faults never raise or count as node failures."""
     value = Store(directory).load()
     auto = _policy(value.get("auto"))
     if not isinstance(auto, dict) or not auto.get("enabled"):
         return {}
+    runtime = _auto_evaluate(directory, runtime, emit, value, auto)
+    _runtime_view(runtime, auto)
+    return runtime
+
+
+def _auto_evaluate(directory, runtime, emit, value, auto):
     value["auto"] = auto
     signature = auto_signature(auto)
     if (isinstance(runtime, dict) and runtime.get("signature") is not None

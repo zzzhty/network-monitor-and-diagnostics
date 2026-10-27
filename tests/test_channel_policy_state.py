@@ -49,11 +49,15 @@ class StateFixture(unittest.TestCase):
     def controller(self, selected):
         test = self
         self.actual, self.puts, self.probes, self.failing = selected, [], [], set()
+        self.uncertain = False
         class Controller:
             def current(self):
                 return dict(type='Selector', now=test.actual, all=list(e.inventory(test.store.load())))
             def request(self, method, body):
                 test.actual = body['name']; test.puts.append(body['name'])
+                if test.uncertain:
+                    test.uncertain = False
+                    raise e.SourceError('synthetic_uncertain_put')
             def delay(self, provider, node):
                 test.probes.append(node)
                 if node in test.failing: raise e.SourceError('delay_test_failed')
@@ -257,6 +261,94 @@ class SwapStateTests(StateFixture):
         resumed = self.store.load()['auto']
         self.assertEqual((resumed['primary']['node'], resumed['secondary']['node']), (primary, secondary))
         self.assertFalse(resumed['paused'])
+
+
+class RuntimeViewTests(StateFixture):
+    def test_derived_state_and_cooldown_follow_the_engine(self):
+        primary, secondary = self.seed_subscription()
+        e.select(self.store, primary, deferred=True)
+        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary,
+                                         fail_after=2, recover_after=2, cooldown=2))
+        with self.controller(primary):
+            runtime, _ = self.evaluate({})
+            self.assertEqual((runtime['target'], runtime['state'], runtime['cooldown_remaining']),
+                             ('primary', 'primary_active', 1))
+            runtime, _ = self.evaluate(runtime)
+            self.assertEqual((runtime['state'], runtime['cooldown_remaining']), ('primary_active', 0))
+            self.failing = {primary}
+            runtime, _ = self.evaluate(runtime)
+            self.assertEqual((runtime['state'], runtime['primary_fail']), ('primary_failing', 1))
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['auto_switch'])
+            self.assertEqual((runtime['target'], runtime['state'], runtime['cooldown_remaining']),
+                             ('secondary', 'secondary_active', 1))
+            runtime, _ = self.evaluate(runtime)
+            self.assertEqual((runtime['state'], runtime['primary_recover']), ('secondary_active', 0))
+            self.failing = set()
+            runtime, _ = self.evaluate(runtime)
+            self.assertEqual((runtime['state'], runtime['primary_recover']), ('recovering', 1))
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['auto_switch'])
+            self.assertEqual((runtime['target'], runtime['state'], runtime['cooldown_remaining']),
+                             ('primary', 'primary_active', 1))
+            self.assertEqual(self.puts, [secondary, primary])
+
+    def test_derived_state_flags_pause_both_unhealthy_and_suspension(self):
+        primary, secondary = self.seed_subscription()
+        e.select(self.store, primary, deferred=True)
+        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary,
+                                         fail_after=2, recover_after=2, cooldown=2))
+        with self.controller(primary):
+            runtime, _ = self.evaluate({})
+            self.assertEqual(runtime['state'], 'primary_active')
+            self.failing = {primary, secondary}
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['both_unhealthy'])
+            self.assertEqual(runtime['state'], 'both_unhealthy')
+            e.refresh(self.store, 'sub-a', self.provider(['one']))  # Drops only the spare candidate.
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['auto_suspended'])
+            self.assertEqual(runtime['state'], 'suspended')
+            self.failing = set()
+            e.refresh(self.store, 'sub-a', self.provider(['one', 'two']))
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['auto_resumed'])
+            self.assertEqual(runtime['state'], 'primary_active')
+            probes_before_pause = len(self.probes)
+            e.select(self.store, secondary, deferred=True)  # A manual choice pauses; no re-pin.
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, [])
+            self.assertEqual(runtime['state'], 'paused')
+            self.assertEqual(len(self.probes), probes_before_pause)  # Paused and suspended probe nothing.
+
+    def test_uncertain_switch_and_unreachable_controller_derive_their_states(self):
+        primary, secondary = self.seed_subscription()
+        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary,
+                                         fail_after=2, recover_after=2, cooldown=2))
+        with self.controller(None):
+            class Unreachable:
+                def __init__(self, value): pass
+                def current(self): raise e.SourceError('manual_selector_required')
+                def delay(self, *args): raise AssertionError('no probes expected')
+            with patch.object(e, 'Controller', Unreachable):
+                runtime, events = self.evaluate({})  # No saved selection and no live target yet.
+                self.assertEqual(events, ['controller_unreachable'])
+                self.assertEqual((runtime['target'], runtime['state'], runtime['cooldown_remaining']),
+                                 (None, 'engaging', 2))
+            runtime, _ = self.evaluate(runtime)  # No saved selection: the engine engages via PUT.
+            self.assertEqual((runtime['state'], runtime['cooldown_remaining']), ('primary_active', 1))
+            self.failing = {primary}
+            runtime, _ = self.evaluate(runtime)
+            self.uncertain = True
+            runtime, events = self.evaluate(runtime)
+            self.assertEqual(events, ['auto_switch_failed'])
+            self.assertEqual(runtime['pending_verify'], secondary)
+            self.assertEqual(runtime['state'], 'pending_verify')
+
+    def test_disabled_policy_has_no_derived_view(self):
+        self.seed_subscription()
+        runtime, events = self.evaluate({'stale': 'shape'})
+        self.assertEqual((runtime, events), ({}, []))
 
 
 if __name__ == '__main__':

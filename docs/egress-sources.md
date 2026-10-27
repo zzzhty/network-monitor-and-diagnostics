@@ -183,7 +183,11 @@ CLI delay_test_failed 是统一安全码，不能仅据此区分两类故障。
 
 策略只控制本机 mihomo 选择器，不代表整机所有流量或 AI 业务可用。系统级服务账户
 仍无权读取 root 私有注册表，不放宽权限。事件写入 `auto_events`，GUI 展示实际节点、
-主备与暂停状态；无健康数据或控制器不可用时不能伪造成功。
+主备与暂停状态。评估器在持久化 runtime 上派生只读 `state`（paused / suspended /
+pending_verify / both_unhealthy / engaging / 主备健康、失败计数、恢复计数）与
+`cooldown_remaining`（距切换解禁的剩余周期数），随既有 `collector.auto_runtime`
+整包导出，不新增平行字段；GUI 据此展示引擎状态与冷却进度。无健康数据或控制器不可用
+时不能伪造成功。
 
 ### 旧配置与 CLI 兼容迁移
 

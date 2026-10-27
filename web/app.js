@@ -67,6 +67,12 @@
     manual_engage_secondary: '手动选择备选', candidate_changed: '候选变化', controller_unreachable: '控制器不可达',
     both_unhealthy: '双侧不健康', auto_error: '评估异常'
   };
+  const runtimeStateNames = {
+    paused: '已暂停', suspended: '候选缺失 · 评估挂起', pending_verify: '切换待确认',
+    both_unhealthy: '双侧不健康 · 保持当前出口', engaging: '等待首次接管',
+    primary_active: '主选健康', primary_failing: '主选失败计数中',
+    secondary_active: '备选健康', secondary_failing: '备选失败计数中', recovering: '主选恢复计数中'
+  };
   function note(message) { text('egress-action-note', message || ''); }
   function renderChannels() {
     const canManage = channelManagementEnabled();
@@ -132,6 +138,9 @@
     const auto = sources?.auto || null;
     const runtime = snapshot?.collector?.auto_runtime || null;
     const targetName = runtime?.target === 'primary' ? ' · 当前目标：主选' : runtime?.target === 'secondary' ? ' · 当前目标：备选' : '';
+    const runtimeDetail = runtimeStateNames[runtime?.state] ? ` · ${runtimeStateNames[runtime.state]}` : '';
+    const cooldownLeft = finite(runtime?.cooldown_remaining) && runtime.cooldown_remaining > 0
+      ? ` · 切换冷却剩 ${runtime.cooldown_remaining} 周期` : '';
     const activeChannel = sources?.sources?.find(channel => nodes.some(node => node.id === sources.active && node.source === channel.id));
     text('egress-current-name', sources?.controller === 'observed' && sources?.active ? `${activeChannel ? channelLabel(activeChannel) + ' · ' : ''}${displayOf(sources.active)}` : '未知');
     text('egress-current-id', sources?.active || '—');
@@ -161,7 +170,7 @@
     }
     text('auto-state', !sources ? '通道数据不可用。' : !auto ? '自动切换未启用。'
       : auto.paused ? '已暂停：手动选择优先；明确恢复后才继续评估原有候选。'
-      : auto.enabled ? `运行中 · 主选 ${displayOf(auto.primary.node)} · 备选 ${displayOf(auto.secondary.node)}${targetName}` : '已停用。');
+      : auto.enabled ? `运行中 · 主选 ${displayOf(auto.primary.node)} · 备选 ${displayOf(auto.secondary.node)}${targetName}${runtimeDetail}${cooldownLeft}` : '已停用。');
     text('auto-policy', auto ? `连续失败 ${auto.fail_after} 次切换 · 主选连续成功 ${auto.recover_after} 次回切 · 切换后冷却 ${auto.cooldown} 周期` : '');
     renderCandidate($('auto-primary-node'), nodes, auto?.primary?.node, Boolean(auto?.enabled));
     renderCandidate($('auto-secondary-node'), nodes, auto?.secondary?.node, Boolean(auto?.enabled));
