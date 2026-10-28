@@ -116,11 +116,10 @@ class ChannelPolicyTests(ChannelFixture):
                     before = self.store.path.read_bytes()
                     view = e.public_status(self.directory, online=False)
                     self.assertEqual(self.store.path.read_bytes(), before)
-                    self.assertEqual(view['auto']['version'], 2)
+                    self.assertEqual(view['auto']['version'], 3)
                     first = tail if primary == 'tailnet' else subscription
                     second = subscription if primary == 'tailnet' else tail
-                    self.assertEqual(view['auto']['primary']['node'], first)
-                    self.assertEqual(view['auto']['secondary']['node'], second)
+                    self.assertEqual([pin['node'] for pin in view['auto']['candidates']], [first, second])
                     e.rename_source(self.store, 'tail-a', '改名但不改变身份')
                     migrated = json.loads(self.store.path.read_bytes())
                     self.assertEqual(migrated['auto'], view['auto'])
@@ -132,20 +131,24 @@ class ChannelPolicyTests(ChannelFixture):
         tail, subscription, another_subscription = self.seed()
         e.put_source(self.store, 'proxy-a', self.proxy)
         e.put_source(self.store, 'proxy-b', dict(self.proxy, port=1081))
-        for primary, secondary in ((subscription, another_subscription),
-                                   (self.node('proxy-a'), self.node('proxy-b')),
-                                   (tail, self.node('proxy-a'))):
-            with self.subTest(primary=primary, secondary=secondary):
-                e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary))
+        for first, second in ((subscription, another_subscription),
+                              (self.node('proxy-a'), self.node('proxy-b')),
+                              (tail, self.node('proxy-a'))):
+            with self.subTest(first=first, second=second):
+                e.auto_configure(self.store, dict(action='enable', nodes=[first, second]))
                 policy = self.store.load()['auto']
-                self.assertEqual(policy['primary']['node'], primary)
-                self.assertEqual(policy['secondary']['node'], secondary)
+                self.assertEqual([pin['node'] for pin in policy['candidates']], [first, second])
                 e.put_source(self.store, 'unused', dict(self.proxy, port=1082), replace='unused' in self.store.load()['sources'])
                 self.assertEqual(self.store.load()['auto'], policy)
+        # A third explicit candidate joins the ordered list without auto additions.
+        e.auto_configure(self.store, dict(action='enable', nodes=[subscription, another_subscription, tail]))
+        self.assertEqual([pin['node'] for pin in self.store.load()['auto']['candidates']],
+                         [subscription, another_subscription, tail])
         before = self.store.path.read_bytes()
-        for payload in (dict(action='enable', primary_node=tail, secondary_node=tail),
-                        dict(action='enable', primary_node=tail),
-                        dict(action='enable', primary_node=tail, secondary_node='missing')):
+        for payload in (dict(action='enable', nodes=[tail, tail]),
+                        dict(action='enable', nodes=[tail]),
+                        dict(action='enable', nodes=[tail, 'missing']),
+                        dict(action='enable', primary_node=tail, secondary_node=subscription)):
             with self.assertRaises(e.SourceError): e.auto_configure(self.store, payload)
             self.assertEqual(self.store.path.read_bytes(), before)
 
@@ -179,7 +182,7 @@ class ChannelPolicyTests(ChannelFixture):
     def test_manual_subscription_choice_pauses_without_replacing_policy_candidates(self):
         _, primary, secondary = self.seed()
         e.select(self.store, primary, deferred=True)
-        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary,
+        e.auto_configure(self.store, dict(action='enable', nodes=[primary, secondary],
                                          fail_after=2, recover_after=2, cooldown=2))
         with self.controller(primary):
             runtime, _ = self.evaluate({})
@@ -191,13 +194,13 @@ class ChannelPolicyTests(ChannelFixture):
         self.assertEqual(self.actual, secondary)
         policy = self.store.load()['auto']
         self.assertTrue(policy['paused'])
-        self.assertEqual((policy['primary']['node'], policy['secondary']['node']), (primary, secondary))
+        self.assertEqual([pin['node'] for pin in policy['candidates']], [primary, secondary])
 
     def test_same_kind_failover_confirms_uncertain_switch_and_recovers_without_enrolling_new_channel(self):
         e.put_source(self.store, 'proxy-a', self.proxy)
         e.put_source(self.store, 'proxy-b', dict(self.proxy, port=1081))
         primary, secondary = self.node('proxy-a'), self.node('proxy-b')
-        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary,
+        e.auto_configure(self.store, dict(action='enable', nodes=[primary, secondary],
                                          fail_after=2, recover_after=2, cooldown=2))
         with self.controller(primary):
             runtime, _ = self.evaluate({})
@@ -215,14 +218,14 @@ class ChannelPolicyTests(ChannelFixture):
             self.assertIn('auto_verify_adopted', events)
             self.assertEqual(self.store.load()['selected'], secondary)
             for _ in range(10): runtime, _ = self.evaluate(runtime)
-        self.assertEqual((self.actual, runtime['target']), (primary, 'primary'))
+        self.assertEqual((self.actual, runtime['target']), (primary, 0))
         self.assertEqual(self.puts, [primary, secondary, primary])
         self.assertEqual(set(self.probes), {primary, secondary})
 
     def test_uncertain_manual_put_pauses_before_returning_unknown_outcome(self):
         _, primary, secondary = self.seed()
         e.select(self.store, primary, deferred=True)
-        e.auto_configure(self.store, dict(action='enable', primary_node=primary, secondary_node=secondary))
+        e.auto_configure(self.store, dict(action='enable', nodes=[primary, secondary]))
         with self.controller(primary):
             self.uncertain = True
             with self.assertRaisesRegex(e.SourceError, 'selection_outcome_unknown'):
@@ -250,12 +253,39 @@ class ChannelPolicyTests(ChannelFixture):
         with self.controller(tail): runtime, events = self.evaluate(runtime)
         self.assertIn('auto_verify_adopted', events)
         self.assertNotIn('candidate_changed', events)
-        self.assertEqual(runtime['target'], 'secondary')
+        self.assertEqual(runtime['target'], 1)
+        self.assertEqual(runtime['fails'], [0, 0])  # Adoption resets counters by design.
         self.assertEqual(self.puts, [])
         self.assertEqual(self.store.load()['selected'], tail)
         self.assertEqual(self.store.load()['auto'], legacy)
         e.rename_source(self.store, 'tail-a', '显式写后迁移')
-        self.assertEqual(self.store.load()['auto']['version'], 2)
+        self.assertEqual(self.store.load()['auto']['version'], 3)
+
+    def test_v2_runtime_signature_translates_without_reset_or_extra_put(self):
+        tail, primary, _ = self.seed()
+        with self.store.edit() as value:
+            value['selected'] = tail
+            value['auto'] = dict(version=2, enabled=True, paused=False,
+                                 primary=dict(source='sub-a', node=primary),
+                                 secondary=dict(source='tail-a', node=tail),
+                                 fail_after=4, recover_after=2, cooldown=2)
+        stored = self.store.load()['auto']
+        v2_fields = {key: stored[key] for key in ('primary', 'secondary', 'fail_after', 'recover_after', 'cooldown')}
+        signature = e.hashlib.sha256(e.encode(v2_fields)).hexdigest()[:20]
+        # A live v2 episode: active secondary failing 2 of fail_after, below the threshold.
+        runtime = dict(signature=signature, target='secondary', primary_fail=0, primary_recover=0,
+                       secondary_fail=2, cycles_since_switch=4, pending_verify=None,
+                       suspended=False, both_unhealthy=False)
+        with self.controller(tail):
+            self.failing = {tail}
+            runtime, events = self.evaluate(runtime)
+        self.assertEqual(events, [])
+        self.assertEqual(runtime['target'], 1)
+        self.assertEqual(runtime['fails'], [0, 3])  # Carried 2, incremented once below fail_after.
+        self.assertEqual((runtime['recover_rank'], runtime['recover_count']), (None, 0))
+        self.assertFalse(runtime['all_unhealthy'])
+        self.assertEqual(self.puts, [])
+        self.assertEqual(self.store.load()['auto']['version'], 2)  # Evaluation never persists the conversion.
 
 
 class ChannelAPITests(ChannelFixture):
@@ -329,10 +359,10 @@ class ChannelCLITests(ChannelFixture):
         e.put_source(self.store, 'proxy-b', dict(self.proxy, port=1081))
         self.run_cli(['rename', 'proxy-a', '--name', '新通道'])
         primary, secondary = self.node('proxy-a'), self.node('proxy-b')
-        self.run_cli(['auto', 'enable', '--primary-node', primary, '--secondary-node', secondary])
-        self.assertEqual(self.store.load()['auto']['primary']['node'], primary)
-        self.run_cli(['auto', 'swap'])
-        self.assertEqual(self.store.load()['auto']['primary']['node'], secondary)
+        self.run_cli(['auto', 'enable', '--node', primary, '--node', secondary])
+        self.assertEqual([pin['node'] for pin in self.store.load()['auto']['candidates']], [primary, secondary])
+        self.run_cli(['auto', 'set-candidates', '--nodes', f'{secondary},{primary}'])
+        self.assertEqual([pin['node'] for pin in self.store.load()['auto']['candidates']], [secondary, primary])
         self.run_cli(['auto', 'disable'])
         self.assertFalse(self.store.load()['auto']['enabled'])
         import manager

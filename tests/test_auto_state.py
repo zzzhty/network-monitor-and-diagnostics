@@ -36,8 +36,7 @@ class AutomaticStateTests(unittest.TestCase):
         self.secondary = value['cache']['tail-a']['nodes'][0]['name']
         self.manual_tail = value['cache']['tail-other']['nodes'][0]['name']
         e.select(self.store, self.primary, deferred=True)
-        e.auto_configure(self.store, dict(action='enable', primary='subscription',
-                         tailnet_node=self.secondary, subscription_node=self.primary,
+        e.auto_configure(self.store, dict(action='enable', nodes=[self.primary, self.secondary],
                          fail_after=2, recover_after=2, cooldown=2))
         self.actual = self.primary
         self.puts = []
@@ -161,10 +160,11 @@ class AutomaticStateTests(unittest.TestCase):
 
     def test_policy_change_during_probes_invalidates_the_old_decision(self):
         runtime=self.ready_to_fail_over()
-        self.during_delay=lambda:e.auto_configure(self.store, {'action':'set-primary','primary':'tailnet'})
+        self.during_delay=lambda:e.auto_configure(self.store, {'action':'set-candidates',
+                                                              'nodes':[self.secondary, self.primary]})
         self.evaluate(runtime)
         self.assertEqual(self.puts, [])
-        self.assertEqual(self.store.load()['auto']['primary']['node'], self.secondary)
+        self.assertEqual(self.store.load()['auto']['candidates'][0]['node'], self.secondary)
 
     def test_manual_candidate_change_during_probes_pauses_without_replacing_pins(self):
         runtime=self.ready_to_fail_over()
@@ -172,7 +172,7 @@ class AutomaticStateTests(unittest.TestCase):
         self.evaluate(runtime)
         self.assertEqual(self.puts, [self.other_primary])
         self.assertEqual(self.actual, self.other_primary)
-        self.assertEqual(self.store.load()['auto']['primary']['node'], self.primary)
+        self.assertEqual(self.store.load()['auto']['candidates'][0]['node'], self.primary)
 
     def test_last_check_reads_the_value_loaded_under_the_writer_lock(self):
         runtime=self.ready_to_fail_over()
@@ -195,7 +195,7 @@ class AutomaticStateTests(unittest.TestCase):
         runtime,events=self.evaluate(runtime)
         self.assertEqual(self.puts, [self.secondary])
         self.assertEqual(events, ['auto_switch'])
-        self.assertEqual(runtime['target'], 'secondary')
+        self.assertEqual(runtime['target'], 1)
         self.assertEqual(self.store.load()['selected'], self.secondary)
 
     def test_uncertain_secondary_adoption_is_persisted_and_eventually_recovers(self):
@@ -207,11 +207,11 @@ class AutomaticStateTests(unittest.TestCase):
         self.failing=set()
         runtime,events=self.evaluate(runtime)
         self.assertEqual(events, ['auto_verify_adopted'])
-        self.assertEqual(runtime['target'], 'secondary')
+        self.assertEqual(runtime['target'], 1)
         self.assertEqual(self.store.load()['selected'], self.secondary)
         for _ in range(10):runtime,_=self.evaluate(runtime)
         self.assertEqual((self.actual,self.store.load()['selected'],runtime['target']),
-                         (self.primary,self.primary,'primary'))
+                         (self.primary,self.primary,0))
         self.assertEqual(self.puts, [self.secondary,self.primary])
 
     def test_manual_operation_before_pending_confirmation_wins(self):
@@ -234,7 +234,7 @@ class AutomaticStateTests(unittest.TestCase):
                 self.assertNotIn('tail-a',value['sources'])
                 self.assertEqual(value['selected'],self.primary)
                 e.put_source(self.store,'tail-a',self.tail)
-                e.auto_configure(self.store,dict(action='enable',primary='subscription',tailnet_node=self.secondary,subscription_node=self.primary))
+                e.auto_configure(self.store,dict(action='enable',nodes=[self.primary,self.secondary]))
         self.assertEqual(self.puts,[])
 
     def test_kind_changes_clear_pins_but_same_kind_updates_remain_valid(self):
@@ -248,7 +248,7 @@ class AutomaticStateTests(unittest.TestCase):
                 self.assertNotIn('auto',value)
                 self.assertEqual(value['sources']['tail-a']['kind'],'subscription')
                 e.put_source(self.store,'tail-a',self.tail,replace=True)
-                e.auto_configure(self.store,dict(action='enable',primary='subscription',tailnet_node=self.secondary,subscription_node=self.primary))
+                e.auto_configure(self.store,dict(action='enable',nodes=[self.primary,self.secondary]))
         self.assertEqual(self.puts,[])
 
     def test_selected_source_delete_is_rejected_without_losing_policy(self):
@@ -260,7 +260,7 @@ class AutomaticStateTests(unittest.TestCase):
     def test_invalid_auto_reference_cannot_be_committed(self):
         original=self.store.path.read_bytes()
         with self.assertRaisesRegex(e.SourceError,'invalid_auto'):
-            with self.store.edit() as value:value['auto']['secondary']['source']='missing'
+            with self.store.edit() as value:value['auto']['candidates'][1]['source']='missing'
         self.assertEqual(self.store.path.read_bytes(),original)
 
 

@@ -36,13 +36,17 @@ FORBIDDEN = {"interface-name", "routing-mark", "dialer-proxy", "certificate", "p
 DELAY_TEST_URL = "https://www.gstatic.com/generate_204"
 DELAY_TEST_TIMEOUT_MS = 5000
 DELAY_HTTP_TIMEOUT = 6
-# Opt-in automatic failover between exactly two pinned candidates. No batch
-# testing, no background refresh; the monitor collector drives one evaluation
-# per cycle and every switch goes through the same select() path as the CLI.
+# Opt-in automatic failover between explicitly pinned candidates ordered by
+# preference (2..8). No batch testing, no background refresh; the monitor
+# collector drives one evaluation per cycle and every switch goes through the
+# same select() path as the CLI.
 AUTO_DEFAULTS = {"fail_after": 3, "recover_after": 2, "cooldown": 2}
+AUTO_MAX_CANDIDATES = 8
 LEGACY_AUTO_KEYS = {"enabled", "paused", "primary", "tailnet", "subscription",
                     "fail_after", "recover_after", "cooldown"}
-AUTO_KEYS = {"version", "enabled", "paused", "primary", "secondary",
+V2_AUTO_KEYS = {"version", "enabled", "paused", "primary", "secondary",
+                "fail_after", "recover_after", "cooldown"}
+AUTO_KEYS = {"version", "enabled", "paused", "candidates",
              "fail_after", "recover_after", "cooldown"}
 
 
@@ -244,10 +248,7 @@ def validate_source(value):
     return value
 
 
-def _policy(auto):
-    """An in-memory view; only an explicit Store.edit persists the conversion."""
-    if not isinstance(auto, dict) or set(auto) != LEGACY_AUTO_KEYS:
-        return auto
+def _v1_to_v2(auto):
     first = auto["primary"]
     second = "tailnet" if first == "subscription" else "subscription"
     return {"version": 2, "enabled": auto["enabled"], "paused": auto["paused"],
@@ -255,37 +256,65 @@ def _policy(auto):
             **{key: auto[key] for key in AUTO_DEFAULTS}}
 
 
+def _v2_to_v3(auto):
+    return {"version": 3, "enabled": auto["enabled"], "paused": auto["paused"],
+            "candidates": [dict(auto["primary"]), dict(auto["secondary"])],
+            **{key: auto[key] for key in AUTO_DEFAULTS}}
+
+
+def _policy(auto):
+    """An in-memory view; only an explicit Store.edit persists the conversion."""
+    if isinstance(auto, dict) and set(auto) == LEGACY_AUTO_KEYS:
+        auto = _v1_to_v2(auto)
+    if isinstance(auto, dict) and set(auto) == V2_AUTO_KEYS and auto.get("version") == 2:
+        auto = _v2_to_v3(auto)
+    return auto
+
+
+def _validate_auto_pin(pin, value, kind=None):
+    if not isinstance(pin, dict) or set(pin) != {"source", "node"}:
+        raise SourceError("invalid_auto")
+    try:
+        identifier(pin["source"])
+    except SourceError:
+        raise SourceError("invalid_auto") from None
+    source = value["sources"].get(pin["source"])
+    if source is None or (kind is not None and source["kind"] != kind):
+        raise SourceError("invalid_auto")
+    if (not isinstance(pin["node"], str)
+            or not re.fullmatch(r"nmd-" + re.escape(pin["source"]) + r"-[a-f0-9]{20}", pin["node"])):
+        raise SourceError("invalid_auto")
+
+
 def validate_auto(value):
     auto = value["auto"]
     legacy = isinstance(auto, dict) and set(auto) == LEGACY_AUTO_KEYS
-    if not isinstance(auto, dict) or (not legacy and set(auto) != AUTO_KEYS):
+    v2 = isinstance(auto, dict) and set(auto) == V2_AUTO_KEYS
+    if not isinstance(auto, dict) or (not legacy and not v2 and set(auto) != AUTO_KEYS):
         raise SourceError("invalid_auto")
     if type(auto["enabled"]) is not bool or type(auto["paused"]) is not bool:
         raise SourceError("invalid_auto")
     if legacy:
         if auto["primary"] not in ("tailnet", "subscription"):
             raise SourceError("invalid_auto")
-        roles = ("tailnet", "subscription")
-    else:
+        for role in ("tailnet", "subscription"):
+            _validate_auto_pin(auto[role], value, kind=role)
+    elif v2:
         if type(auto["version"]) is not int or auto["version"] != 2:
             raise SourceError("invalid_auto")
-        roles = ("primary", "secondary")
-    for role in roles:
-        pin = auto[role]
-        if not isinstance(pin, dict) or set(pin) != {"source", "node"}:
+        for role in ("primary", "secondary"):
+            _validate_auto_pin(auto[role], value)
+    else:
+        if type(auto["version"]) is not int or auto["version"] != 3:
             raise SourceError("invalid_auto")
-        try:
-            identifier(pin["source"])
-        except SourceError:
-            raise SourceError("invalid_auto") from None
-        source = value["sources"].get(pin["source"])
-        if source is None or (legacy and source["kind"] != role):
+        candidates = auto["candidates"]
+        if (not isinstance(candidates, list)
+                or not 2 <= len(candidates) <= AUTO_MAX_CANDIDATES):
             raise SourceError("invalid_auto")
-        if (not isinstance(pin["node"], str)
-                or not re.fullmatch(r"nmd-" + re.escape(pin["source"]) + r"-[a-f0-9]{20}", pin["node"])):
-            raise SourceError("invalid_auto")
+        for pin in candidates:
+            _validate_auto_pin(pin, value)
     policy = _policy(auto)
-    if policy["primary"]["node"] == policy["secondary"]["node"]:
+    if len({pin["node"] for pin in policy["candidates"]}) != len(policy["candidates"]):
         raise SourceError("invalid_auto")
     for key in AUTO_DEFAULTS:
         if type(auto[key]) is not int or not 2 <= auto[key] <= 10:
@@ -396,8 +425,8 @@ def fetch_subscription(url):
 def _clear_auto_reference(value, source_id):
     """Deleting/changing a pinned source atomically stands automation down."""
     auto = _policy(value.get("auto"))
-    if isinstance(auto, dict) and any(auto[role]["source"] == source_id
-                                      for role in ("primary", "secondary")):
+    if isinstance(auto, dict) and "candidates" in auto and any(
+            pin["source"] == source_id for pin in auto["candidates"]):
         value.pop("auto")
 
 
@@ -600,9 +629,8 @@ def _check_auto_decision(value, expected):
             or expected is None or _auto_decision(value) != expected):
         raise SourceError("auto_decision_stale")
     nodes = inventory(value)
-    if any(auto[role]["node"] not in nodes
-           or nodes[auto[role]["node"]][0] != auto[role]["source"]
-           for role in ("primary", "secondary")):
+    if any(pin["node"] not in nodes or nodes[pin["node"]][0] != pin["source"]
+           for pin in auto["candidates"]):
         raise SourceError("auto_decision_stale")
 
 
@@ -612,55 +640,37 @@ def _auto_pin(name, nodes, kind=None):
     return {"source": nodes[name][0], "node": name}
 
 
-def _single_tailnet_node(nodes):
-    candidates = [name for name, (_, source, _) in nodes.items() if source["kind"] == "tailnet"]
-    if len(candidates) != 1:
-        raise SourceError("auto_requires_single_tailnet_node")
-    return candidates[0]
-
-
-def _auto_subscription_default(value, nodes):
-    selected = value.get("selected")
-    if selected in nodes and nodes[selected][1]["kind"] == "subscription":
-        return selected
-    raise SourceError("auto_requires_subscription_node")
+def _auto_candidates(names, nodes):
+    if not isinstance(names, list) or not 2 <= len(names) <= AUTO_MAX_CANDIDATES:
+        raise SourceError("auto_node_not_in_inventory")
+    pins = [_auto_pin(name, nodes) for name in names]
+    if len({pin["node"] for pin in pins}) != len(pins):
+        raise SourceError("auto_candidates_must_differ")
+    return pins
 
 
 def auto_configure(store, payload):
-    """CLI and GUI share one policy writer; candidates are never inferred in v2."""
+    """CLI and GUI share one policy writer; candidates are never inferred."""
     action = payload.get("action")
+    legacy = {"primary_node", "secondary_node", "primary", "tailnet_node", "subscription_node"}
+    if set(payload) & legacy or action in {"swap", "set-primary"}:
+        raise SourceError("auto_legacy_payload_removed")
     allowed = {"action"}
     if action == "enable":
-        allowed |= {"primary_node", "secondary_node", "primary", "tailnet_node", "subscription_node", *AUTO_DEFAULTS}
-    elif action == "set-primary":
-        allowed.add("primary")
-    elif action not in {"disable", "resume", "swap"}:
+        allowed |= {"nodes", *AUTO_DEFAULTS}
+    elif action == "set-candidates":
+        allowed.add("nodes")
+    elif action not in {"disable", "resume"}:
         raise SourceError("auto_invalid_action")
     if set(payload) - allowed:
         raise SourceError("auto_invalid_parameters")
     with store.edit() as value:
         nodes = inventory(value)
+        if action in {"enable", "set-candidates"}:
+            candidates = _auto_candidates(payload.get("nodes"), nodes)
         if action == "enable":
-            explicit = "primary_node" in payload or "secondary_node" in payload
-            if explicit:
-                if set(payload) & {"primary", "tailnet_node", "subscription_node"}:
-                    raise SourceError("auto_invalid_parameters")
-                first = _auto_pin(payload.get("primary_node"), nodes)
-                second = _auto_pin(payload.get("secondary_node"), nodes)
-            else:
-                # Keep the existing CLI flags, defaults and ordering working.
-                primary = payload.get("primary")
-                if primary not in ("tailnet", "subscription"):
-                    raise SourceError("auto_primary_required")
-                tailnet = payload.get("tailnet_node") or _single_tailnet_node(nodes)
-                subscription = payload.get("subscription_node") or _auto_subscription_default(value, nodes)
-                pins = {"tailnet": _auto_pin(tailnet, nodes, "tailnet"),
-                        "subscription": _auto_pin(subscription, nodes, "subscription")}
-                first, second = pins[primary], pins["tailnet" if primary == "subscription" else "subscription"]
-            if first["node"] == second["node"]:
-                raise SourceError("auto_candidates_must_differ")
-            auto = {"version": 2, "enabled": True, "paused": False,
-                    "primary": first, "secondary": second}
+            auto = {"version": 3, "enabled": True, "paused": False,
+                    "candidates": candidates}
             for key, default in AUTO_DEFAULTS.items():
                 parameter = payload.get(key, default)
                 if type(parameter) is not int or not 2 <= parameter <= 10:
@@ -675,21 +685,9 @@ def auto_configure(store, payload):
             if action == "disable":
                 auto["enabled"] = False
                 result = "auto_disabled"
-            elif action in {"set-primary", "swap"}:
-                if action == "set-primary":
-                    kind = payload.get("primary")
-                    if kind not in ("tailnet", "subscription"):
-                        raise SourceError("auto_primary_required")
-                    matching = [role for role in ("primary", "secondary")
-                                if value["sources"][auto[role]["source"]]["kind"] == kind]
-                    if len(matching) != 1:
-                        raise SourceError("auto_legacy_primary_ambiguous_use_explicit_nodes")
-                    swap = matching[0] == "secondary"
-                else:
-                    swap = True
-                if swap:
-                    auto["primary"], auto["secondary"] = auto["secondary"], auto["primary"]
-                result = "auto_primary_updated"
+            elif action == "set-candidates":
+                auto["candidates"] = candidates
+                result = "auto_candidates_updated"
             else:
                 auto["paused"] = False
                 result = "auto_resumed"
@@ -698,46 +696,84 @@ def auto_configure(store, payload):
 
 def auto_signature(auto):
     auto = _policy(auto)
-    fields = ("primary", "secondary", "fail_after", "recover_after", "cooldown")
+    fields = ("candidates", "fail_after", "recover_after", "cooldown")
     return hashlib.sha256(encode({key: auto[key] for key in fields})).hexdigest()[:20]
 
 
 def _legacy_runtime_signature(auto, sources):
-    """Recognize an unchanged legacy episode without losing pending readback."""
-    kinds = {role: sources[auto[role]["source"]]["kind"] for role in ("primary", "secondary")}
-    if set(kinds.values()) != {"tailnet", "subscription"}:
+    """Recognize an unchanged pre-v2 episode without losing pending readback."""
+    if len(auto["candidates"]) != 2:
         return None
-    previous = {"primary": kinds["primary"], **{kinds[role]: auto[role] for role in kinds},
+    kinds = [sources[pin["source"]]["kind"] for pin in auto["candidates"]]
+    if set(kinds) != {"tailnet", "subscription"}:
+        return None
+    first, second = auto["candidates"]
+    previous = {"primary": kinds[0], kinds[0]: first, kinds[1]: second,
                 **{key: auto[key] for key in AUTO_DEFAULTS}}
     return hashlib.sha256(encode(previous)).hexdigest()[:20]
 
 
+def _v2_runtime_signature(auto):
+    """The digest a v2-era binary persisted for the same leading pair."""
+    if len(auto["candidates"]) != 2:
+        return None
+    previous = {"primary": auto["candidates"][0], "secondary": auto["candidates"][1],
+                **{key: auto[key] for key in AUTO_DEFAULTS}}
+    return hashlib.sha256(encode(previous)).hexdigest()[:20]
+
+
+def _translate_v2_runtime(runtime, auto):
+    """Carry target, counters and pending readback across the v2→v3 upgrade."""
+    runtime["target"] = {"primary": 0, "secondary": 1}.get(runtime.get("target"))
+    fails = [runtime.pop("primary_fail", 0), runtime.pop("secondary_fail", 0)]
+    runtime["fails"] = fails + [0] * (len(auto["candidates"]) - len(fails))
+    recover = runtime.pop("primary_recover", 0)
+    runtime["recover_rank"] = 0 if recover else None
+    runtime["recover_count"] = recover
+    runtime["all_unhealthy"] = runtime.pop("both_unhealthy", False)
+    runtime.pop("state", None)
+    runtime.pop("cooldown_remaining", None)
+    runtime["signature"] = auto_signature(auto)
+    return runtime
+
+
 def _fresh_runtime(auto):
-    return {"signature": auto_signature(auto), "target": None, "primary_fail": 0,
-            "primary_recover": 0, "secondary_fail": 0, "cycles_since_switch": 0,
-            "pending_verify": None, "suspended": False, "both_unhealthy": False}
+    return {"signature": auto_signature(auto), "target": None,
+            "fails": [0] * len(auto["candidates"]), "recover_rank": None,
+            "recover_count": 0, "cycles_since_switch": 0,
+            "pending_verify": None, "suspended": False, "all_unhealthy": False}
+
+
+def _zero_counters(runtime):
+    runtime["fails"] = [0] * len(runtime["fails"])
+    runtime["recover_rank"] = None
+    runtime["recover_count"] = 0
 
 
 def _runtime_view(runtime, auto):
     """Derive display-only fields onto the runtime itself; never a parallel export."""
     if not runtime:
         return
+    target = runtime.get("target")
+    if type(target) is not int or not 0 <= target < len(auto["candidates"]):
+        target = None
+    fails = runtime.get("fails") if isinstance(runtime.get("fails"), list) else []
     if auto.get("paused"):
         state = "paused"
     elif runtime.get("suspended"):
         state = "suspended"
     elif runtime.get("pending_verify"):
         state = "pending_verify"
-    elif runtime.get("both_unhealthy"):
-        state = "both_unhealthy"
-    elif runtime.get("target") is None:
-        state = "primary_failing" if runtime.get("primary_fail") else "engaging"
-    elif runtime["target"] == "secondary":
-        state = ("secondary_failing" if runtime.get("secondary_fail")
-                 else "recovering" if runtime.get("primary_recover")
-                 else "secondary_active")
+    elif runtime.get("all_unhealthy"):
+        state = "all_unhealthy"
+    elif target is None:
+        state = "engaging"
+    elif fails[target:target + 1] and fails[target]:
+        state = "failing"
+    elif runtime.get("recover_count"):
+        state = "recovering"
     else:
-        state = "primary_failing" if runtime.get("primary_fail") else "primary_active"
+        state = "active"
     runtime["state"] = state
     runtime["cooldown_remaining"] = max(0, auto["cooldown"] - runtime.get("cycles_since_switch", 0))
 
@@ -756,10 +792,12 @@ def auto_evaluate(directory, runtime, emit):
 def _auto_evaluate(directory, runtime, emit, value, auto):
     value["auto"] = auto
     signature = auto_signature(auto)
-    if (isinstance(runtime, dict) and runtime.get("signature") is not None
-            and runtime.get("signature") != signature
-            and runtime.get("signature") == _legacy_runtime_signature(auto, value["sources"])):
-        runtime["signature"] = signature
+    if (isinstance(runtime, dict) and runtime.get("signature") != signature
+            and "primary_fail" in runtime and len(auto["candidates"]) == 2):
+        previous = runtime.get("signature")
+        if previous is not None and (previous == _legacy_runtime_signature(auto, value["sources"])
+                                     or previous == _v2_runtime_signature(auto)):
+            runtime = _translate_v2_runtime(runtime, auto)
     if not isinstance(runtime, dict) or runtime.get("signature") != signature:
         if isinstance(runtime, dict) and runtime:
             emit("candidate_changed", {})
@@ -768,11 +806,11 @@ def _auto_evaluate(directory, runtime, emit, value, auto):
         return runtime
     decision = _auto_decision(value)
     nodes = inventory(value)
-    roles = {role: auto[role] for role in ("primary", "secondary")}
-    missing = next((role for role in roles if auto[role]["node"] not in nodes), None)
-    if missing:
+    candidates = auto["candidates"]
+    missing = next((rank for rank, pin in enumerate(candidates) if pin["node"] not in nodes), None)
+    if missing is not None:
         if not runtime.get("suspended"):
-            emit("auto_suspended", {"reason": missing + "_node_missing"})
+            emit("auto_suspended", {"reason": "node_missing", "rank": missing})
         runtime["suspended"] = True
         runtime["target"] = None
         return runtime
@@ -801,19 +839,22 @@ def _auto_evaluate(directory, runtime, emit, value, auto):
             value = confirmed
             auto = _policy(value["auto"])
             decision = _auto_decision(value)
-            runtime["target"] = next(role for role, pin in roles.items() if pin["node"] == expected)
+            candidates = auto["candidates"]
+            runtime["target"] = next((rank for rank, pin in enumerate(candidates)
+                                      if pin["node"] == expected), None)
             runtime["cycles_since_switch"] = 0
-            runtime["primary_fail"] = runtime["primary_recover"] = runtime["secondary_fail"] = 0
+            _zero_counters(runtime)
             emit("auto_verify_adopted", {"node": expected})
     # Align the standing target with any desired/live selection on a candidate.
     selected = value.get("selected")
-    for role, pin in roles.items():
-        if selected == pin["node"] and runtime.get("target") != role:
-            if runtime.get("target") is not None:
-                emit("manual_engage_" + role, {"node": selected})
-            runtime["target"] = role
-            runtime["primary_fail"] = runtime["primary_recover"] = runtime["secondary_fail"] = 0
-            break
+    if selected is not None:
+        for rank, pin in enumerate(candidates):
+            if selected == pin["node"] and runtime.get("target") != rank:
+                if runtime.get("target") is not None:
+                    emit("manual_engage", {"rank": rank, "node": selected})
+                runtime["target"] = rank
+                _zero_counters(runtime)
+                break
     client = Controller(value)
     try:
         client.current()
@@ -828,47 +869,46 @@ def _auto_evaluate(directory, runtime, emit, value, auto):
             return None
         except SourceError as exc:
             return False if str(exc) == "delay_test_failed" else None
-    primary_ok = healthy(roles["primary"])
-    secondary_ok = healthy(roles["secondary"])
-    if primary_ok is None or secondary_ok is None:
+    results = [healthy(pin) for pin in candidates]
+    if any(result is None for result in results):
         emit("controller_unreachable", {})
         return runtime
-    if not primary_ok and not secondary_ok:
-        if not runtime.get("both_unhealthy"):
-            emit("both_unhealthy", {})
-        runtime["both_unhealthy"] = True
+    if not any(results):
+        if not runtime.get("all_unhealthy"):
+            emit("all_unhealthy", {})
+        runtime["all_unhealthy"] = True
         runtime["cycles_since_switch"] = runtime.get("cycles_since_switch", 0) + 1
         return runtime
-    runtime["both_unhealthy"] = False
+    runtime["all_unhealthy"] = False
     target = runtime.get("target")
+    if type(target) is not int or not 0 <= target < len(candidates):
+        target = None
     cooldown_ok = runtime.get("cycles_since_switch", 0) >= auto["cooldown"]
     switch_to, reason = None, None
-    if target == "secondary":
-        if primary_ok and not secondary_ok:
-            runtime["primary_recover"] = 0
-            runtime["secondary_fail"] += 1
-            if runtime["secondary_fail"] >= auto["fail_after"] and cooldown_ok:
-                switch_to, reason = "primary", "secondary_unhealthy"
-        elif primary_ok:
-            runtime["secondary_fail"] = 0
-            runtime["primary_recover"] += 1
-            if runtime["primary_recover"] >= auto["recover_after"] and cooldown_ok:
-                switch_to, reason = "primary", "primary_recovered"
-        else:
-            runtime["primary_recover"] = 0
-            if secondary_ok:
-                runtime["secondary_fail"] = 0
+    if target is None:
+        # Cold start: engage the highest-priority healthy candidate now.
+        switch_to, reason = results.index(True), "auto_engaged"
     else:
-        if primary_ok:
-            runtime["primary_fail"] = 0
-            if target is None:
-                switch_to, reason = "primary", "auto_engaged"
-        elif secondary_ok:
-            runtime["primary_fail"] += 1
-            if runtime["primary_fail"] >= auto["fail_after"] and cooldown_ok:
-                switch_to, reason = "secondary", "primary_unhealthy"
-    if switch_to:
-        node = roles[switch_to]["node"]
+        runtime["fails"][target] = 0 if results[target] else runtime["fails"][target] + 1
+        recover_to = next((rank for rank in range(target) if results[rank]), None)
+        if results[target] and recover_to is not None:
+            if runtime.get("recover_rank") != recover_to:
+                runtime["recover_rank"] = recover_to
+                runtime["recover_count"] = 0
+            runtime["recover_count"] += 1
+            if runtime["recover_count"] >= auto["recover_after"] and cooldown_ok:
+                switch_to, reason = recover_to, "candidate_recovered"
+        else:
+            runtime["recover_rank"] = None
+            runtime["recover_count"] = 0
+        if not results[target]:
+            best_other = next((rank for rank in range(len(candidates))
+                               if rank != target and results[rank]), None)
+            if (best_other is not None and runtime["fails"][target] >= auto["fail_after"]
+                    and cooldown_ok):
+                switch_to, reason = best_other, "candidate_unhealthy"
+    if switch_to is not None:
+        node = candidates[switch_to]["node"]
         try:
             select(Store(directory), node, origin="auto", auto_decision=decision)
         except SourceError as exc:
@@ -884,9 +924,8 @@ def _auto_evaluate(directory, runtime, emit, value, auto):
         else:
             emit("auto_switch", {"from": target, "to": switch_to, "node": node, "reason": reason})
             runtime["target"] = switch_to
-            runtime["primary_fail"] = runtime["primary_recover"] = runtime["secondary_fail"] = 0
-            runtime["cycles_since_switch"] = 0
-            runtime["cycles_since_switch"] += 1
+            _zero_counters(runtime)
+            runtime["cycles_since_switch"] = 1
             return runtime
     runtime["cycles_since_switch"] = runtime.get("cycles_since_switch", 0) + 1
     return runtime
@@ -1036,20 +1075,19 @@ def main(argv=None, directory=None, allow_directory_override=True):
     sub.add_argument("node", help="manual single-node latency check via loopback controller")
     sub = commands.add_parser("auto")
     actions = sub.add_subparsers(dest="auto_action", required=True, parser_class=Parser)
-    enable = actions.add_parser("enable", help="opt in to automatic failover between two pinned nodes")
-    enable.add_argument("--primary", choices=["tailnet", "subscription"], help="legacy candidate order")
-    enable.add_argument("--primary-node", help="explicit primary cached node")
-    enable.add_argument("--secondary-node", help="explicit secondary cached node")
-    enable.add_argument("--tailnet-node")
-    enable.add_argument("--subscription-node")
+    enable = actions.add_parser("enable", help="opt in to automatic failover between pinned nodes ordered by preference")
+    group = enable.add_mutually_exclusive_group(required=True)
+    group.add_argument("--node", action="append", metavar="NODE", help="candidate node, highest priority first; repeatable")
+    group.add_argument("--nodes", metavar="A,B,...", help="comma-separated candidate nodes, highest priority first")
     enable.add_argument("--fail-after", type=int)
     enable.add_argument("--recover-after", type=int)
     enable.add_argument("--cooldown", type=int)
     actions.add_parser("disable")
-    actions.add_parser("swap", help="exchange the two existing candidates")
-    primary_action = actions.add_parser("set-primary")
-    primary_action.add_argument("--primary", required=True, choices=["tailnet", "subscription"])
-    actions.add_parser("resume", help="clear the pause a manual tailnet selection caused")
+    replace = actions.add_parser("set-candidates", help="replace the ordered candidate list of the existing policy")
+    group = replace.add_mutually_exclusive_group(required=True)
+    group.add_argument("--node", action="append", metavar="NODE")
+    group.add_argument("--nodes", metavar="A,B,...")
+    actions.add_parser("resume", help="clear the pause a manual selection caused")
     actions.add_parser("status")
     args = parser.parse_args(argv)
     store = Store(args.sources_dir)
@@ -1078,18 +1116,13 @@ def main(argv=None, directory=None, allow_directory_override=True):
                       "desired": view["desired"]}
         else:
             payload = {"action": args.auto_action}
-            if args.auto_action in {"enable", "set-primary"} and args.primary is not None:
-                payload["primary"] = args.primary
-            if args.auto_action == "enable":
-                for key, argument in (("primary_node", "primary_node"),
-                                      ("secondary_node", "secondary_node"),
-                                      ("tailnet_node", "tailnet_node"),
-                                      ("subscription_node", "subscription_node"),
-                                      ("fail_after", "fail_after"),
-                                      ("recover_after", "recover_after"),
-                                      ("cooldown", "cooldown")):
-                    if getattr(args, argument) is not None:
-                        payload[key] = getattr(args, argument)
+            if args.auto_action in {"enable", "set-candidates"}:
+                payload["nodes"] = args.node if args.node is not None else args.nodes.split(",")
+                if args.auto_action == "enable":
+                    for key in AUTO_DEFAULTS:
+                        argument = getattr(args, key)
+                        if argument is not None:
+                            payload[key] = argument
             result = auto_configure(store, payload)
     else:
         identifier(args.id)
