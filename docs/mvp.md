@@ -63,8 +63,8 @@ GUI 仅绑定本机回环地址，不提供公网监听选项。不要通过反�
 每周期内评估自动切换并把事件写入 `auto_events`；采集器自身永远不因评估失败中断，
 周期预算按评估耗时扩展以保持新鲜度判定准确。CAPABILITIES 的 `read_only_gui` 因此为
 false，`local_egress_control` 与 `channel_management` 为 true，`network_mutations` 仍为 false
-（网络部署不变）。macOS/demo 两项管理能力均关闭。主备为任意两个明确节点，手动选择
-统一暂停策略，不自动替换候选；兼容迁移与稳定 ID 见出口通道文档。
+（网络部署不变）。macOS/demo 两项管理能力均关闭。候选为任意 2..8 个按优先级排序的
+明确节点，手动选择统一暂停策略，不自动替换候选；兼容迁移与稳定 ID 见出口通道文档。
 
 ## 场景配置不是网络模式
 
