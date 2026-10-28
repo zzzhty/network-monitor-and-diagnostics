@@ -28,6 +28,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("fetch('/api/snapshot'", js)
         self.assertIn("postJSON('/api/egress/select'", js)
         self.assertIn("postJSON('/api/egress/delay'", js)
+        self.assertIn("postJSON('/api/egress/diagnose'", js)
         self.assertIn("postJSON('/api/auto'", js)
         self.assertIn('AbortController', js)
         self.assertIn('document.hidden', js)
@@ -35,6 +36,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('5000', js)
         self.assertIn('aria-label=', html)
         self.assertIn('data-page="egress"', html)
+        self.assertIn('id="diagnose-run"', html)
 
     def test_platform_and_synthetic_data_are_visible(self):
         html = (ROOT / 'web/index.html').read_text()

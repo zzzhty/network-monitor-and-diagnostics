@@ -19,4 +19,13 @@
 #egress-action-note{min-height:1.2em}
 #egress-current-id{margin:2px 0 8px}
 
+#diagnose-run{border:1px solid #374561;background:#202b40;color:#d8e2ff;border-radius:7px;padding:10px 14px}
+#diagnose-run:disabled{opacity:.5;cursor:not-allowed}
+#diagnose-results .diagnose-row{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:8px 10px;border:1px solid #263043;border-radius:8px;margin:6px 0;font-size:13px}
+#diagnose-results .diagnose-row>span:first-child{font-weight:600;overflow-wrap:anywhere}
+.diagnose-ms{color:#92a0b4;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:nowrap}
+.diagnose-verdict{margin:12px 0 0;font-weight:600;overflow-wrap:anywhere}
+.diagnose-verdict.ok{color:#91d7bd}
+.diagnose-verdict.fail{color:#f4a7b6}
+
 .channel-form{display:grid;gap:14px;margin-top:18px}.channel-form fieldset{display:grid;gap:12px;border:0;padding:0;margin:0;min-width:0}.channel-form fieldset[hidden],.channel-form[hidden]{display:none}.channel-form label,.channel-rename-form label{display:grid;gap:6px;font-size:12px;color:var(--muted)}.channel-form input,.channel-form select,.channel-rename-form input{font:inherit;min-width:0;width:100%;border:1px solid var(--line);background:#101620;color:inherit;padding:10px;border-radius:7px}.channel-form button,.channel-rename-form button{border:1px solid #374561;background:#202b40;color:#d8e2ff;border-radius:7px;padding:10px 14px}.channel-form button:disabled,.channel-rename-form button:disabled{opacity:.5;cursor:not-allowed}.channel-rename-form{display:flex;align-items:end;gap:10px;flex-wrap:wrap}.channel-rename-form label{flex:1;min-width:150px}.channel-row{border-bottom:1px solid var(--line);padding-bottom:14px}.channel-row h3{overflow-wrap:anywhere;margin-top:8px}.auto-actions .channel-form{flex:1 1 100%;margin:0}.auto-actions select{max-width:100%}.candidate-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;align-items:end}.candidate-row .candidate-move,.candidate-row .candidate-remove{border:1px solid #374561;background:#202b40;color:#d8e2ff;border-radius:7px;padding:10px 12px}.candidate-row button:disabled{opacity:.5;cursor:not-allowed}

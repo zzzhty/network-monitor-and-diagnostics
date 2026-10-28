@@ -39,6 +39,12 @@
     <section id="egress" class="page" aria-label="出口节点" hidden>
       <article class="card"><p class="eyebrow">ACTIVE EGRESS</p><h2>当前出口</h2><p id="egress-current-name" class="metric">未知</p><p id="egress-current-id" class="node-id">—</p><p id="egress-current-mode" class="muted">选择模式未知</p></article>
       <article class="card">
+        <h2>一键排查</h2>
+        <p class="muted">对四个固定公共目标（本机直连外网、国内直连、经节点访问外网、经节点出口 IP 免 DNS）与当前候选做一次并行分层探测，给出固定结论码；不修改任何配置或选择。探测目标固定、结论码有限，不能替代诊断手册 3.3 的人工矩阵；本页或面板本身不可达时请走 CLI 排查。仅 Linux 出口控制环境可用。</p>
+        <button id="diagnose-run" type="button" disabled>一键排查</button>
+        <div id="diagnose-results" aria-label="分层排查结果"></div>
+      </article>
+      <article class="card">
         <h2>通道 Channels</h2>
         <div id="channel-list" class="list" aria-label="通道列表"></div>
         <form id="channel-add-form" class="channel-form" hidden autocomplete="off">
@@ -82,7 +88,7 @@
       </article>
     </section>
     <section id="help" class="page" aria-label="设置与帮助" hidden>
-      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 和模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速。自动故障切换是手动开启的可选模式，在按优先级排序的候选列表（2–8 个）之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅可在通道列表中点击「更新订阅」显式刷新；删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。此界面不提供系统网络设置、任意命令执行或网络部署；订阅刷新仅按通道显式发起，通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒，订阅刷新最长 30 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
+      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 和模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速；「一键排查」按固定公共目标分层探测一次并给出固定结论码，仅作快速分诊。自动故障切换是手动开启的可选模式，在按优先级排序的候选列表（2–8 个）之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅可在通道列表中点击「更新订阅」显式刷新；删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。此界面不提供系统网络设置、任意命令执行或网络部署；订阅刷新仅按通道显式发起，通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒，订阅刷新与一键排查最长 30 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
     </section>
     <footer><span>NMD / 本地面板</span><span>证据优先 · 独立监控 · 无云端依赖</span></footer>
   </main>

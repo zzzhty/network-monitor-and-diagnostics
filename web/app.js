@@ -3,7 +3,7 @@
 (() => {
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
   const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map(), pendingRefresh = new Set();
-  let pendingChannel = false, pendingPolicy = false, candidateDrafts = null;
+  let pendingChannel = false, pendingPolicy = false, candidateDrafts = null, diagnoseReport = null, pendingDiagnose = false;
   const $ = id => document.getElementById(id);
   const make = (tag, value, cls) => {
     const el = document.createElement(tag);
@@ -82,6 +82,22 @@
     paused: '已暂停', suspended: '候选缺失 · 评估挂起', pending_verify: '切换待确认',
     all_unhealthy: '全部候选不健康 · 保持当前出口', engaging: '等待首次接管',
     active: '当前候选健康', failing: '当前候选失败计数中', recovering: '高优先候选恢复计数中'
+  };
+  const diagnoseProbeNames = {
+    direct_foreign: '本机直连外网', egress_cn: '国内直连',
+    egress_foreign: '经节点访问外网', egress_exit_ip: '经节点出口 IP（免 DNS）'
+  };
+  const diagnoseHealthNames = { ok: '健康', fail: '失败', controller_unreachable: '控制器故障', skipped: '未探测' };
+  const diagnoseTcpNames = { ok: 'TCP 可达', refused: 'TCP 拒绝', timeout: 'TCP 超时', unreachable: 'TCP 不可达', skipped: '跳过' };
+  const diagnoseHints = {
+    egress_healthy: '各层探测均正常，出口链路健康。',
+    local_internet_down: '本机直连外网失败：先排查本地网络与路由，与出口节点无关。',
+    node_service_down: '候选全部失测且节点主机拒绝连接：节点服务疑似停机，可切换其他候选。',
+    node_network_unreachable: '候选节点 TCP 连接超时或不可达：到节点的网络路径不通或被丢弃。',
+    exit_dns_poisoned: '出口 IP 可达但域名访问失败：疑似出口侧 DNS 污染，可对照诊断手册 3.3 处理。',
+    egress_degraded: '链路可用但经节点耗时超过 3 秒：中继路径劣化，可考虑切换候选。',
+    controller_unreachable: '本地控制器探测故障：不能据此判定节点失效，请检查核心与控制器。',
+    egress_anomaly: '失败组合未命中固定结论：请按诊断手册 3.3 人工排查。'
   };
   function note(message) { text('egress-action-note', message || ''); }
   function renderChannels() {
@@ -169,6 +185,54 @@
     });
     $('auto-add-candidate').disabled = !controlsEnabled() || pendingPolicy || candidateDrafts.length >= 8;
   }
+  function renderDiagnose() {
+    const canControl = controlsEnabled();
+    $('diagnose-run').disabled = !canControl || pendingDiagnose;
+    $('diagnose-run').textContent = pendingDiagnose ? '排查中…' : '一键排查';
+    const box = $('diagnose-results');
+    box.replaceChildren();
+    if (!canControl) {
+      box.append(empty('仅 Linux 出口控制环境可用一键排查。'));
+      return;
+    }
+    if (!diagnoseReport) return;
+    for (const [key, label] of Object.entries(diagnoseProbeNames)) {
+      const probe = diagnoseReport.probes?.[key];
+      if (!probe) continue;
+      const row = make('div', undefined, 'diagnose-row');
+      row.append(make('span', label),
+        badge(probe.status === 'ok' ? 'success' : 'failure', probe.status === 'ok' ? '成功' : `失败（${probe.error || '未知'}）`),
+        make('span', finite(probe.total_ms) ? `${probe.total_ms} ms` : '—', 'diagnose-ms'));
+      box.append(row);
+    }
+    for (const candidate of (Array.isArray(diagnoseReport.candidates) ? diagnoseReport.candidates : [])) {
+      const node = (sources?.nodes || []).find(item => item.id === candidate.node);
+      const health = candidate.health === 'ok' && finite(candidate.delay_ms)
+        ? `健康 ${candidate.delay_ms} ms` : diagnoseHealthNames[candidate.health] || '未知';
+      const tcp = candidate.tcp === 'skipped' ? 'TCP 跳过（非 Tailnet 路径）' : diagnoseTcpNames[candidate.tcp] || '—';
+      const row = make('div', undefined, 'diagnose-row');
+      row.append(make('span', `候选 · ${node?.display || candidate.node}`),
+        badge(candidate.health === 'ok' ? 'success' : candidate.health === 'fail' ? 'failure' : 'unknown', health),
+        make('span', tcp, 'diagnose-ms'));
+      box.append(row);
+    }
+    const code = diagnoseReport.verdict?.code;
+    box.append(make('p', `结论：${diagnoseHints[code] || '结论未知，请按诊断手册 3.3 人工排查。'}`,
+      'diagnose-verdict ' + (code === 'egress_healthy' ? 'ok' : 'fail')));
+  }
+  async function runDiagnose() {
+    if (!controlsEnabled() || pendingDiagnose) return;
+    pendingDiagnose = true; note('正在分层探测（最长约 15 秒）…'); render();
+    try {
+      const data = await postJSON('/api/egress/diagnose', {}, 30000);
+      if (data?.schema_version !== 1 || !data.verdict?.code || !data.probes) throw new Error('invalid_response');
+      diagnoseReport = data; note('');
+    } catch (error) {
+      diagnoseReport = null;
+      note(controlErrors[error.message] || '一键排查失败，请稍后重试。');
+    } finally { pendingDiagnose = false; render(); }
+  }
+  $('diagnose-run').addEventListener('click', runDiagnose);
   function render() {
     const demoMode = snapshot?.collector?.data_origin === 'demo';
     const canControl = controlsEnabled();
@@ -199,6 +263,7 @@
       ? (auto.paused ? '自动 · 已暂停（手动接管）'
         : auto.enabled ? `自动 · ${candidates.length} 个候选 · 首选 ${displayOf(candidates[0]?.node)}${targetName}` : '手动 · 自动已停用')
       : '手动选择');
+    renderDiagnose();
     $('egress-node-list').replaceChildren();
     if (!canControl && !nodes.length) $('egress-node-list').append(empty('此环境仅提供只读诊断，不读取出口来源或启用控制。'));
     else if (!nodes.length && sources) $('egress-node-list').append(empty('暂无缓存节点；请在通道列表点击「更新订阅」，或使用 nmd source refresh。'));

@@ -6,6 +6,7 @@ const path = require('node:path');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root = path.resolve(__dirname, '..');
 let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
+let diagnoseView = null;
 let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
 let sourceView = { schema_version: 1, sources: [], nodes: [], active: null, controller: 'not_queried', selection_mode: 'manual' };
 const failingNodes = [];
@@ -55,6 +56,10 @@ const server = http.createServer((req, res) => {
         if (failingNodes.includes(body.node)) { res.writeHead(409); return res.end('{"error":"delay_test_failed"}'); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ node: body.node, delay_ms: 87 }));
+      }
+      if (req.url === '/api/egress/diagnose') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(diagnoseView));
       }
       if (req.url === '/api/auto' && body && typeof body.action === 'string') {
         if (body.action === 'enable') {
@@ -254,6 +259,35 @@ const server = http.createServer((req, res) => {
     const update = posts.filter(([url]) => url === '/api/auto').at(-1);
     assert.match(update[1], /"action":"set-candidates"/);
     assert.deepEqual(JSON.parse(update[1]).nodes, ['nmd-sub-a-aaaaaaaaaaaaaaaaaaaa', 'nmd-sub-a-0123456789abcdef0123']);
+    // One-click layered diagnosis posts a strict empty body and renders the
+    // mocked per-layer rows plus the verdict hint from the fixed code set.
+    diagnoseView = { schema_version: 1, generated_at: now, selector_now: 'nmd-sub-a-0123456789abcdef0123',
+      probes: { direct_foreign: { status: 'ok', error: null, total_ms: 41 },
+                egress_cn: { status: 'ok', error: null, total_ms: 18 },
+                egress_foreign: { status: 'ok', error: null, total_ms: 152 },
+                egress_exit_ip: { status: 'ok', error: null, total_ms: 143 } },
+      verdict: { code: 'egress_healthy', hint_key: 'egress_healthy' },
+      candidates: [{ source: 'sub-a', kind: 'subscription', node: 'nmd-sub-a-0123456789abcdef0123',
+                     health: 'ok', delay_ms: 87, tcp: 'skipped', tcp_ms: null, tcp_reason: 'server_routed_through_tun' }] };
+    const diagnosePostsBefore = posts.length;
+    await page.locator('#diagnose-run').click();
+    await page.waitForFunction(() => document.querySelector('#diagnose-results')?.textContent.includes('各层探测均正常'));
+    assert.deepEqual(posts.slice(diagnosePostsBefore).map(([url]) => url), ['/api/egress/diagnose']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), {});
+    const diagnoseText = await page.locator('#diagnose-results').textContent();
+    assert.match(diagnoseText, /本机直连外网/);
+    assert.match(diagnoseText, /经节点访问外网/);
+    assert.match(diagnoseText, /152 ms/);
+    assert.match(diagnoseText, /TCP 跳过（非 Tailnet 路径）/);
+    // A fault verdict run re-renders layers and the matching hint.
+    diagnoseView = { ...diagnoseView,
+      probes: { ...diagnoseView.probes,
+        egress_foreign: { status: 'fail', error: 'dns_error', total_ms: null },
+        egress_exit_ip: { status: 'ok', error: null, total_ms: 200 } },
+      verdict: { code: 'exit_dns_poisoned', hint_key: 'exit_dns_poisoned' } };
+    await page.locator('#diagnose-run').click();
+    await page.waitForFunction(() => document.querySelector('#diagnose-results').textContent.includes('DNS 污染'));
+    assert.match(await page.locator('#diagnose-results').textContent(), /失败（dns_error）/);
     assert.equal(await page.locator('#egress img').count(), 0);
     capabilityView.platform = 'macos';
     capabilityView.local_egress_control = false;
@@ -262,6 +296,10 @@ const server = http.createServer((req, res) => {
     await refresh();
     assert.equal(await page.locator('.node-select').first().isEnabled(), false);
     assert.equal(await page.locator('.delay-btn').first().isEnabled(), false);
+    // Diagnosis stays a Linux control action: the button is disabled in
+    // read-only mode, so no probe battery can be posted.
+    assert.equal(await page.locator('#diagnose-run').isEnabled(), false);
+    assert.match(await page.locator('#diagnose-results').textContent(), /仅 Linux 出口控制环境可用/);
     assert.equal(await page.locator('#auto-actions').isVisible(), false);
     assert.equal(await page.locator('#channel-add-form').isVisible(), false);
     assert.equal(await page.locator('button[data-refresh]').count(), 0);
@@ -314,7 +352,7 @@ const server = http.createServer((req, res) => {
     await page.waitForTimeout(5200);
     assert.ok(requests.filter(r => r[1] === '/api/snapshot').length > before, 'visible page polls');
     const readable = ['/', '/app.js', '/style.css', '/api/snapshot', '/api/sources', '/api/capabilities', '/favicon.ico'];
-    const writable = ['/api/egress/select', '/api/egress/delay', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh'];
+    const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh'];
     assert.ok(requests.every(([method, url]) => (method === 'GET' && readable.includes(url)) || (method === 'POST' && writable.includes(url))), 'only intended same-origin requests');
     // Render only the bundled error page. Never launch the desktop binary,
     // invoke a custom URL handler, read real configuration, or start a sidecar.
@@ -331,6 +369,6 @@ const server = http.createServer((req, res) => {
     assert.deepEqual(errorPageRequests, []);
     await errorPage.close();
     assert.deepEqual(errors, []);
-    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, channel subscription refresh, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, CSP.');
+    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, one-click diagnose, channel subscription refresh, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, CSP.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());
