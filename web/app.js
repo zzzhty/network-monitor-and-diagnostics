@@ -3,7 +3,7 @@
 (() => {
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
   const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map();
-  let pendingChannel = false, pendingPolicy = false;
+  let pendingChannel = false, pendingPolicy = false, candidateDrafts = null;
   const $ = id => document.getElementById(id);
   const make = (tag, value, cls) => {
     const el = document.createElement(tag);
@@ -52,26 +52,24 @@
     node_not_found: '节点不存在，可能已随订阅刷新变化。', node_not_deployed_apply_first: '节点未部署，请先运行 nmd apply。',
     selection_outcome_unknown_read_status_before_retry: '切换结果不确定，已停止重试；请刷新查看当前出口。',
     delay_test_failed: '测速失败或该节点当前不可达。', source_operation_busy: '操作冲突，请稍后重试。',
-    auto_not_configured: '自动切换尚未配置。', auto_requires_single_tailnet_node: '需要恰好一个 Tailnet 来源节点。',
-    auto_requires_subscription_node: '请先选择一个订阅节点作为候选。', auto_primary_required: '需要指定主选侧。',
+    auto_not_configured: '自动切换尚未配置。', auto_legacy_payload_removed: '旧版主备参数已移除；请使用候选列表配置或更新候选。',
     invalid_channel_name: '显示名称须为 1–128 个字符，不能含控制字符。', source_already_exists: '通道 ID 已存在，请使用另一个 ID。',
     invalid_source_id: '通道 ID 需以小写字母开头，只含小写字母、数字和短横线，最长 32 字符。',
     subscription_requires_https_url: '订阅需使用 HTTPS 443 URL，不能含用户名、密码或片段。',
     proxy_requires_literal_non_tailnet_ip: '普通路径代理需使用非 Tailnet 的 IP 地址。', tailnet_requires_literal_tailnet_ip: 'Tailnet 通道需使用 Tailnet IP 地址。',
-    invalid_proxy_port: '端口须为 1–65535。', auto_candidates_must_differ: '主备节点必须不同。', auto_node_not_in_inventory: '请明确选择两个有效缓存节点。',
+    invalid_proxy_port: '端口须为 1–65535。', auto_candidates_must_differ: '候选节点必须互不相同。', auto_node_not_in_inventory: '请按优先级选择 2–8 个有效缓存节点。',
     auto_invalid_parameters: '参数无效。', auto_invalid_action: '操作无效。', sources_unavailable: '私有来源数据不可用。'
   };
   const autoEventNames = {
     auto_engaged: '自动接管', auto_switch: '自动切换', auto_switch_failed: '切换失败', auto_verify_adopted: '切换确认',
-    auto_suspended: '自动挂起', auto_resumed: '自动恢复', manual_engage_primary: '手动回到主选',
-    manual_engage_secondary: '手动选择备选', candidate_changed: '候选变化', controller_unreachable: '控制器不可达',
-    both_unhealthy: '双侧不健康', auto_error: '评估异常'
+    auto_suspended: '自动挂起', auto_resumed: '自动恢复', manual_engage: '手动选择候选',
+    candidate_changed: '候选变化', controller_unreachable: '控制器不可达',
+    all_unhealthy: '全部候选不健康', auto_error: '评估异常'
   };
   const runtimeStateNames = {
     paused: '已暂停', suspended: '候选缺失 · 评估挂起', pending_verify: '切换待确认',
-    both_unhealthy: '双侧不健康 · 保持当前出口', engaging: '等待首次接管',
-    primary_active: '主选健康', primary_failing: '主选失败计数中',
-    secondary_active: '备选健康', secondary_failing: '备选失败计数中', recovering: '主选恢复计数中'
+    all_unhealthy: '全部候选不健康 · 保持当前出口', engaging: '等待首次接管',
+    active: '当前候选健康', failing: '当前候选失败计数中', recovering: '高优先候选恢复计数中'
   };
   function note(message) { text('egress-action-note', message || ''); }
   function renderChannels() {
@@ -106,8 +104,7 @@
       $('channel-list').append(item);
     }
   }
-  function renderCandidate(select, nodes, preferred, locked) {
-    const current = select.value;
+  function fillCandidateSelect(select, nodes, preferred) {
     select.replaceChildren(make('option', '请选择节点'));
     select.firstElementChild.value = '';
     for (const node of nodes) {
@@ -115,9 +112,40 @@
       const option = make('option', `${channel ? channelLabel(channel) : node.source} · ${node.display || node.id}`);
       option.value = node.id; select.append(option);
     }
-    const exists = id => nodes.some(node => node.id === id);
-    select.value = locked && exists(preferred) ? preferred : exists(current) ? current : exists(preferred) ? preferred : '';
-    select.disabled = !controlsEnabled() || locked || pendingPolicy;
+    select.value = nodes.some(node => node.id === preferred) ? preferred : '';
+    select.disabled = !controlsEnabled() || pendingPolicy;
+  }
+  function renderCandidateRows(nodes, auto) {
+    const box = $('auto-candidate-rows');
+    // Preserve an open dropdown across read-only polling refreshes; row
+    // buttons may rebuild immediately after moving or removing a candidate.
+    const editing = box.contains(document.activeElement) && document.activeElement.matches('select');
+    if (pendingPolicy || editing) return;
+    if (candidateDrafts === null) {
+      candidateDrafts = Array.isArray(auto?.candidates) ? auto.candidates.map(pin => pin.node).filter(Boolean) : [];
+      while (candidateDrafts.length < 2) candidateDrafts.push('');
+    }
+    box.replaceChildren();
+    candidateDrafts.forEach((id, index) => {
+      const row = make('div', undefined, 'candidate-row');
+      const label = make('label', `候选 ${index + 1}`);
+      const select = make('select');
+      select.dataset.rank = index;
+      fillCandidateSelect(select, nodes, id);
+      label.append(select);
+      const up = make('button', '↑', 'candidate-move');
+      up.type = 'button'; up.dataset.move = 'up'; up.dataset.rank = index;
+      up.disabled = index === 0 || !controlsEnabled() || pendingPolicy;
+      const down = make('button', '↓', 'candidate-move');
+      down.type = 'button'; down.dataset.move = 'down'; down.dataset.rank = index;
+      down.disabled = index === candidateDrafts.length - 1 || !controlsEnabled() || pendingPolicy;
+      const remove = make('button', '✕', 'candidate-remove');
+      remove.type = 'button'; remove.dataset.rank = index;
+      remove.disabled = candidateDrafts.length <= 2 || !controlsEnabled() || pendingPolicy;
+      row.append(label, up, down, remove);
+      box.append(row);
+    });
+    $('auto-add-candidate').disabled = !controlsEnabled() || pendingPolicy || candidateDrafts.length >= 8;
   }
   function render() {
     const demoMode = snapshot?.collector?.data_origin === 'demo';
@@ -137,7 +165,8 @@
     }
     const auto = sources?.auto || null;
     const runtime = snapshot?.collector?.auto_runtime || null;
-    const targetName = runtime?.target === 'primary' ? ' · 当前目标：主选' : runtime?.target === 'secondary' ? ' · 当前目标：备选' : '';
+    const candidates = Array.isArray(auto?.candidates) ? auto.candidates : [];
+    const targetName = Number.isInteger(runtime?.target) ? ` · 当前目标：候选 ${runtime.target + 1}` : '';
     const runtimeDetail = runtimeStateNames[runtime?.state] ? ` · ${runtimeStateNames[runtime.state]}` : '';
     const cooldownLeft = finite(runtime?.cooldown_remaining) && runtime.cooldown_remaining > 0
       ? ` · 切换冷却剩 ${runtime.cooldown_remaining} 周期` : '';
@@ -145,7 +174,8 @@
     text('egress-current-name', sources?.controller === 'observed' && sources?.active ? `${activeChannel ? channelLabel(activeChannel) + ' · ' : ''}${displayOf(sources.active)}` : '未知');
     text('egress-current-id', sources?.active || '—');
     text('egress-current-mode', auto
-      ? (auto.paused ? '自动 · 已暂停（手动接管）' : auto.enabled ? `自动 · 主选 ${displayOf(auto.primary?.node)}${targetName}` : '手动 · 自动已停用')
+      ? (auto.paused ? '自动 · 已暂停（手动接管）'
+        : auto.enabled ? `自动 · ${candidates.length} 个候选 · 首选 ${displayOf(candidates[0]?.node)}${targetName}` : '手动 · 自动已停用')
       : '手动选择');
     $('egress-node-list').replaceChildren();
     if (!canControl && !nodes.length) $('egress-node-list').append(empty('此环境仅提供只读诊断，不读取出口来源或启用控制。'));
@@ -168,16 +198,18 @@
       }
       $('egress-node-list').append(group);
     }
+    const candidatesText = candidates.length
+      ? candidates.map((pin, index) => `候选${index + 1} ${displayOf(pin.node)}${runtime?.target === index ? ' ●当前' : ''}`).join(' · ')
+      : '';
     text('auto-state', !sources ? '通道数据不可用。' : !auto ? '自动切换未启用。'
       : auto.paused ? '已暂停：手动选择优先；明确恢复后才继续评估原有候选。'
-      : auto.enabled ? `运行中 · 主选 ${displayOf(auto.primary.node)} · 备选 ${displayOf(auto.secondary.node)}${targetName}${runtimeDetail}${cooldownLeft}` : '已停用。');
-    text('auto-policy', auto ? `连续失败 ${auto.fail_after} 次切换 · 主选连续成功 ${auto.recover_after} 次回切 · 切换后冷却 ${auto.cooldown} 周期` : '');
-    renderCandidate($('auto-primary-node'), nodes, auto?.primary?.node, Boolean(auto?.enabled));
-    renderCandidate($('auto-secondary-node'), nodes, auto?.secondary?.node, Boolean(auto?.enabled));
-    $('auto-enable').disabled = !canControl || Boolean(auto?.enabled) || pendingPolicy;
+      : auto.enabled ? `运行中 · ${candidatesText}${runtimeDetail}${cooldownLeft}` : '已停用。');
+    text('auto-policy', auto ? `连续失败 ${auto.fail_after} 次切到下一健康候选 · 更高优先候选连续成功 ${auto.recover_after} 次回切 · 切换后冷却 ${auto.cooldown} 周期` : '');
+    renderCandidateRows(nodes, auto);
+    text('auto-enable', auto?.enabled ? '更新候选列表' : '保存并启用候选');
+    $('auto-enable').disabled = !canControl || pendingPolicy;
     $('auto-disable').disabled = !canControl || !auto?.enabled || pendingPolicy;
     $('auto-resume').disabled = !canControl || !auto?.enabled || !auto?.paused || pendingPolicy;
-    $('auto-toggle-primary').disabled = !canControl || !auto?.enabled || auto?.paused || pendingPolicy;
     $('auto-timeline').replaceChildren();
     const events = (snapshot?.auto_events || []).slice(0, 20);
     if (!events.length) $('auto-timeline').append(make('p', '暂无自动切换记录。', 'muted'));
@@ -333,20 +365,50 @@
     } catch (error) { text('channel-action-note', controlErrors[error.message] || '重命名失败。'); }
     finally { pendingChannel = false; await refresh(); }
   });
+  $('auto-candidate-rows').addEventListener('change', event => {
+    const select = event.target.closest('select[data-rank]');
+    if (!select || candidateDrafts === null) return;
+    candidateDrafts[Number(select.dataset.rank)] = select.value;
+  });
+  $('auto-candidate-rows').addEventListener('click', event => {
+    const move = event.target.closest('.candidate-move');
+    const remove = event.target.closest('.candidate-remove');
+    if (!move && !remove) return;
+    if (!controlsEnabled() || pendingPolicy || candidateDrafts === null) return;
+    if (move) {
+      const rank = Number(move.dataset.rank), other = rank + (move.dataset.move === 'up' ? -1 : 1);
+      if (other < 0 || other >= candidateDrafts.length) return;
+      [candidateDrafts[rank], candidateDrafts[other]] = [candidateDrafts[other], candidateDrafts[rank]];
+    } else if (candidateDrafts.length > 2) {
+      candidateDrafts.splice(Number(remove.dataset.rank), 1);
+    }
+    render();
+  });
+  $('auto-add-candidate').addEventListener('click', () => {
+    if (!controlsEnabled() || pendingPolicy || candidateDrafts === null || candidateDrafts.length >= 8) return;
+    candidateDrafts.push('');
+    render();
+  });
   $('auto-config-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!controlsEnabled() || pendingPolicy) return;
-    const primary = $('auto-primary-node').value, secondary = $('auto-secondary-node').value;
-    if (!primary || !secondary || primary === secondary) { note('请明确选择两个不同的缓存节点。'); return; }
-    pendingPolicy = true; note('正在保存并启用策略…'); render();
-    try { await postJSON('/api/auto', { action: 'enable', primary_node: primary, secondary_node: secondary }); note('已启用明确指定的两个候选。'); }
-    catch (error) { note(controlErrors[error.message] || '策略保存失败。'); }
-    finally { pendingPolicy = false; await refresh(); }
+    if (!controlsEnabled() || pendingPolicy || candidateDrafts === null) return;
+    const picked = candidateDrafts.filter(Boolean);
+    if (picked.length !== candidateDrafts.length || picked.length < 2 || picked.length > 8
+        || new Set(picked).size !== picked.length) {
+      note('请按优先级选择 2–8 个互不相同的缓存节点。'); return;
+    }
+    const updating = Boolean(sources?.auto?.enabled);
+    const action = updating ? 'set-candidates' : 'enable';
+    pendingPolicy = true; note(updating ? '正在更新候选列表…' : '正在保存并启用策略…'); render();
+    try {
+      await postJSON('/api/auto', { action, nodes: picked });
+      note(updating ? '已更新候选列表；下一周期起按新优先级评估。' : '已启用明确指定的候选列表。');
+    } catch (error) { note(controlErrors[error.message] || '策略保存失败。'); }
+    finally { pendingPolicy = false; candidateDrafts = null; await refresh(); }
   });
   const autoActions = [
     ['auto-disable', () => ({ action: 'disable' })],
-    ['auto-resume', () => ({ action: 'resume' })],
-    ['auto-toggle-primary', () => ({ action: 'swap' })]
+    ['auto-resume', () => ({ action: 'resume' })]
   ];
   for (const [id, build] of autoActions) {
     $(id).addEventListener('click', async () => {

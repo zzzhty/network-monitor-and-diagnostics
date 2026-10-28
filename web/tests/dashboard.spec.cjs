@@ -9,7 +9,7 @@ let mode = 'empty', requests = [], posts = [], snapshot;
 let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
 let sourceView = { schema_version: 1, sources: [], nodes: [], active: null, controller: 'not_queried', selection_mode: 'manual' };
 const failingNodes = [];
-const autoConfig = { version: 2, enabled: true, paused: false,
+const autoConfig = { version: 3, enabled: true, paused: false,
   fail_after: 3, recover_after: 2, cooldown: 2 };
 const server = http.createServer((req, res) => {
   requests.push([req.method, req.url]);
@@ -49,13 +49,17 @@ const server = http.createServer((req, res) => {
       if (req.url === '/api/auto' && body && typeof body.action === 'string') {
         if (body.action === 'enable') {
           const pin = node => ({ source: sourceView.nodes.find(row => row.id === node).source, node });
-          sourceView.auto = { ...autoConfig, primary: pin(body.primary_node), secondary: pin(body.secondary_node) }; sourceView.selection_mode = 'auto';
+          sourceView.auto = { ...autoConfig, candidates: body.nodes.map(pin) }; sourceView.selection_mode = 'auto';
+        }
+        if (body.action === 'set-candidates' && Array.isArray(body.nodes)) {
+          const pin = node => ({ source: sourceView.nodes.find(row => row.id === node).source, node });
+          sourceView.auto.candidates = body.nodes.map(pin);
         }
         if (body.action === 'resume') { sourceView.auto.paused = false; sourceView.selection_mode = 'auto'; }
-        if (body.action === 'swap') [sourceView.auto.primary, sourceView.auto.secondary] = [sourceView.auto.secondary, sourceView.auto.primary];
         if (body.action === 'disable') { sourceView.auto.enabled = false; sourceView.selection_mode = 'manual'; }
+        const results = { enable: 'auto_enabled', 'set-candidates': 'auto_candidates_updated', resume: 'auto_resumed', disable: 'auto_disabled' };
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ result: 'auto_' + body.action.replace('-primary', '_primary') }));
+        return res.end(JSON.stringify({ result: results[body.action] || 'auto_invalid_action' }));
       }
       res.writeHead(400); res.end('{"error":"invalid_body"}');
     });
@@ -133,8 +137,8 @@ const server = http.createServer((req, res) => {
         { id: 'nmd-sub-a-0123456789abcdef0123', source: 'sub-a', display: '香港 01 | IEPL' },
         { id: 'nmd-sub-a-aaaaaaaaaaaaaaaaaaaa', source: 'sub-a', display: '<img src=x onerror="window.injected=true">' }
       ], active: 'nmd-sub-a-0123456789abcdef0123', desired: 'nmd-sub-a-0123456789abcdef0123' };
-    snapshot.auto_events = [{ id: 1, ts: now - 30, kind: 'auto_switch', detail: { from: 'secondary', to: 'primary', node: 'nmd-sub-a-0123456789abcdef0123', reason: 'primary_recovered' } }];
-    snapshot.collector.auto_runtime = { target: 'primary' };
+    snapshot.auto_events = [{ id: 1, ts: now - 30, kind: 'auto_switch', detail: { from: 1, to: 0, node: 'nmd-sub-a-0123456789abcdef0123', reason: 'candidate_recovered' } }];
+    snapshot.collector.auto_runtime = { target: 0 };
     await refresh();
     await page.locator('[data-page="egress"]').click();
     assert.equal(await page.locator('#egress').isVisible(), true);
@@ -142,8 +146,8 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('#egress-node-list img').count(), 0);
     assert.match(await page.locator('#auto-timeline').textContent(), /自动切换/);
     // Saving Channel forms has no refresh/probe/selection/policy side effect.
-    assert.equal(await page.locator('#auto-primary-node').inputValue(), '');
-    assert.equal(await page.locator('#auto-secondary-node').inputValue(), '');
+    assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
+    assert.equal(await page.locator('#auto-candidate-rows select[data-rank="1"]').inputValue(), '');
     const channelPostsBefore = posts.length;
     await page.locator('#channel-id').fill('new-sub');
     await page.locator('#channel-name').fill('新增订阅');
@@ -153,7 +157,7 @@ const server = http.createServer((req, res) => {
     assert.deepEqual(posts.slice(channelPostsBefore).map(([url]) => url), ['/api/channels']);
     assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
     assert.equal(sourceView.auto, undefined);
-    assert.equal(await page.locator('#auto-primary-node').inputValue(), '');
+    assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
     const rename = page.locator('.channel-rename-form[data-channel="new-sub"]');
     await rename.locator('input').fill('<img src=x onerror="window.injected=true">');
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
@@ -183,7 +187,7 @@ const server = http.createServer((req, res) => {
     await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('公网备用'));
     assert.deepEqual(posts.slice(proxyPostsBefore).map(([url]) => url), ['/api/channels']);
     assert.equal(JSON.parse(posts.at(-1)[1]).definition.url, undefined);
-    assert.equal(await page.locator('#auto-primary-node').inputValue(), '');
+    assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
     assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
     const publicChannels = await page.evaluate(() => fetch('/api/sources').then(response => response.json()));
     for (const secret of ['SYNTHETIC_URL_SECRET', 'SYNTHETIC_PROXY_USER', 'SYNTHETIC_PROXY_PASSWORD', '192.0.2.30']) assert.equal(JSON.stringify(publicChannels).includes(secret), false);
@@ -196,15 +200,31 @@ const server = http.createServer((req, res) => {
     await page.locator('.delay-btn[data-node="nmd-sub-a-0123456789abcdef0123"]').click();
     await page.waitForFunction(() => document.querySelector('#egress-node-list').textContent.includes('失败'));
     failingNodes.length = 0;
-    await page.locator('#auto-primary-node').selectOption('nmd-sub-a-0123456789abcdef0123');
-    await page.locator('#auto-secondary-node').selectOption('nmd-sub-a-0123456789abcdef0123');
+    await page.locator('#auto-candidate-rows select[data-rank="0"]').selectOption('nmd-sub-a-0123456789abcdef0123');
+    await page.locator('#auto-candidate-rows select[data-rank="1"]').selectOption('nmd-sub-a-0123456789abcdef0123');
     const policyPostsBefore = posts.length;
     await page.locator('#auto-enable').click();
     assert.equal(posts.length, policyPostsBefore);
-    await page.locator('#auto-secondary-node').selectOption('nmd-sub-a-aaaaaaaaaaaaaaaaaaaa');
+    // A third row can be added and removed again; two rows stay the minimum.
+    await page.locator('#auto-add-candidate').click();
+    await page.waitForFunction(() => document.querySelectorAll('#auto-candidate-rows select').length === 3);
+    await page.locator('#auto-candidate-rows .candidate-remove[data-rank="2"]').click();
+    await page.waitForFunction(() => document.querySelectorAll('#auto-candidate-rows select').length === 2);
+    await page.locator('#auto-candidate-rows select[data-rank="1"]').selectOption('nmd-sub-a-aaaaaaaaaaaaaaaaaaaa');
     await page.locator('#auto-enable').click();
     await page.waitForFunction(() => document.querySelector('#auto-state').textContent.includes('运行中'));
-    assert.ok(posts.some(([url, body]) => url === '/api/auto' && body.includes('enable') && JSON.parse(body).primary_node === 'nmd-sub-a-0123456789abcdef0123' && JSON.parse(body).secondary_node === 'nmd-sub-a-aaaaaaaaaaaaaaaaaaaa'), 'auto enable POST');
+    assert.ok(posts.some(([url, body]) => url === '/api/auto' && JSON.parse(body).action === 'enable'
+      && JSON.parse(body).nodes.length === 2 && JSON.parse(body).nodes[0] === 'nmd-sub-a-0123456789abcdef0123'
+      && JSON.parse(body).nodes[1] === 'nmd-sub-a-aaaaaaaaaaaaaaaaaaaa'), 'auto enable POST');
+    assert.match(await page.locator('#auto-state').textContent(), /候选1 香港 01 \| IEPL ●当前/);
+    assert.equal(await page.locator('#auto-toggle-primary').count(), 0);
+    // Reordering the enabled policy posts set-candidates instead of enable.
+    await page.locator('#auto-candidate-rows .candidate-move[data-rank="1"][data-move="up"]').click();
+    await page.locator('#auto-enable').click();
+    await page.waitForFunction(() => document.querySelector('#egress-action-note').textContent.includes('已更新候选列表'));
+    const update = posts.filter(([url]) => url === '/api/auto').at(-1);
+    assert.match(update[1], /"action":"set-candidates"/);
+    assert.deepEqual(JSON.parse(update[1]).nodes, ['nmd-sub-a-aaaaaaaaaaaaaaaaaaaa', 'nmd-sub-a-0123456789abcdef0123']);
     assert.equal(await page.locator('#egress img').count(), 0);
     capabilityView.platform = 'macos';
     capabilityView.local_egress_control = false;
