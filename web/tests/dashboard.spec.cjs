@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root = path.resolve(__dirname, '..');
-let mode = 'empty', requests = [], posts = [], snapshot;
+let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
 let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
 let sourceView = { schema_version: 1, sources: [], nodes: [], active: null, controller: 'not_queried', selection_mode: 'manual' };
 const failingNodes = [];
@@ -17,7 +17,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST') {
     let raw = '';
     req.on('data', chunk => { raw += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       posts.push([req.url, raw]);
       let body = null; try { body = JSON.parse(raw || '{}'); } catch { body = null; }
       if (req.url === '/api/channels' && body?.id && body?.definition) {
@@ -35,6 +35,16 @@ const server = http.createServer((req, res) => {
         sourceView.sources.find(channel => channel.id === body.id).display_name = body.display_name;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end('{"result":"channel_renamed"}');
+      }
+      if (req.url === '/api/channels/refresh' && body && typeof body.id === 'string') {
+        const channel = sourceView.sources.find(row => row.id === body.id);
+        if (!channel || channel.kind !== 'subscription') {
+          res.writeHead(409); return res.end('{"schema_version":1,"error":"subscription_source_not_found"}');
+        }
+        if (refreshHold) await new Promise(resolve => setTimeout(resolve, refreshHold));
+        channel.node_count = 3;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end('{"result":"refreshed_pending_apply"}');
       }
       if (req.url === '/api/egress/select' && body && typeof body.node === 'string') {
         sourceView.active = body.node; if (sourceView.auto?.enabled) { sourceView.auto.paused = true; sourceView.selection_mode = 'manual'; }
@@ -163,11 +173,28 @@ const server = http.createServer((req, res) => {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await page.waitForFunction(() => !document.querySelector('#refresh').disabled);
     assert.equal(await rename.locator('input').evaluate(input => input === document.activeElement), true);
-    await rename.locator('button').click();
+    await rename.locator('button[type="submit"]').click();
     await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('onerror'));
     assert.equal(await page.locator('#channel-list img').count(), 0);
     assert.equal(await page.evaluate(() => window.injected), undefined);
     assert.deepEqual(posts.slice(channelPostsBefore).map(([url]) => url), ['/api/channels', '/api/channels/rename']);
+    // Subscription channels get an explicit refresh button; while the POST is
+    // in flight it is disabled, so a double click cannot fire two fetches.
+    const refreshPostsBefore = posts.length;
+    refreshHold = 400;
+    await page.locator('button[data-refresh="new-sub"]').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('button[data-refresh="new-sub"]');
+      return button && button.disabled && button.textContent.includes('更新中');
+    });
+    await page.evaluate(() => document.querySelector('button[data-refresh="new-sub"]').click());
+    assert.match(await page.locator('#channel-action-note').textContent(), /正在更新订阅/);
+    await page.waitForFunction(() => document.querySelector('#channel-action-note').textContent.includes('已更新订阅'));
+    refreshHold = 0;
+    assert.deepEqual(posts.slice(refreshPostsBefore).map(([url]) => url), ['/api/channels/refresh']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), { id: 'new-sub' });
+    await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('3 个缓存节点'));
+    assert.equal(await page.locator('button[data-refresh="new-sub"]').isEnabled(), true);
     // Duplicate IDs are a visible, sanitized error and preserve the form draft.
     await page.locator('#channel-id').fill('new-sub');
     await page.locator('#channel-name').fill('重复');
@@ -186,6 +213,8 @@ const server = http.createServer((req, res) => {
     await page.locator('#channel-add-submit').click();
     await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('公网备用'));
     assert.deepEqual(posts.slice(proxyPostsBefore).map(([url]) => url), ['/api/channels']);
+    // Manual proxy channels never offer a subscription refresh button.
+    assert.equal(await page.locator('button[data-refresh="new-proxy"]').count(), 0);
     assert.equal(JSON.parse(posts.at(-1)[1]).definition.url, undefined);
     assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
     assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
@@ -235,6 +264,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('.delay-btn').first().isEnabled(), false);
     assert.equal(await page.locator('#auto-actions').isVisible(), false);
     assert.equal(await page.locator('#channel-add-form').isVisible(), false);
+    assert.equal(await page.locator('button[data-refresh]').count(), 0);
     await page.evaluate(() => {
       document.getElementById('channel-add-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       document.getElementById('auto-config-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
@@ -284,7 +314,7 @@ const server = http.createServer((req, res) => {
     await page.waitForTimeout(5200);
     assert.ok(requests.filter(r => r[1] === '/api/snapshot').length > before, 'visible page polls');
     const readable = ['/', '/app.js', '/style.css', '/api/snapshot', '/api/sources', '/api/capabilities', '/favicon.ico'];
-    const writable = ['/api/egress/select', '/api/egress/delay', '/api/auto', '/api/channels', '/api/channels/rename'];
+    const writable = ['/api/egress/select', '/api/egress/delay', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh'];
     assert.ok(requests.every(([method, url]) => (method === 'GET' && readable.includes(url)) || (method === 'POST' && writable.includes(url))), 'only intended same-origin requests');
     // Render only the bundled error page. Never launch the desktop binary,
     // invoke a custom URL handler, read real configuration, or start a sidecar.
@@ -301,6 +331,6 @@ const server = http.createServer((req, res) => {
     assert.deepEqual(errorPageRequests, []);
     await errorPage.close();
     assert.deepEqual(errors, []);
-    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, CSP.');
+    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, channel subscription refresh, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, CSP.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());

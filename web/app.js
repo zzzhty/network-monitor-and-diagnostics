@@ -2,7 +2,7 @@
 'use strict';
 (() => {
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
-  const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map();
+  const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map(), pendingRefresh = new Set();
   let pendingChannel = false, pendingPolicy = false, candidateDrafts = null;
   const $ = id => document.getElementById(id);
   const make = (tag, value, cls) => {
@@ -37,9 +37,9 @@
   const channelManagementEnabled = () => controlsEnabled() && capabilities?.channel_management === true;
   const channelLabel = channel => channel.display_name || channel.id;
   const connectionLabel = kind => ({ subscription: '订阅 · URL 已隐藏', tailnet: 'SOCKS5 · Tailnet 路径', proxy: 'SOCKS5 · 普通路径' }[kind] || '未知通道');
-  async function postJSON(path, body) {
+  async function postJSON(path, body, timeoutMs = 8000) {
     if (!controlsEnabled()) throw new Error('read_only');
-    const abort = new AbortController(), timeout = setTimeout(() => abort.abort(), 8000);
+    const abort = new AbortController(), timeout = setTimeout(() => abort.abort(), timeoutMs);
     try {
       const response = await fetch(path, { method: 'POST', signal: abort.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
       const data = await response.json().catch(() => null);
@@ -58,7 +58,19 @@
     subscription_requires_https_url: '订阅需使用 HTTPS 443 URL，不能含用户名、密码或片段。',
     proxy_requires_literal_non_tailnet_ip: '普通路径代理需使用非 Tailnet 的 IP 地址。', tailnet_requires_literal_tailnet_ip: 'Tailnet 通道需使用 Tailnet IP 地址。',
     invalid_proxy_port: '端口须为 1–65535。', auto_candidates_must_differ: '候选节点必须互不相同。', auto_node_not_in_inventory: '请按优先级选择 2–8 个有效缓存节点。',
-    auto_invalid_parameters: '参数无效。', auto_invalid_action: '操作无效。', sources_unavailable: '私有来源数据不可用。'
+    auto_invalid_parameters: '参数无效。', auto_invalid_action: '操作无效。', sources_unavailable: '私有来源数据不可用。',
+    subscription_source_not_found: '未找到该订阅通道；只有订阅通道可以刷新。',
+    subscription_fetch_failed: '订阅下载失败；已保留原有节点缓存，可稍后重试。',
+    subscription_timeout: '订阅下载超时；已保留原有节点缓存，可稍后重试。',
+    subscription_http_error_no_redirects: '订阅服务器返回错误（不跟随重定向）；已保留原有节点缓存。',
+    subscription_too_large: '订阅内容超出大小上限；已保留原有节点缓存。',
+    provider_requires_proxies_mapping: '订阅内容缺少有效的 proxies 节点列表。',
+    provider_requires_1_to_256_nodes: '订阅节点数量须在 1–256 之间。',
+    invalid_provider_yaml: '订阅内容不是有效的 YAML。', invalid_yaml_keys: '订阅 YAML 含重复或非字符串键。',
+    unsupported_yaml_alias_or_tag: '订阅 YAML 含不支持的别名或标签。',
+    duplicate_proxy_name: '订阅内存在重复的节点名称。', invalid_or_unsupported_proxy_node: '订阅包含无效或不支持的节点。',
+    selected_node_would_disappear_choose_another_first: '当前选中节点会随刷新消失；请先切换到其他节点再刷新。',
+    yaml_dependency_missing_PyYAML_6_0_3: '缺少 PyYAML 6.0.3 依赖，无法解析订阅。'
   };
   const autoEventNames = {
     auto_engaged: '自动接管', auto_switch: '自动切换', auto_switch_failed: '切换失败', auto_verify_adopted: '切换确认',
@@ -99,7 +111,17 @@
         input.addEventListener('input', () => renameDrafts.set(channel.id, input.value));
         label.append(input);
         const button = make('button', '重命名'); button.type = 'submit'; button.disabled = pendingChannel;
-        form.append(label, button); item.append(form);
+        form.append(label, button);
+        // Subscription channels can be refreshed in place; one explicit HTTPS
+        // fetch per click, never automatic, never for manual proxy channels.
+        if (channel.kind === 'subscription') {
+          const refreshing = pendingRefresh.has(channel.id);
+          const refresh = make('button', refreshing ? '更新中…' : '更新订阅');
+          refresh.type = 'button'; refresh.dataset.refresh = channel.id;
+          refresh.disabled = refreshing || pendingChannel;
+          form.append(refresh);
+        }
+        item.append(form);
       }
       $('channel-list').append(item);
     }
@@ -179,7 +201,7 @@
       : '手动选择');
     $('egress-node-list').replaceChildren();
     if (!canControl && !nodes.length) $('egress-node-list').append(empty('此环境仅提供只读诊断，不读取出口来源或启用控制。'));
-    else if (!nodes.length && sources) $('egress-node-list').append(empty('暂无缓存节点；请通过 nmd source refresh 刷新订阅。'));
+    else if (!nodes.length && sources) $('egress-node-list').append(empty('暂无缓存节点；请在通道列表点击「更新订阅」，或使用 nmd source refresh。'));
     else if (sources) for (const source of (sources.sources || []).slice(0, 32)) {
       const group = make('article', undefined, 'card');
       group.append(make('h2', `${channelLabel(source)} · ${connectionLabel(source.kind)} · ${source.node_count} 个节点`));
@@ -348,7 +370,7 @@
     try {
       await postJSON('/api/channels', body);
       $('channel-add-form').reset();
-      text('channel-action-note', '已保存；未刷新、探测、部署或切换。订阅请通过 CLI 显式刷新。');
+      text('channel-action-note', '已保存；未刷新、探测、部署或切换。订阅可在通道行点击「更新订阅」显式刷新。');
     } catch (error) { text('channel-action-note', controlErrors[error.message] || '保存失败，请检查输入后重试。'); }
     finally { pendingChannel = false; await refresh(); }
   });
@@ -364,6 +386,20 @@
       text('channel-action-note', '已重命名；节点 ID、选择和候选保持不变。');
     } catch (error) { text('channel-action-note', controlErrors[error.message] || '重命名失败。'); }
     finally { pendingChannel = false; await refresh(); }
+  });
+  async function controlRefresh(id) {
+    // Per-channel pending state: a double click cannot start two fetches.
+    if (!channelManagementEnabled() || pendingChannel || pendingRefresh.has(id)) return;
+    pendingRefresh.add(id); text('channel-action-note', '正在更新订阅…'); renderChannels();
+    try {
+      await postJSON('/api/channels/refresh', { id }, 30000);
+      text('channel-action-note', '已更新订阅并重写节点缓存；列表稍后自动刷新，部署仍需 nmd apply。');
+    } catch (error) { text('channel-action-note', controlErrors[error.message] || '更新订阅失败。'); }
+    finally { pendingRefresh.delete(id); await refresh(); }
+  }
+  $('channel-list').addEventListener('click', event => {
+    const refresh = event.target.closest('button[data-refresh]');
+    if (refresh) controlRefresh(refresh.dataset.refresh);
   });
   $('auto-candidate-rows').addEventListener('change', event => {
     const select = event.target.closest('select[data-rank]');
