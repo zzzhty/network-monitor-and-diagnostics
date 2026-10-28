@@ -9,7 +9,7 @@ pub const NOTIFY_KINDS: [&str; 5] = [
     "auto_suspended",
     "auto_resumed",
     "auto_switch_failed",
-    "both_unhealthy",
+    "all_unhealthy",
 ];
 
 const KIND_LABELS: [(&str, &str); 5] = [
@@ -17,7 +17,7 @@ const KIND_LABELS: [(&str, &str); 5] = [
     ("auto_suspended", "自动切换已挂起"),
     ("auto_resumed", "自动切换已恢复"),
     ("auto_switch_failed", "自动切换失败"),
-    ("both_unhealthy", "主备出口均不健康"),
+    ("all_unhealthy", "候选出口全部不健康"),
 ];
 
 fn label(kind: &str) -> &'static str {
@@ -126,9 +126,13 @@ mod tests {
         let messages = notifier.absorb(&snapshot(json!([
             { "id": 1, "ts": 101.0, "kind": "auto_engaged" },
             { "id": 2, "ts": 105.0, "kind": "auto_switch" },
-            { "id": 3, "ts": 106.0, "kind": "auto_suspended" }
+            { "id": 3, "ts": 106.0, "kind": "auto_suspended" },
+            { "id": 4, "ts": 107.0, "kind": "all_unhealthy" }
         ])));
-        assert_eq!(messages, vec!["自动切换出口", "自动切换已挂起"]);
+        assert_eq!(
+            messages,
+            vec!["自动切换出口", "自动切换已挂起", "候选出口全部不健康"]
+        );
         assert!(notifier
             .absorb(&snapshot(
                 json!([{ "id": 2, "ts": 105.0, "kind": "auto_switch" }])
