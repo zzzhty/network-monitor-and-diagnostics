@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Fixed local controls and save-only Channel metadata share the source backend.
 # GUI subscription refresh reuses the CLI --confirm path; deployment stays CLI-only.
 NODE_ID = re.compile(r"nmd-[a-z][a-z0-9-]{0,31}-[a-f0-9]{20}")
-POST_ROUTES = {"/api/egress/select", "/api/egress/delay", "/api/auto",
+POST_ROUTES = {"/api/egress/select", "/api/egress/delay", "/api/egress/diagnose", "/api/auto",
                "/api/channels", "/api/channels/rename", "/api/channels/refresh"}
 MAX_BODY_BYTES = 4096
 
@@ -182,6 +182,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/channels/refresh" and (set(body) != {"id"} or not isinstance(body.get("id"), str)):
             self.json_response(400, {"error": "invalid_body"})
             return
+        # The diagnosis battery is entirely server-fixed; the body must be empty.
+        if path == "/api/egress/diagnose" and body != {}:
+            self.json_response(400, {"error": "invalid_body"})
+            return
         try:
             if path == "/api/channels":
                 egress_sources.put_source(egress_sources.Store(self.server.sources_dir), body["id"], body["definition"])
@@ -199,6 +203,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(200, {"result": "selected_and_observed", "active": node})
             elif path == "/api/egress/delay":
                 self.json_response(200, egress_sources.delay_test(self.server.sources_dir, node))
+            elif path == "/api/egress/diagnose":
+                # Read-only layered battery against fixed public targets; the
+                # same trust level as the manual delay button, no store writes.
+                import egress_diagnose
+                self.json_response(200, egress_diagnose.build_report(self.server.sources_dir))
             else:
                 self.json_response(200, egress_sources.auto_configure(
                     egress_sources.Store(self.server.sources_dir), body))

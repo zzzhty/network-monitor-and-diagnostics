@@ -61,6 +61,7 @@ class DashboardAPITests(unittest.TestCase):
         self.assertEqual(self.request('/api/egress/select', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
         self.assertEqual(self.request('/api/auto', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
         self.assertEqual(self.request('/api/channels/refresh', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
+        self.assertEqual(self.request('/api/egress/diagnose', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
         self.assertEqual(self.request('/api/egress/select?node=x', method='POST')[0], 400)
         self.assertFalse(self.state.exists())
 
