@@ -120,7 +120,7 @@
     // Preserve an open dropdown across read-only polling refreshes; row
     // buttons may rebuild immediately after moving or removing a candidate.
     const editing = box.contains(document.activeElement) && document.activeElement.matches('select');
-    if (pendingPolicy || editing) return;
+    if (pendingPolicy || editing || sources === null) return;  // Never seed drafts before the policy data arrives.
     if (candidateDrafts === null) {
       candidateDrafts = Array.isArray(auto?.candidates) ? auto.candidates.map(pin => pin.node).filter(Boolean) : [];
       while (candidateDrafts.length < 2) candidateDrafts.push('');
