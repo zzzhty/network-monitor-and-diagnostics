@@ -319,15 +319,21 @@ class AutoCycleTests(unittest.TestCase):
 
     def test_auto_cycle_persists_events_runtime_and_freshness_window(self):
         def fake_evaluate(directory, runtime, emit):
-            emit('auto_switch', {'from': None, 'to': 'primary', 'node': 'nmd-x-y', 'reason': 'auto_engaged'})
-            return {'signature': 's', 'target': 'primary'}
+            emit('auto_switch', {'from': None, 'to': 0, 'node': 'nmd-x-y', 'reason': 'auto_engaged'})
+            return {'signature': 's', 'target': 0, 'fails': [0, 0]}
         with patch.object(self.egress, 'auto_evaluate', fake_evaluate):
             self.assertGreaterEqual(m.run_auto_cycle(self.store, self.sources, {'interval_seconds': 30}), 0)
         snapshot = m.read_snapshot(self.path)
         self.assertEqual(snapshot['auto_events'][0]['kind'], 'auto_switch')
         self.assertEqual(snapshot['auto_events'][0]['detail']['node'], 'nmd-x-y')
-        self.assertEqual(snapshot['collector']['auto_runtime']['target'], 'primary')
-        self.assertGreaterEqual(snapshot['collector']['expected_cycle_seconds'], 32)
+        self.assertEqual(snapshot['collector']['auto_runtime']['target'], 0)
+        # One delay probe per candidate: the freshness window scales with N.
+        self.assertGreaterEqual(snapshot['collector']['expected_cycle_seconds'], 34)
+        def eight_candidates(directory, runtime, emit):
+            return {'signature': 's', 'target': 0, 'fails': [0] * 8}
+        with patch.object(self.egress, 'auto_evaluate', eight_candidates):
+            self.assertGreaterEqual(m.run_auto_cycle(self.store, self.sources, {'interval_seconds': 30}), 0)
+        self.assertGreaterEqual(m.read_snapshot(self.path)['collector']['expected_cycle_seconds'], 46)
 
     def test_source_errors_are_silent_but_other_failures_are_recorded(self):
         with patch.object(self.egress, 'auto_evaluate', side_effect=self.egress.SourceError('invalid_auto')):

@@ -506,11 +506,12 @@ def run_auto_cycle(store, sources_dir, cfg):
         return 0.0
     elapsed = time.monotonic() - started
     if runtime:
-        # Two controller delay probes may exceed the plain interval; keep the
+        # One delay probe per candidate may exceed the plain interval; keep the
         # freshness window honest so the GUI does not flap while auto is active.
+        probes = max(2, len(runtime.get('fails') or ()))
         try:
             store.setmeta('expected_cycle_seconds',
-                          max(cfg['interval_seconds'] + elapsed + 2, store.meta('expected_cycle_seconds') or 0))
+                          max(cfg['interval_seconds'] + elapsed + 2 * probes, store.meta('expected_cycle_seconds') or 0))
         except Exception: pass
     store.db.commit()
     return elapsed

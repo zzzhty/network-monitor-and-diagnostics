@@ -433,10 +433,9 @@ verify
 
 
 class AutoTests(LocalControllerFixture):
-    def enable(self, primary="subscription"):
-        return e.auto_configure(self.store, {"action": "enable", "primary": primary,
-                                             "tailnet_node": self.node("tail-a"),
-                                             "subscription_node": self.node("sub-a")})
+    def enable(self):
+        return e.auto_configure(self.store, {"action": "enable",
+                                             "nodes": [self.node("sub-a"), self.node("tail-a")]})
 
     def evaluate(self, runtime):
         events = []
@@ -444,22 +443,34 @@ class AutoTests(LocalControllerFixture):
         return runtime, [kind for kind, _ in events]
 
     def test_enable_requires_explicit_pins_and_valid_parameters(self):
-        with self.assertRaisesRegex(e.SourceError, "single_tailnet"):
-            e.auto_configure(self.store, {"action": "enable", "primary": "subscription"})
-        for payload in ({"action": "enable", "primary": "bad", "tailnet_node": self.node("tail-a")},
-                        {"action": "enable", "primary": "subscription", "tailnet_node": self.node("tail-a"),
-                         "subscription_node": self.node("tail-a")},
-                        {"action": "enable", "primary": "subscription", "tailnet_node": self.node("tail-a"),
-                         "subscription_node": self.node("sub-a"), "fail_after": 1},
-                        {"action": "enable", "primary": "subscription", "tailnet_node": self.node("tail-a"),
-                         "subscription_node": self.node("sub-a"), "extra": True}):
+        with self.assertRaisesRegex(e.SourceError, "auto_legacy_payload_removed"):
+            e.auto_configure(self.store, {"action": "enable", "primary": "subscription",
+                                          "tailnet_node": self.node("tail-a")})
+        for payload in ({"action": "enable", "nodes": [self.node("tail-a")]},
+                        {"action": "enable", "nodes": [self.node("tail-a"), self.node("tail-a")]},
+                        {"action": "enable", "nodes": [self.node("sub-a"), "missing"]},
+                        {"action": "enable", "nodes": [self.node("sub-a"), self.node("tail-a")],
+                         "fail_after": 1},
+                        {"action": "enable", "nodes": [self.node("sub-a"), self.node("tail-a")],
+                         "extra": True}):
             with self.subTest(payload=payload), self.assertRaises(e.SourceError):
                 e.auto_configure(self.store, payload)
+        # The candidate list is bounded: exactly two through eight ordered pins.
+        chain = {"sources": {f"s{index}": {} for index in range(9)},
+                 "auto": {"version": 3, "enabled": True, "paused": False,
+                          "candidates": [{"source": f"s{index}", "node": f"nmd-s{index}-{index:020x}"}
+                                         for index in range(9)], **e.AUTO_DEFAULTS}}
+        with self.assertRaisesRegex(e.SourceError, "invalid_auto"):
+            e.validate_auto(chain)
+        self.assertEqual(e.validate_auto({**chain, "auto": {**chain["auto"],
+                                                             "candidates": chain["auto"]["candidates"][:8]}}),
+                         {**chain["auto"], "candidates": chain["auto"]["candidates"][:8]})
         self.assertEqual(self.enable()["result"], "auto_enabled")
         view = e.public_status(self.directory, online=False)
         self.assertEqual(view["selection_mode"], "auto")
-        self.assertEqual(view["auto"]["secondary"], {"source": "tail-a", "node": self.node("tail-a")})
-        self.assertEqual(view["auto"]["primary"], {"source": "sub-a", "node": self.node("sub-a")})
+        self.assertEqual(view["auto"]["candidates"],
+                         [{"source": "sub-a", "node": self.node("sub-a")},
+                          {"source": "tail-a", "node": self.node("tail-a")}])
         self.assertEqual(view["auto"]["fail_after"], 3)
         with self.assertRaisesRegex(e.SourceError, "auto_not_configured"):
             e.auto_configure(e.Store(self.base / "no-auto"), {"action": "disable"})
@@ -475,22 +486,22 @@ class AutoTests(LocalControllerFixture):
         runtime, events = self.evaluate({})
         self.assertEqual(events, ["auto_switch"])
         self.assertEqual((runtime["target"], self.current, self.store.load()["selected"]),
-                         ("primary", primary, primary))
+                         (0, primary, primary))
         self.failing_nodes = {primary}
         for _ in range(2):
             runtime, events = self.evaluate(runtime)
             self.assertEqual(events, [])
-            self.assertEqual(runtime["target"], "primary")
+            self.assertEqual(runtime["target"], 0)
         runtime, events = self.evaluate(runtime)
-        self.assertEqual(runtime["target"], "secondary")
+        self.assertEqual(runtime["target"], 1)
         self.assertEqual(events, ["auto_switch"])
         self.assertEqual(self.store.load()["selected"], self.node("tail-a"))
         self.failing_nodes = set()
         runtime, events = self.evaluate(runtime)
-        self.assertEqual(runtime["primary_recover"], 1)
-        self.assertEqual(runtime["target"], "secondary")
+        self.assertEqual(runtime["recover_count"], 1)
+        self.assertEqual(runtime["target"], 1)
         runtime, events = self.evaluate(runtime)
-        self.assertEqual(runtime["target"], "primary")
+        self.assertEqual(runtime["target"], 0)
         self.assertEqual(self.current, primary)
         self.assertEqual(self.store.load()["selected"], primary)
 
@@ -507,7 +518,7 @@ class AutoTests(LocalControllerFixture):
         e.auto_configure(self.store, {"action": "resume"})
         self.assertFalse(self.store.load()["auto"]["paused"])
         e.select(self.store, self.store.load()["cache"]["sub-a"]["nodes"][1]["name"])
-        self.assertEqual(self.store.load()["auto"]["primary"]["node"], self.node("sub-a"))
+        self.assertEqual(self.store.load()["auto"]["candidates"][0]["node"], self.node("sub-a"))
         self.assertTrue(self.store.load()["auto"]["paused"])
         e.auto_configure(self.store, {"action": "resume"})
         e.put_source(self.store, "tail-a", dict(TAIL, port=1081), replace=True)
@@ -530,7 +541,7 @@ class AutoTests(LocalControllerFixture):
         with patch.object(e, "select", side_effect=e.SourceError("source_operation_busy")):
             runtime, events = self.evaluate(runtime)
         self.assertEqual(events, [])
-        self.assertEqual(runtime["target"], "primary")
+        self.assertEqual(runtime["target"], 0)
         with patch.object(e, "select", side_effect=e.SourceError(
                 "selection_outcome_unknown_read_status_before_retry")):
             runtime, events = self.evaluate(runtime)
@@ -540,14 +551,14 @@ class AutoTests(LocalControllerFixture):
         self.current = self.node("tail-a")  # the uncertain PUT actually landed
         runtime, events = self.evaluate(runtime)
         self.assertEqual(events, ["auto_verify_adopted"])
-        self.assertEqual(runtime["target"], "secondary")
+        self.assertEqual(runtime["target"], 1)
         self.assertEqual(self.store.load()["selected"], self.node("tail-a"))
         self.assertIsNone(runtime["pending_verify"])
         self.assertEqual(sum(1 for method, *_ in self.requests if method == "PUT"), puts_before)
         for _ in range(10):
             runtime, _ = self.evaluate(runtime)
         self.assertEqual((self.current, runtime["target"], self.store.load()["selected"]),
-                         (primary, "primary", primary))
+                         (primary, 0, primary))
         self.assertEqual(sum(1 for method, *_ in self.requests if method == "PUT"), puts_before + 1)
 
 
@@ -611,9 +622,8 @@ class DashboardSourceTests(LocalControllerFixture):
         self.assertEqual(self.dashboard_request(dashboard, "POST", "/api/egress/select",
                                                 {"node": "DIRECT"})[0], 400)
         status, body = self.dashboard_request(dashboard, "POST", "/api/auto",
-                                              {"action": "enable", "primary": "subscription",
-                                               "tailnet_node": self.node("tail-a"),
-                                               "subscription_node": chosen})
+                                              {"action": "enable",
+                                               "nodes": [chosen, self.node("tail-a")]})
         self.assertEqual(status, 200, body)
         self.assertIn("auto_enabled", json.loads(body)["result"])
         view = json.loads(self.dashboard_request(dashboard)[1])
@@ -664,17 +674,21 @@ class CLITests(SourceFixture):
         nodes = json.loads(self.invoke("nodes").stdout)["nodes"]
         tail = next(node["id"] for node in nodes if node["source"] == "tail-a")
         subscription = next(node["id"] for node in nodes if node["source"] == "sub-a")
-        ambiguous = self.invoke("auto", "enable", "--primary", "subscription")
-        self.assertEqual(ambiguous.returncode, 1)
-        self.assertIn("auto_requires_single_tailnet_node", ambiguous.stderr)
-        enabled = self.invoke("auto", "enable", "--primary", "subscription",
-                              "--tailnet-node", tail, "--subscription-node", subscription)
+        # Legacy primary/secondary flags are gone: argparse rejects them without echoing values.
+        legacy = self.invoke("auto", "enable", "--primary", "subscription")
+        self.assertEqual(legacy.returncode, 1)
+        self.assertIn("invalid_arguments_use_source_help", legacy.stderr)
+        enabled = self.invoke("auto", "enable", "--node", subscription, "--node", tail)
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         self.assertIn("auto_enabled", enabled.stdout)
         status = json.loads(self.invoke("auto", "status").stdout)
         self.assertEqual(status["selection_mode"], "auto")
-        self.assertEqual(status["auto"]["primary"], {"source": "sub-a", "node": subscription})
-        self.assertEqual(status["auto"]["version"], 2)
+        self.assertEqual(status["auto"]["candidates"][0], {"source": "sub-a", "node": subscription})
+        self.assertEqual(status["auto"]["candidates"][1], {"source": "tail-a", "node": tail})
+        self.assertEqual(status["auto"]["version"], 3)
+        replaced = self.invoke("auto", "set-candidates", "--nodes", f"{tail},{subscription}")
+        self.assertEqual(replaced.returncode, 0, replaced.stderr)
+        self.assertIn("auto_candidates_updated", replaced.stdout)
         self.assertIn("auto_disabled", self.invoke("auto", "disable").stdout)
 
     def test_bad_json_and_arguments_never_echo_secrets(self):
