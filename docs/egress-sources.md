@@ -22,9 +22,10 @@ Tailnet 通道不是 Tailscale exit-node 管理。新增普通路径不会放宽
 约束；普通手工代理也拒绝 Tailnet 地址、IPv4 映射的 Tailnet 地址和带作用域接口的 IPv6。
 第一版手工通道使用 IP 字面地址，不解析主机名，不引入新 VPN 协议框架。
 
-Linux 回环 GUI 可添加/重命名通道、选择已部署节点、单节点手动测速或显式开启策略。
-**添加、刷新、部署、选择是四个独立动作**：保存配置不下载订阅、不测速、不部署，
-也不切换或启用策略。订阅刷新、连接定义更新/删除及网络部署仍由 CLI 显式执行。
+Linux 回环 GUI 可添加/重命名通道、显式更新订阅、选择已部署节点、单节点手动测速或显式
+开启策略。**添加、刷新、部署、选择是四个独立动作**：保存配置不下载订阅、不测速、不部署，
+也不切换或启用策略。订阅刷新在 GUI 通道行显式发起（等同 CLI `--confirm` 的真实 HTTPS
+下载）或由 CLI 执行；连接定义更新/删除及网络部署仍由 CLI 显式执行。
 macOS 与 demo 始终只读，不读取私有来源，也不允许 Channel 配置写入。
 
 ## 范围、依赖与私有数据
@@ -260,13 +261,16 @@ GUI `/api/sources` 复用同一后端（GET，含所属用户可读名称，仅�
 
 - `/api/channels`：严格 `{id, definition}`，只调用 source 保存；URL/凭据只进私有注册表。
 - `/api/channels/rename`：严格 `{id, display_name}`，只更新显示元数据。
+- `/api/channels/refresh`：严格 `{id}`，仅订阅通道；复用 CLI `--confirm` 后端，对已存
+  私有 URL 做一次真实 HTTPS 下载并重写缓存，无 fixture/force/apply 等附加参数。
 - `/api/egress/select`、`/api/egress/delay`、`/api/auto`：显式选择、单节点测速与策略配置。
 
-请求体仍为 ≤4096 字节的严格字段 JSON；不接受任意文件、命令、接口覆盖、刷新或 apply 参数。
-Host、Origin、Fetch-Site、固定路径和 macOS 平台拒绝均适用于新路由。公开响应不回显
+请求体仍为 ≤4096 字节的严格字段 JSON；不接受任意文件、命令、接口覆盖或 apply/force
+等附加参数。Host、Origin、Fetch-Site、固定路径和 macOS 平台拒绝均适用于新路由。公开响应不回显
 订阅 URL、server、用户名、密码、控制器密钥或原始错误；节点/通道名称仅 owner-local。
 `channel_management` 仅在配置了来源的 Linux GUI 为 true；`network_mutations` 仍为 false。
-配置保存权限不是系统网络设置授权，表单不会调用刷新、测速、切换或自动策略端点。
+配置保存权限不是系统网络设置授权；订阅刷新是对固定私有 URL 的单次显式动作，保存
+表单本身不触发下载、测速、切换、部署或自动策略。
 system GUI 无权读取 root 私有来源时仍显示未知，不放宽权限。
 
 ## 开发验收

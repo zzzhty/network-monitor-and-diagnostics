@@ -36,12 +36,12 @@
 | `nmd update --check` | C，写管理锁、Git 对象与远端引用 | git fetch；不切换当前代码、不 apply | 管理者；不是零写入预览 |
 | `nmd update` | C，同上并快进代码、记录 pendingApply | 不自动 apply 或重启 monitor | 管理者；无自动代码回滚 |
 | `nmd source add/update/remove`、`nmd channel rename` | C，来源与缓存 | 不即时探测、部署或切换 | 管理者；删除/连接变化可能丢缓存，见第 3 节 |
-| `nmd source refresh <id> --fixture <YAML>` / `--confirm` | C，成功写缓存 | fixture 离线；confirm 用 HTTPS，2 MiB / 20s 预算且不跟随重定向 | 管理者；失败保留旧缓存与选择 |
+| `nmd source refresh <id> --fixture <YAML>` / `--confirm` | C，成功写缓存 | fixture 离线；confirm 用 HTTPS，2 MiB / 20s 预算且不跟随重定向；Linux GUI「更新订阅」按钮走同一 confirm 后端 | 管理者；失败保留旧缓存与选择 |
 | `nmd source select <节点ID> --defer` | C，保存期望，暂停已启用策略 | 不即时 PUT | 管理者；再选可覆盖保存值 |
 | `nmd channel auto enable/disable/set-candidates/resume` | C，写策略 | 不即时 PUT；下一采集周期可能恢复探测与切换 | 管理者；disable 关闭，set-candidates 保留 enabled/paused 并重置评估 |
 | `nmd install` / `monitor install` | C，安装/修复采集单元与配置 | 不 start/enable，不部署网络 | 管理者；uninstall 保留配置与历史 |
 | `nmd monitor start/stop/restart/enable/disable` | N，本地采集服务 | start/restart 后会写历史，并按配置探测/自动评估；enable 不等于 start 或 lingering | 管理者；对应停止/启动操作仍需检查状态 |
-| `nmd gui` | N，启动回环 HTTP 服务 | 不启动采集器；Linux 浏览页面会轮询 sources 并 GET 本地控制器；按钮另可保存通道/策略、测速或切换 | 诊断数据 UID；停止进程关闭面板，不撤销按钮已完成的动作 |
+| `nmd gui` | N，启动回环 HTTP 服务 | 不启动采集器；Linux 浏览页面会轮询 sources 并 GET 本地控制器；按钮另可保存通道/策略、更新订阅、测速或切换 | 诊断数据 UID；停止进程关闭面板，不撤销按钮已完成的动作 |
 | `nmd demo --once` / `nmd demo --port 8765` | C，创建临时合成 SQLite；后者另有 N 本地监听 | 不采集本机、不读私有来源，正常退出清理 | 无 sudo；不是零文件写入 |
 | `nmd monitor run --config FILE --state-dir DIR [--once]` | C/N，前台采集并写历史 | 读取本机元数据；主动探测由 config 决定；Linux 的 sources-dir 可启用自动评估 | 数据所属 UID；Ctrl-C 停止，已有历史保留 |
 | `nmd source select <节点ID> --confirm` | C/N，保存并 PUT selector | 改变已部署节点的运行出口，回读确认；不重启服务 | 管理者；回切需重新确认原节点 |
@@ -52,7 +52,7 @@
 源码边界：[manager.py](../scripts/manager.py)、[local-setup.sh](../local-setup.sh)、
 [egress_sources.py](../scripts/egress_sources.py)、[observability.py](../scripts/observability.py)。
 `machine capabilities` 描述平台能力；实际面板还须看 `/api/capabilities` 的有效能力。
-Linux GUI 有保存 Channel、重命名、策略、测速、选择五类 POST 路由；macOS 和 demo 拒绝这些写/控制请求。
+Linux GUI 有保存 Channel、重命名、更新订阅、策略、测速、选择六类 POST 路由；macOS 和 demo 拒绝这些写/控制请求。
 
 ## 2. 从已有证据开始
 

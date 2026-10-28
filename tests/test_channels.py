@@ -325,9 +325,40 @@ class ChannelAPITests(ChannelFixture):
                                ('/api/channels?apply=true', {})):
             self.assertEqual(self.request(server, route, payload)[0], 400)
         self.assertEqual(self.request(server, '/api/channels', {'id': 'sub-a', 'definition': self.subscription})[0], 409)
-        self.assertEqual(self.request(server, '/api/channels/refresh', {'id': 'sub-a'})[0], 405)
+        self.assertEqual(self.request(server, '/api/channels/remove', {'id': 'sub-a'})[0], 405)
         for headers in ({'Origin': 'https://evil.invalid'}, {'Host': 'evil.invalid'}, {'Sec-Fetch-Site': 'cross-site'}):
             self.assertEqual(self.request(server, '/api/channels/rename', {'id': 'sub-a', 'display_name': 'blocked'}, headers)[0], 403)
+
+    def test_refresh_rewrites_subscription_cache_via_real_https_semantics(self):
+        server = self.dashboard()
+        e.put_source(self.store, 'sub-a', self.subscription)
+        payload = (b'proxies:\n'
+                   b'  - {name: one, type: socks5, server: 192.0.2.20, port: 1080}\n'
+                   b'  - {name: two, type: socks5, server: 192.0.21.21, port: 1080}\n')
+        with patch.object(e, 'fetch_subscription', return_value=payload) as fetch:
+            status, body = self.request(server, '/api/channels/refresh', {'id': 'sub-a'})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body), {'result': 'refreshed_pending_apply'})
+        self.assertNotIn(b'SYNTHETIC_SECRET', body)
+        # One real fetch of the stored private URL; identical to CLI --confirm.
+        self.assertEqual(fetch.call_args.args, (self.subscription['url'],))
+        self.assertEqual([node['display'] for node in self.store.load()['cache']['sub-a']['nodes']], ['one', 'two'])
+        # Strict fixed-key body: no force/fixture/apply companions survive.
+        for extra in ({'id': 'sub-a', 'force': True}, {'id': 'sub-a', 'fixture': 'payload.yaml'},
+                      {'id': 'sub-a', 'definition': self.subscription}, {}):
+            self.assertEqual(self.request(server, '/api/channels/refresh', extra)[0], 400)
+        # Only subscription channels can refresh; failures never echo the URL
+        # and keep the last cache, exactly like the CLI path they share.
+        e.put_source(self.store, 'tail-a', self.tail)
+        status, body = self.request(server, '/api/channels/refresh', {'id': 'tail-a'})
+        self.assertEqual((status, json.loads(body)['error']), (409, 'subscription_source_not_found'))
+        status, body = self.request(server, '/api/channels/refresh', {'id': 'missing'})
+        self.assertEqual((status, json.loads(body)['error']), (409, 'subscription_source_not_found'))
+        with patch.object(e, 'fetch_subscription', side_effect=e.SourceError('subscription_fetch_failed')):
+            status, body = self.request(server, '/api/channels/refresh', {'id': 'sub-a'})
+        self.assertEqual((status, json.loads(body)['error']), (409, 'subscription_fetch_failed'))
+        self.assertNotIn(b'SYNTHETIC_SECRET', body)
+        self.assertEqual([node['display'] for node in self.store.load()['cache']['sub-a']['nodes']], ['one', 'two'])
 
     def test_invalid_private_fields_are_sanitized_and_do_not_create_a_channel(self):
         server = self.dashboard()
@@ -343,7 +374,8 @@ class ChannelAPITests(ChannelFixture):
         server = self.dashboard('macos')
         with patch.object(e.Store, 'load', side_effect=AssertionError('real private sources forbidden')):
             for route, body in (('/api/channels', {'id': 'sub-a', 'definition': self.subscription}),
-                                ('/api/channels/rename', {'id': 'sub-a', 'display_name': 'no'})):
+                                ('/api/channels/rename', {'id': 'sub-a', 'display_name': 'no'}),
+                                ('/api/channels/refresh', {'id': 'sub-a'})):
                 self.assertEqual(self.request(server, route, body)[0], 405)
         self.assertFalse(self.directory.exists())
 

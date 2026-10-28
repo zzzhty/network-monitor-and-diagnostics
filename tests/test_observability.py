@@ -53,13 +53,14 @@ class DashboardAPITests(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_post_surface_is_limited_and_requires_private_sources(self):
-        # Unrouted paths keep rejecting every write verb; the three egress routes
+        # Unrouted paths keep rejecting every write verb; the fixed egress routes
         # need a configured sources store, which this server does not have.
         for method in ('POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'):
             self.assertEqual(self.request('/api/snapshot', method=method)[0], 405)
         self.assertEqual(self.request('/api/egress/select', method='PUT')[0], 405)
         self.assertEqual(self.request('/api/egress/select', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
         self.assertEqual(self.request('/api/auto', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
+        self.assertEqual(self.request('/api/channels/refresh', method='POST')[0], 405 if observability.nmd_platform.name() != 'linux' else 503)
         self.assertEqual(self.request('/api/egress/select?node=x', method='POST')[0], 400)
         self.assertFalse(self.state.exists())
 
