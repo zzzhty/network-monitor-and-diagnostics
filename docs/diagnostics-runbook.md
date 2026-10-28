@@ -38,7 +38,7 @@
 | `nmd source add/update/remove`、`nmd channel rename` | C，来源与缓存 | 不即时探测、部署或切换 | 管理者；删除/连接变化可能丢缓存，见第 3 节 |
 | `nmd source refresh <id> --fixture <YAML>` / `--confirm` | C，成功写缓存 | fixture 离线；confirm 用 HTTPS，2 MiB / 20s 预算且不跟随重定向 | 管理者；失败保留旧缓存与选择 |
 | `nmd source select <节点ID> --defer` | C，保存期望，暂停已启用策略 | 不即时 PUT | 管理者；再选可覆盖保存值 |
-| `nmd channel auto enable/disable/swap/resume` | C，写策略 | 不即时 PUT；下一采集周期可能恢复探测与切换 | 管理者；disable 关闭，swap 保留 enabled/paused |
+| `nmd channel auto enable/disable/set-candidates/resume` | C，写策略 | 不即时 PUT；下一采集周期可能恢复探测与切换 | 管理者；disable 关闭，set-candidates 保留 enabled/paused 并重置评估 |
 | `nmd install` / `monitor install` | C，安装/修复采集单元与配置 | 不 start/enable，不部署网络 | 管理者；uninstall 保留配置与历史 |
 | `nmd monitor start/stop/restart/enable/disable` | N，本地采集服务 | start/restart 后会写历史，并按配置探测/自动评估；enable 不等于 start 或 lingering | 管理者；对应停止/启动操作仍需检查状态 |
 | `nmd gui` | N，启动回环 HTTP 服务 | 不启动采集器；Linux 浏览页面会轮询 sources 并 GET 本地控制器；按钮另可保存通道/策略、测速或切换 | 诊断数据 UID；停止进程关闭面板，不撤销按钮已完成的动作 |
@@ -80,8 +80,8 @@ system 模式按第 1 节分别选择管理者和诊断数据 UID；不要把所
 1. R：先读 status、已有时间线，区分服务、DNS、尾网对端与出口节点；需要联网证据时再
    R/N 执行 verify，或在授权环境用 `tailscale ping <对端>`。直连/DERP 的证明边界见
    [对端验收](../runbook.md#对端路径的验收边界)。
-2. 仅节点失败：核对 auto_events 与 active 是否已切到备选；未启用自动策略时，先确认
-   备选已部署且可用，再 N 手动 select --confirm。回切也是新的显式选择。
+2. 仅节点失败：核对 auto_events 与 active 是否已切到更低优先候选；未启用自动策略时，
+   先确认接管候选已部署且可用，再 N 手动 select --confirm。回切也是新的显式选择。
 3. 整个 Tailnet/DNS 不可达：不要通过清空路由/防火墙来试错；按 Tailscale 和本机网络
    排查。[独立 DNS/控制路径](../runbook.md#避免-tailscale-与-vps-循环依赖)是部署目标，
    须由实际观测确认，不能因配置存在就宣称正常。
@@ -105,16 +105,17 @@ system 模式按第 1 节分别选择管理者和诊断数据 UID；不要把所
 
 删除与连接更新没有缓存撤销历史；先保留必要的私有定义，恢复需要 add/update 与刷新。
 
-### 3.3 两候选失败、控制器故障与自动策略停顿
+### 3.3 候选失败、控制器故障与自动策略停顿
 
 先读 auto status、source status 与采集器 auto_events；CLI delay 可以补充一次主动测速，
 但对外统一的 `delay_test_failed` **不能区分节点失败与控制器故障**。服务 active 也不能排除
-控制器鉴权、路由或响应格式错误。
+控制器鉴权、路由或响应格式错误。每周期按优先级探测全部候选（2..8 个，最坏约 N×6 秒），
+新鲜度窗口随候选数加宽。
 
 | 观测 | 当前行为 | 后续处理 |
 | --- | --- | --- |
-| `controller_unreachable` | 当前评估无法获得有效控制器/测速证据；探测故障不推进失败、恢复或冷却计数，不发切换 PUT | 检查核心/控制器，不据此判两节点失效；恢复后继续评估 |
-| `both_unhealthy` | 两个有效节点探测均失败；同一连续窗口只首次发事件，不 PUT，保留 target 与失败/恢复计数；冷却周期计数仍每轮 +1 | 保持现状，检查共同通道/上游；恢复有效证据后按迟滞/冷却继续 |
+| `controller_unreachable` | 当前评估无法获得有效控制器/测速证据；探测故障不推进失败、恢复或冷却计数，不发切换 PUT | 检查核心/控制器，不据此判候选失效；恢复后继续评估 |
+| `all_unhealthy` | 全部有效候选探测均失败；同一连续窗口只首次发事件，不 PUT，保留 target 与失败/恢复计数；冷却周期计数仍每轮 +1 | 保持现状，检查共同通道/上游；恢复有效证据后按迟滞/冷却继续 |
 | `auto_suspended` / `auto_resumed` | 候选从缓存消失时挂起，恢复后继续 | 核对刷新和节点身份；不会自动把新节点补成候选 |
 | `paused=true` | 手动选择（含 defer）暂停已启用策略，不改候选 | 确认后 C 执行 auto resume；已有采集器下一轮可能切换 |
 | `auto_switch_failed` | 切换失败，包含 PUT 前的节点未部署等拒绝 | 按事件 reason 定位；该事件本身不代表已经发出 PUT |
@@ -195,8 +196,8 @@ capabilities/status；Linux 安装/更新、source/channel、网络管理、syst
 ## 5. 事件与源码索引
 
 - auto_switch、auto_switch_failed、auto_verify_adopted、candidate_changed、
-  manual_engage_primary/secondary：见 [自动评估](../scripts/egress_sources.py)。
-- both_unhealthy、controller_unreachable、auto_suspended/resumed：处理路径见第 3.3 节。
+  manual_engage：见 [自动评估](../scripts/egress_sources.py)。
+- all_unhealthy、controller_unreachable、auto_suspended/resumed：处理路径见第 3.3 节。
 - incident、gap、新鲜度与保留：见 [Store / read_snapshot](../scripts/nmd_monitor.py)、
   [时间线回归](../tests/test_timeline_metrics.py) 与 [monitor 回归](../tests/test_monitor.py)。
 - 源码与管理安装的命令边界：见 [manager.py](../scripts/manager.py)、

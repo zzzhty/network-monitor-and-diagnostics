@@ -9,8 +9,8 @@
   持久字段仍名为 `sources`，Channel ID 就是原 source ID。
 - **Node（节点）**：某个通道中可选择的实际代理出口，有稳定匿名 ID；当前出口显示到节点。
   手工通道包含一个 SOCKS5 节点，订阅通道包含显式刷新所得的节点集合。
-- **Policy（策略）**：独立于通道类型的两个明确候选（主选/备选）及迟滞、恢复、冷却参数。
-  可以选两个订阅、两个手工代理，甚至同一通道内的两个不同节点；新通道不自动入选。
+- **Policy（策略）**：独立于通道类型的 2..8 个按优先级排序的明确候选及迟滞、恢复、冷却
+  参数。可以混用订阅与手工代理，甚至同一通道内的多个不同节点；新通道不自动入选。
 
 | 通道 kind | 节点协议 | 连接路径 |
 |---|---|---|
@@ -112,7 +112,7 @@ nmd source status                          # 仅 GET 本机 selector，不测速
 # 已部署节点，显式改变运行中出口：
 nmd source select nmd-sub-a-匿名摘要 --confirm
 nmd source delay nmd-sub-a-匿名摘要        # 单节点手动测速（见下）
-nmd channel auto enable --primary-node "$PRIMARY_NODE" --secondary-node "$SECONDARY_NODE"  # 显式候选，见下
+nmd channel auto enable --node "$PRIMARY_NODE" --node "$SECONDARY_NODE"  # 显式候选（可重复 --node），见下
 nmd source export                          # 仅脱敏 JSON
 ```
 
@@ -151,60 +151,71 @@ status 再决定下一步，不自动重试或回退。新节点尚未部署时�
 
 ## 自动故障切换（可选，需手动开启）
 
-策略显式保存两个不同的完整节点 ID，与通道 kind 无关；`source` 引用字段继续表示
-稳定 Channel ID。先通过 `nmd channel nodes` 取得实际 ID，再设置命令中的变量：
+策略显式保存 2..8 个互不相同的完整节点 ID，按优先级排序，与通道 kind 无关；`source`
+引用字段继续表示稳定 Channel ID。先通过 `nmd channel nodes` 取得实际 ID，再设置命令中
+的变量：
 
 ```bash
-nmd channel auto enable --primary-node "$PRIMARY_NODE" --secondary-node "$SECONDARY_NODE" \
+nmd channel auto enable --node "$PRIMARY_NODE" --node "$SECONDARY_NODE" --node "$THIRD_NODE" \
   --fail-after 3 --recover-after 2 --cooldown 2
+nmd channel auto enable --nodes "$PRIMARY_NODE,$SECONDARY_NODE"  # 逗号列表等价
 nmd channel auto status
-nmd channel auto swap             # 交换已有主备，仍保留 enabled/paused
+nmd channel auto set-candidates --node "$SECONDARY_NODE" --node "$PRIMARY_NODE"  # 启用后直接替换有序列表
 nmd channel auto disable
-nmd channel auto resume           # 仅恢复原有两个候选，不重新挑选节点
+nmd channel auto resume           # 仅清除手动暂停，不重新挑选节点
 ```
 
 `fail_after` 默认 3、`recover_after` 默认 2、`cooldown` 默认 2，均为 2..10。
-GUI 也明确选择两个节点，先停用才能更换候选；保存通道不会调用自动策略接口。
-采集器启动/启用仍是独立操作，配置策略不会启动 monitor 或安装服务。
+GUI 用候选行编辑器维护同一份有序列表（增删/上下移，上限 8），启用后保存即
+`set-candidates`；保存通道不会调用自动策略接口。采集器启动/启用仍是独立操作，
+配置策略不会启动 monitor 或安装服务。
 
-评估器仍在已有监控采集周期内工作：只探测这两个候选，保留失败迟滞、主选恢复迟滞、
-切换冷却与双侧不健康时不动的行为。控制器传输、鉴权、路由或响应格式故障不作为节点失败：
-发出 controller_unreachable，本轮不推进失败/恢复/冷却计数，也不 PUT。两候选有效探测
-均失败时发出 both_unhealthy，保留 target 和失败/恢复计数，但冷却周期仍递增。
+评估器仍在已有监控采集周期内工作：每周期按优先级顺序探测全部候选（最坏情况约
+N×6 秒，新鲜度窗口随候选数加宽），保留失败迟滞、恢复迟滞、切换冷却与全部不健康时
+不动的行为。当前候选连续失败满 `fail_after` 且冷却已过时，切到最高优先的其他健康
+候选；更高优先候选恢复满 `recover_after` 时回切上去（同一周期只对最高优先的健康
+上游计数，避免多上游振荡）。控制器传输、鉴权、路由或响应格式故障不作为节点失败：
+发出 controller_unreachable，本轮不推进失败/恢复/冷却计数，也不 PUT。全部候选有效
+探测均失败时发出 all_unhealthy，保留 target 和失败/恢复计数，但冷却周期仍递增。
 CLI delay_test_failed 是统一安全码，不能仅据此区分两类故障。
 任何自动切换仍在实际 writer lock 内重验策略、
-暂停状态、期望选择和候选清单，再走 PUT + 回读；过期决策不执行 PUT。
+暂停状态、期望选择和完整候选清单，再走 PUT + 回读；过期决策不执行 PUT。
 结果不确定时保持 pending_verify，先协调实际观察与保存选择，再按恢复规则回切。
 
 手动选择任何节点（含 `--defer`）都会暂停已启用的策略，且**不替换候选**；明确
 `auto resume` 后才继续。手动 PUT 结果不确定也先持久化暂停，再返回未知结果，
 保留原 desired 供后续只读核查，避免自动策略抢回。节点从缓存消失时挂起，恢复后才继续。
-没有多级备用、全节点测速或负载均衡；新增通道/节点不会自动进入探测集合。
+没有全节点测速或负载均衡；备用深度上限为 8 个显式候选，新增通道/节点不会自动进入
+探测集合。
 
 策略只控制本机 mihomo 选择器，不代表整机所有流量或 AI 业务可用。系统级服务账户
 仍无权读取 root 私有注册表，不放宽权限。事件写入 `auto_events`，GUI 展示实际节点、
-主备与暂停状态。评估器在持久化 runtime 上派生只读 `state`（paused / suspended /
-pending_verify / both_unhealthy / engaging / 主备健康、失败计数、恢复计数）与
+候选序与暂停状态。评估器在持久化 runtime 上派生只读 `state`（paused / suspended /
+pending_verify / all_unhealthy / engaging / active / failing / recovering）与
 `cooldown_remaining`（距切换解禁的剩余周期数），随既有 `collector.auto_runtime`
 整包导出，不新增平行字段；GUI 据此展示引擎状态与冷却进度。无健康数据或控制器不可用
 时不能伪造成功。
 
 ### 旧配置与 CLI 兼容迁移
 
-外层注册表继续为 `schema_version: 1`、`sources` 和 `cache`；新策略为 `auto.version: 2`，
-`primary` / `secondary` 分别为 `{"source": ChannelID, "node": NodeID}`。
-旧 `tailnet` / `subscription` 策略按原 `primary` 顺序转换，enabled、paused、selected 和
-阈值不变。list/status/export/GUI GET 只返回内存视图，不写盘；下一次显式写操作
-才在同一 writer lock 内原子提交迁移。自动切换/确认仍可更新实际选择，但不借此改写
-旧策略的存储格式。旧运行状态摘要也可识别，不丢失未决切换确认。
+外层注册表继续为 `schema_version: 1`、`sources` 和 `cache`；新策略为 `auto.version: 3`，
+`candidates` 为 2..8 个有序 `{"source": ChannelID, "node": NodeID}`。旧 `tailnet` /
+`subscription`（v1）策略先按原 `primary` 顺序转换为 v2 主备，再映射为
+`candidates[0..1]`；v2 `primary`/`secondary` 策略同样取前两位。enabled、paused、
+selected 和阈值不变。list/status/export/GUI GET 只返回内存视图，不写盘；下一次显式
+写操作才在同一 writer lock 内原子提交迁移。自动切换/确认仍可更新实际选择，但不借此
+改写旧策略的存储格式。旧（v1/v2 时代）运行状态摘要也可识别：升级后首周期原地把
+runtime 翻译为 v3 形态（target 转为候选序号、计数映射到 fails/recover），既不重置
+计数，也不触发多余的接管 PUT，未决切换确认保留。
 
 节点 ID 不因新增显示字段而变化；重命名保留缓存，显示字段从摘要输入排除，原摘要保持
 兼容。同连接定义的 display-only update 也不清缓存。通道 ID 不提供重命名操作。
 
-旧 `nmd source auto enable --primary subscription|tailnet --tailnet-node ... --subscription-node ...`
-仍可使用，并保留原候选默认规则和顺序；旧 `set-primary --primary ...` 在主备类型可唯一
-区分时仍有效。新的同类候选使用显式 node 参数与 `auto swap`。持久迁移后，旧版程序
-不理解 v2 策略及新增通道字段；需要回退程序时，应使用已确认的私有配置备份。
+v3 移除旧主备专用载荷与动作：`--primary/--primary-node/--secondary-node/
+--tailnet-node/--subscription-node`、`swap` 与 `set-primary` 一律拒绝并返回
+`auto_legacy_payload_removed`；同类候选用显式 `--node/--nodes` 与 `set-candidates`。
+持久迁移后，旧版程序不理解 v3 策略及新增通道字段；需要回退程序时，应使用已确认的
+私有配置备份。
 
 ```bash
 nmd source update sub-a --file /private/location/replacement.json  # 连接定义变化会清缓存；只改显示名则保留缓存
@@ -241,7 +252,7 @@ provider health check/delay 即使以后单独启用，也只能表示其测试�
   SOCKS5 VPS 都是 exit node。若要恢复某个来源的 Tailscale exit node，需另行确认它
   提供 exit-node 能力并人工操作。
 - 订阅来源：没有对应的 Tailscale exit-node 回退。手动选择已部署的其他来源，或由自动
-  切换在两个候选间接管，再验证；不将健康检查或其他来源 IP 视为该订阅的业务可用证明。
+  切换在候选之间接管，再验证；不将健康检查或其他来源 IP 视为该订阅的业务可用证明。
 - 没有来源注册表：兼容原有单 VPS 配置、NMD_VPS_PUB、cutover/rollback 和 DERP 降级说明。
   一旦存在注册表，旧的固定 VPS cutover/rollback 拒绝执行，避免恢复错误的 exit node。
 
