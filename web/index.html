@@ -68,22 +68,21 @@
         <p id="auto-state" class="muted">自动切换未启用。</p>
         <div id="auto-actions" class="auto-actions" aria-label="自动切换操作">
           <form id="auto-config-form" class="channel-form">
-            <label>主选节点<select id="auto-primary-node" required><option value="">请选择节点</option></select></label>
-            <label>备选节点<select id="auto-secondary-node" required><option value="">请选择节点</option></select></label>
-            <button id="auto-enable" type="submit">保存并启用这两个候选</button>
+            <div id="auto-candidate-rows" aria-label="候选节点列表（按优先级排序）"></div>
+            <button id="auto-add-candidate" type="button">添加候选</button>
+            <button id="auto-enable" type="submit">保存并启用候选</button>
           </form>
           <button id="auto-disable" type="button">停用</button>
           <button id="auto-resume" type="button">恢复自动</button>
-          <button id="auto-toggle-primary" type="button">交换主备</button>
         </div>
         <p id="auto-policy" class="muted"></p>
         <div class="section-heading"><h2>切换时间线</h2><span class="muted">最近 20 条</span></div>
         <div id="auto-timeline" class="timeline"></div>
-        <p class="muted">自动模式只评估明确指定的两个节点，可来自任意通道，按连续失败/成功次数和冷却周期切换。手动选择任何节点都会暂停自动策略，候选保持不变，需显式恢复。更换候选先停用再配置；添加通道不会开始探测。订阅刷新和部署仍由 CLI 显式执行。</p>
+        <p class="muted">自动模式按优先级评估明确指定的 2–8 个候选，可来自任意通道，按连续失败/成功次数和冷却周期在候选之间切换：当前候选不健康时切到最高优先的健康候选，更高优先候选恢复后回切。手动选择任何节点都会暂停自动策略，候选保持不变，需显式恢复。候选列表启用后也可直接更新；添加通道不会开始探测。订阅刷新和部署仍由 CLI 显式执行。</p>
       </article>
     </section>
     <section id="help" class="page" aria-label="设置与帮助" hidden>
-      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 和模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速。自动故障切换是手动开启的可选模式，只在两个固定候选之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅刷新、删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。此界面不提供系统网络设置、任意命令执行或订阅刷新；通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
+      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 和模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速。自动故障切换是手动开启的可选模式，在按优先级排序的候选列表（2–8 个）之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅刷新、删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。此界面不提供系统网络设置、任意命令执行或订阅刷新；通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
     </section>
     <footer><span>NMD / 本地面板</span><span>证据优先 · 独立监控 · 无云端依赖</span></footer>
   </main>
