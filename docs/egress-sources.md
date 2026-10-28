@@ -150,6 +150,45 @@ status 再决定下一步，不自动重试或回退。新节点尚未部署时�
 节点必须存在于缓存清单；测速结果只有毫秒数或固定失败码 `delay_test_failed`，不透传核心
 错误文本。没有批量测速、没有后台定时测速；核心 provider 的 health-check 保持关闭。
 
+## 一键分层排查（GUI）
+
+Linux 出口控制 GUI 的「一键排查」按钮触发 `POST /api/egress/diagnose`（严格空体），
+把 [诊断手册 3.3](diagnostics-runbook.md#33-候选失败控制器故障与自动策略停顿) 的手工
+故障矩阵自动化为一次并行固定电池：四个固定公共目标的系统路径 HEAD 探测（curl，
+`--proxy ''` 不走环境代理，各自 `--max-time 8s`，总预算约 15 秒）、每个自动策略候选的
+单节点 healthcheck（与测速按钮同一控制器路径），以及对 Tailnet 通道 `server:port` 的
+3 秒原始 TCP 连接（Tailnet 地址被路由排除在 TUN 之外，因此这是真正的绕行探测）。
+
+| 层 | 目标（服务端常量） | 验证的路由层 |
+|---|---|---|
+| direct_foreign | connectivity-check.ubuntu.com | 本机直连外网（规则 DIRECT） |
+| egress_cn | www.baidu.com | 国内直连（GEOSITE,cn → DIRECT） |
+| egress_foreign | www.cloudflare.com | 真实出口链路（MATCH → 所选节点） |
+| egress_exit_ip | 1.1.1.1（无 DNS） | 同一出口链路的出口侧判别 |
+| candidate_health | 各候选节点 | 控制器单节点 healthcheck（毫秒或失败） |
+| node_tcp | 仅 Tailnet 通道 server:port | 原始 TCP（ok/refused/timeout） |
+
+非 Tailnet 通道的 server 本身经 TUN 路由，原始连接不能作为绕行证据，固定跳过并返回
+原因码 `server_routed_through_tun`。结论由对结果字典的纯函数决策树计算（无网络参与，
+可离线单测），固定码如下；GUI 为每个码显示一行中文提示：
+
+| code | 触发条件 | 含义 |
+|---|---|---|
+| `egress_healthy` | 全部层成功 | 出口链路健康 |
+| `local_internet_down` | direct_foreign 失败 | 本机直连外网故障，与节点无关 |
+| `controller_unreachable` | 任一候选探测遇控制器故障 | 控制器问题，绝不记为节点失败（同自动评估语义） |
+| `node_service_down` | 全候选失测 + Tailnet TCP 拒绝 | 节点服务疑似停机 |
+| `node_network_unreachable` | 全候选失测 + Tailnet TCP 超时/不可达 | 到节点的网络路径不通 |
+| `exit_dns_poisoned` | 候选失测 + 出口 IP 可达 + 域名层失败 | 疑似出口侧 DNS 污染 |
+| `egress_degraded` | 全部成功但 egress_foreign > 3000 ms | 中继路径劣化 |
+| `egress_anomaly` | 未命中上述组合的失败 | 转诊断手册 3.3 人工排查 |
+
+限制：探测目标为固定公共常量，不接受任何客户端输入；响应只含固定字段、取整毫秒与
+匿名节点 ID，不包含节点 IP、URL、原始 curl 输出或控制器错误文本；端点只读私有注册表、
+从不写入，也不改变 selector。单次探测成功只代表该次观察；该电池是 3.3 矩阵的快速分诊
+子集，GUI 或面板本身不可达、需要系统性取证时，仍按
+[诊断手册 3.3](diagnostics-runbook.md#33-候选失败控制器故障与自动策略停顿) 人工排查。
+
 ## 自动故障切换（可选，需手动开启）
 
 策略显式保存 2..8 个互不相同的完整节点 ID，按优先级排序，与通道 kind 无关；`source`
@@ -263,6 +302,8 @@ GUI `/api/sources` 复用同一后端（GET，含所属用户可读名称，仅�
 - `/api/channels/rename`：严格 `{id, display_name}`，只更新显示元数据。
 - `/api/channels/refresh`：严格 `{id}`，仅订阅通道；复用 CLI `--confirm` 后端，对已存
   私有 URL 做一次真实 HTTPS 下载并重写缓存，无 fixture/force/apply 等附加参数。
+- `/api/egress/diagnose`：严格空体 `{}`（拒绝任何字段）；执行一次固定分层探测电池
+  （见下节），只读私有注册表并只向固定公共目标发探测，不写任何配置或选择。
 - `/api/egress/select`、`/api/egress/delay`、`/api/auto`：显式选择、单节点测速与策略配置。
 
 请求体仍为 ≤4096 字节的严格字段 JSON；不接受任意文件、命令、接口覆盖或 apply/force
