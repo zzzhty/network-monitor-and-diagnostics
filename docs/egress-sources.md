@@ -179,7 +179,7 @@ Linux 出口控制 GUI 的「一键排查」按钮触发 `POST /api/egress/diagn
 | `controller_unreachable` | 任一候选探测遇控制器故障 | 控制器问题，绝不记为节点失败（同自动评估语义） |
 | `node_service_down` | 全候选失测 + Tailnet TCP 拒绝 | 节点服务疑似停机 |
 | `node_network_unreachable` | 全候选失测 + Tailnet TCP 超时/不可达 | 到节点的网络路径不通 |
-| `exit_dns_poisoned` | 候选失测 + 出口 IP 可达 + 域名层失败 | 疑似出口侧 DNS 污染 |
+| `exit_dns_poisoned` | 候选失测 + 出口 IP 可达 + 域名层失败 | 疑似出口侧解析故障；高延迟劣化链路上解析超时也会形成同样组合，需结合各层耗时判断，勿仅凭此码定论 |
 | `egress_degraded` | 全部成功但 egress_foreign > 3000 ms | 中继路径劣化 |
 | `egress_anomaly` | 未命中上述组合的失败 | 转诊断手册 3.3 人工排查 |
 

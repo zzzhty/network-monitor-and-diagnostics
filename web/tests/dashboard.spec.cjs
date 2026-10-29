@@ -286,7 +286,7 @@ const server = http.createServer((req, res) => {
         egress_exit_ip: { status: 'ok', error: null, total_ms: 200 } },
       verdict: { code: 'exit_dns_poisoned', hint_key: 'exit_dns_poisoned' } };
     await page.locator('#diagnose-run').click();
-    await page.waitForFunction(() => document.querySelector('#diagnose-results').textContent.includes('DNS 污染'));
+    await page.waitForFunction(() => document.querySelector('#diagnose-results').textContent.includes('出口侧解析故障'));
     assert.match(await page.locator('#diagnose-results').textContent(), /失败（dns_error）/);
     assert.equal(await page.locator('#egress img').count(), 0);
     capabilityView.platform = 'macos';
