@@ -118,6 +118,36 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('#incident-count').textContent(), '未知');
     assert.equal(await page.locator('#paths .ok').count(), 0);
     assert.match(await page.locator('#egress-active').textContent(), /未知/);
+    // Theme tokens: the light override block must actually re-skin the GUI,
+    // color-scheme must flip so native form controls follow the active theme,
+    // and the dark base must keep its exact original panel colors. Each scheme
+    // is asserted after a fresh reload: flipping prefers-color-scheme live on
+    // an already-rendered page can leave stale computed var() styles in
+    // Chromium, so a reload keeps the fixture deterministic.
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.reload();
+    assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme), 'dark');
+    const darkCard = await page.evaluate(() => getComputedStyle(document.querySelector('.card')).backgroundColor);
+    const darkSidebar = await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar')).backgroundColor);
+    const darkNavActive = await page.evaluate(() => getComputedStyle(document.querySelector('.nav.active')).backgroundColor);
+    assert.equal(darkCard, 'rgb(21, 28, 41)');
+    assert.equal(darkNavActive, 'rgb(36, 48, 74)');
+    await page.emulateMedia({ colorScheme: 'light' });
+    await page.reload();
+    assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme), 'light');
+    const lightCard = await page.evaluate(() => getComputedStyle(document.querySelector('.card')).backgroundColor);
+    const lightSidebar = await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar')).backgroundColor);
+    const lightNavActive = await page.evaluate(() => getComputedStyle(document.querySelector('.nav.active')).backgroundColor);
+    assert.notEqual(lightCard, darkCard);
+    assert.notEqual(lightSidebar, darkSidebar);
+    assert.notEqual(lightNavActive, darkNavActive);
+    // Reduced-motion emulation must not break rendering of key elements.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    assert.equal(await page.locator('h1').textContent(), '网络概览');
+    assert.equal(await page.locator('.brand strong').textContent(), 'NMD');
+    await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'no-preference' });
+    await page.reload();
+    await page.waitForFunction(() => document.querySelector('#connection').textContent.includes('尚无监控数据'));
     const refresh = async () => { await page.locator('#refresh').click(); await page.waitForFunction(() => !document.querySelector('#refresh').disabled); };
     snapshot = { schema_version: 1, generated_at: now, collector: { state: 'fresh', last_sample_at: now, interval_seconds: 30 }, samples: [
       { id: '<img src=x onerror="window.injected=true">', type: 'http', path: 'system', status: 'success', timings: { total: 0.125 }, observed_at: now },
@@ -369,6 +399,6 @@ const server = http.createServer((req, res) => {
     assert.deepEqual(errorPageRequests, []);
     await errorPage.close();
     assert.deepEqual(errors, []);
-    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, one-click diagnose, channel subscription refresh, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, CSP.');
+    console.log('Dashboard browser tests passed: empty, fresh, failed paths, gaps, incidents, egress switch/delay/auto, one-click diagnose, channel subscription refresh, XSS, stale/future, HTTP/schema errors, recovery, mobile, polling, theme dark/light tokens, reduced motion, CSP.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());
