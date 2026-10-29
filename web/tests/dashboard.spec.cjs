@@ -5,6 +5,21 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root = path.resolve(__dirname, '..');
+// WCAG contrast ratio of the footer text against the page background, computed
+// from live computed styles so the accessibility contract is checked per scheme.
+const footerContrast = (page) => page.evaluate(() => {
+  const channel = (value) => {
+    const part = Number(value) / 255;
+    return part <= 0.04045 ? part / 12.92 : Math.pow((part + 0.055) / 1.055, 2.4);
+  };
+  const luminance = (color) => {
+    const [r, g, b] = color.match(/\d+(\.\d+)?/g).slice(0, 3).map(channel);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const fg = luminance(getComputedStyle(document.querySelector('footer')).color);
+  const bg = luminance(getComputedStyle(document.documentElement).backgroundColor);
+  return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+});
 let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
 let diagnoseView = null;
 let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
@@ -130,8 +145,13 @@ const server = http.createServer((req, res) => {
     const darkCard = await page.evaluate(() => getComputedStyle(document.querySelector('.card')).backgroundColor);
     const darkSidebar = await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar')).backgroundColor);
     const darkNavActive = await page.evaluate(() => getComputedStyle(document.querySelector('.nav.active')).backgroundColor);
+    const darkNavActiveColor = await page.evaluate(() => getComputedStyle(document.querySelector('.nav.active')).color);
     assert.equal(darkCard, 'rgb(21, 28, 41)');
     assert.equal(darkNavActive, 'rgb(36, 48, 74)');
+    // The active-nav text keeps its exact original #c9d4ff tint: it is a
+    // one-off accent step (--ink-750), not the shared --ink-800 button text.
+    assert.equal(darkNavActiveColor, 'rgb(201, 212, 255)');
+    assert.ok(await footerContrast(page) >= 4.5);
     await page.emulateMedia({ colorScheme: 'light' });
     await page.reload();
     assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme), 'light');
@@ -141,6 +161,7 @@ const server = http.createServer((req, res) => {
     assert.notEqual(lightCard, darkCard);
     assert.notEqual(lightSidebar, darkSidebar);
     assert.notEqual(lightNavActive, darkNavActive);
+    assert.ok(await footerContrast(page) >= 4.5);
     // Reduced-motion emulation must not break rendering of key elements.
     await page.emulateMedia({ reducedMotion: 'reduce' });
     assert.equal(await page.locator('h1').textContent(), '网络概览');
