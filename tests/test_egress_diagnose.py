@@ -69,6 +69,18 @@ class VerdictTests(unittest.TestCase):
                 candidates = [row(health="fail", tcp=tcp), row(kind="subscription", health="fail")]
                 self.assertEqual(self.code(probes, candidates), "node_network_unreachable")
 
+    def test_tcp_ok_with_dead_chain_is_node_service_unresponsive(self):
+        probes = self.healthy_probes()
+        probes["egress_foreign"] = probe(ok=False, error="timeout")
+        probes["egress_exit_ip"] = probe(ok=False, error="timeout")
+        # The tailnet host accepts TCP yet nothing answers through it: a hung
+        # node service (or dead node-side egress), not network loss.
+        candidates = [row(health="fail", tcp="ok"), row(kind="subscription", health="fail")]
+        self.assertEqual(self.code(probes, candidates), "node_service_unresponsive")
+        # Without any TCP evidence the same failures stay the generic anomaly.
+        self.assertEqual(self.code(probes, [row(kind="subscription", health="fail"),
+                                            row(kind="subscription", health="fail")]), "egress_anomaly")
+
     def test_node_up_but_domain_only_failure_is_exit_dns_poisoned(self):
         probes = self.healthy_probes()
         probes["egress_foreign"] = probe(ok=False, error="dns_error")
