@@ -93,6 +93,11 @@ def verdict(probes, candidates):
         code = "node_service_down"
     elif all_fail and ({"timeout", "unreachable"} & set(tcps)):
         code = "node_network_unreachable"
+    elif all_fail and "ok" in tcps and not ok("egress_exit_ip"):
+        # Port answers TCP but neither healthchecks nor the chain respond: a
+        # hung node service (or a dead node-side egress) — distinguish from
+        # network loss, which the tcp probe above already classifies.
+        code = "node_service_unresponsive"
     elif (any(health == "fail" for health in healths)
             and ok("egress_exit_ip") and not ok("egress_foreign")):
         code = "exit_dns_poisoned"
