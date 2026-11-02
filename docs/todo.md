@@ -16,10 +16,12 @@
 
 ## P2 — 低优先
 
-3. **真 P2P 直连（观察项，非必须）**：当前 HOME↔VPS 走 peer-relay
-   （`203.0.113.47:40000:vni:1`，aliyun UDP），2026-10-30 → 10-31 实测 24h 零失败、
-   p50/p95 = 72/73ms、max 268ms，egress_foreign p95 621ms——已达生产标准并正式关闭
-   P0。真直连仅作为消除 aliyun 中继跳的进一步优化。
+3. **真 P2P 直连（已定性收档，2026-11-02）**：HOME↔VPS 稳定运行于 peer-relay
+   （aliyun UDP，71ms 零抖动）。VPS 侧 root 实勘：端点通告正常
+   （203.0.113.154:41641）、netcheck UDP true、且日志出现过 `via=direct` 到 HOME
+   公网地址——但 HOME 侧始终 `direct connection not established`。结论：该线路
+   WG 形态 UDP 受 GFW 间歇干扰，单包可穿、会话不稳，**peer-relay 即终态方案**；
+   仅换 VPS/线路时再重开此项。
 
 ## 已关闭（留档）
 
