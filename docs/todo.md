@@ -4,12 +4,13 @@
 
 ## P1 — 进行中
 
-1. **VPS mihomo 挂起根因**（非 DNS 问题，勿往 dns 段方向查——2026-10-29"DNS 污染"系
-   误诊已更正）：挂起签名 = tailnet SSH 通 + 节点服务无响应（socks/healthcheck 失败）。
-   一键诊断已有 `node_service_unresponsive` 结论码。2026-10-30 → 10-31 的 24h 监控
-   零挂起窗口（2900/2900 全成功，p95 73ms）；继续常态观察，复发时用当天的挂起
-   窗口清单到 VPS 对 `journalctl -u mihomo` 取日志定根因；若频繁复发，在
-   vps-setup.sh 层面加看门狗。
+1. **VPS mihomo 挂起**：2026-11-02 日志定性——**静默挂起**（11-01 复发 12 窗口，
+   最长 62min；journalctl 全天仅 1 行、零报错零退出，`Restart=always` 无效；无 OOM、
+   负载 0、磁盘 35% 空闲，外部因素排除，系进程内部停摆）。**对策已入库**：
+   vps-setup.sh 新增 `nmd-vps-watchdog`（systemd timer 每分钟经自身 socks5 探测
+   出口，连续 3 次失败且 VPS 直连正常时 restart mihomo；成功即清零）。
+   待部署到 VPS 生效；后续复发会在 ~3 分钟内自愈并在 HOME 侧表现为至多一次
+   `all_unhealthy` 闪断而非小时级窗口。
 2. **oness 订阅复活**：GUI「更新订阅」拉取新入口（供应商侧疑似换 IP）；任一节点
    恢复即重建四候选冗余。
 
