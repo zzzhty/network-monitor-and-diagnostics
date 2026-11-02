@@ -128,6 +128,10 @@ source {ROOT / 'vps-setup.sh'}
 BINARY={binary}
 CONFIG_DIR={config.parent}
 UNIT={unit}
+WATCHDOG_SCRIPT={self.base / 'bin/nmd-vps-watchdog'}
+WATCHDOG_SERVICE={self.base / 'systemd/nmd-vps-watchdog.service'}
+WATCHDOG_TIMER={self.base / 'systemd/nmd-vps-watchdog.timer'}
+WATCHDOG_STATE={self.base / 'watchdog-state'}
 record() {{ echo "$*" >> {self.events}; }}
 mktemp() {{ command mktemp -d {self.base}/stage.XXXXXX; }}
 cp() {{
@@ -151,8 +155,18 @@ tailscale() {{ echo 100.100.1.2; }}
 sleep() {{ :; }}
 service_active={1 if existing and active else 0}
 service_enabled={int(enabled)}
+watchdog_enabled=0
 systemctl() {{
  record "systemctl $*"
+ case "$*" in
+   *nmd-vps-watchdog.timer*)
+     case $1 in
+       is-enabled) (( watchdog_enabled )); return $?;;
+       enable) watchdog_enabled=1;;
+       disable) watchdog_enabled=0;;
+     esac
+     return 0;;
+ esac
  case $1 in
    is-active) (( service_active )); return $?;;
    is-enabled) (( service_enabled )); return $?;;
@@ -225,9 +239,12 @@ main
                 result, paths = self.vps('probe', existing=True, active=active, enabled=enabled)
                 self.assertNotEqual(result.returncode, 0)
                 events = self.events.read_text().splitlines()
-                self.assertEqual(events[-2:], [
+                # mihomo keeps its own prior state; the fresh watchdog timer
+                # (not previously installed) is stood down after it.
+                self.assertEqual(events[-3:-1], [
                     'systemctl ' + ('enable' if enabled else 'disable') + ' mihomo',
                     'systemctl ' + ('restart' if active else 'stop') + ' mihomo'])
+                self.assertEqual(events[-1], 'systemctl disable --now nmd-vps-watchdog.timer')
                 self.assertFalse(list(self.base.glob('stage.*')))
 
     def test_vps_repeat_deploy_restarts_running_service(self):
