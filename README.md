@@ -3,8 +3,8 @@
 家庭网络分流：国内和私网直连，其余经 Tailscale 内的 VPS SOCKS5 出海。
 Tailscale 登录、控制服务、DERP 和 MagicDNS 独立于 VPS 代理。
 
-可选的[出口通道 Channel](docs/egress-sources.md)复用已有 source 注册表：可添加多个订阅、
-手工普通路径 SOCKS5 VPS 和 Tailnet SOCKS5 通道，并重命名显示名称而不改变节点 ID。
+可选的[出口通道 Channel](docs/egress-sources.md)复用已有 source 注册表：默认添加 Tailnet 直连
+VPS 通道，也支持手工普通路径 SOCKS5 与（可选的）订阅通道，并重命名显示名称而不改变节点 ID。
 Channel 管理连接来源，Node 表示实际出口，Policy 只引用两个明确主备节点，可选任意通道
 中的节点，不再要求“一条订阅 + 一条 Tailnet”。`nmd channel` 与旧 `nmd source` 共用后端。
 Linux GUI 可添加/重命名并管理明确主备；保存只写私有配置，不自动刷新、探测、部署或切换。
