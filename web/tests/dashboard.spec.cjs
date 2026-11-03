@@ -33,6 +33,16 @@ const assertTextContrast = async (page) => {
   const ratios = await textContrasts(page);
   for (const [name, value] of Object.entries(ratios)) assert.ok(value >= 4.5, `${name} contrast ${value} < 4.5`);
 };
+const assertChannelFields = async (page, kind) => {
+  assert.equal(await page.locator('#channel-kind').inputValue(), kind);
+  const subscription = kind === 'subscription';
+  assert.equal(await page.locator('#channel-subscription-fields').isVisible(), subscription);
+  assert.equal(await page.locator('#channel-proxy-fields').isVisible(), !subscription);
+  assert.equal(await page.locator('#channel-url').isEnabled(), subscription);
+  for (const field of ['server', 'port', 'username', 'password']) {
+    assert.equal(await page.locator(`#channel-${field}`).isEnabled(), !subscription);
+  }
+};
 let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
 let diagnoseView = null;
 let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
@@ -227,13 +237,56 @@ const server = http.createServer((req, res) => {
     // Saving Channel forms has no refresh/probe/selection/policy side effect.
     assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
     assert.equal(await page.locator('#auto-candidate-rows select[data-rank="1"]').inputValue(), '');
+    // The default path creates a Tailnet channel without touching the type selector.
+    await assertChannelFields(page, 'tailnet');
+    assert.equal(await page.locator('#channel-port').inputValue(), '1080');
+    const tailnetPostsBefore = posts.length;
+    await page.locator('#channel-id').fill('new-tailnet');
+    await page.locator('#channel-name').fill('Tailnet 直连 VPS');
+    await page.locator('#channel-server').fill('100.64.0.30');
+    await page.locator('#channel-add-submit').click();
+    await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('Tailnet 直连 VPS'));
+    assert.deepEqual(posts.slice(tailnetPostsBefore).map(([url]) => url), ['/api/channels']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), {
+      id: 'new-tailnet', definition: { kind: 'tailnet', display_name: 'Tailnet 直连 VPS', server: '100.64.0.30', port: 1080 }
+    });
+    assert.equal(await page.locator('button[data-refresh="new-tailnet"]').count(), 0);
+    assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
+    assert.equal(sourceView.auto, undefined);
+    await assertChannelFields(page, 'tailnet');
+    assert.equal(await page.locator('#channel-id').inputValue(), '');
+    assert.equal(await page.locator('#channel-server').inputValue(), '');
+    assert.equal(await page.locator('#channel-port').inputValue(), '1080');
     const channelPostsBefore = posts.length;
+    // Inactive proxy fields must neither block subscription validation nor leak
+    // into its payload, even when a draft survives a round trip between types.
+    await page.locator('#channel-port').fill('0');
+    await page.locator('#channel-username').fill('SYNTHETIC_INACTIVE_USER');
+    await page.locator('#channel-password').fill('SYNTHETIC_INACTIVE_PASSWORD');
+    await page.locator('#channel-kind').selectOption('subscription');
+    await assertChannelFields(page, 'subscription');
     await page.locator('#channel-id').fill('new-sub');
     await page.locator('#channel-name').fill('新增订阅');
     await page.locator('#channel-url').fill('https://fixture.example.invalid/SYNTHETIC_URL_SECRET');
+    assert.equal(await page.locator('#channel-add-form').evaluate(form => form.checkValidity()), true);
+    await page.locator('#channel-kind').selectOption('tailnet');
+    await assertChannelFields(page, 'tailnet');
+    assert.equal(await page.locator('#channel-add-form').evaluate(form => form.checkValidity()), false);
+    await page.locator('#channel-kind').selectOption('subscription');
+    await assertChannelFields(page, 'subscription');
+    assert.equal(await page.locator('#channel-url').inputValue(), 'https://fixture.example.invalid/SYNTHETIC_URL_SECRET');
+    assert.equal(posts.length, channelPostsBefore, 'changing channel type does not POST');
     await page.locator('#channel-add-submit').click();
     await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('新增订阅'));
     assert.deepEqual(posts.slice(channelPostsBefore).map(([url]) => url), ['/api/channels']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), {
+      id: 'new-sub', definition: { kind: 'subscription', display_name: '新增订阅', url: 'https://fixture.example.invalid/SYNTHETIC_URL_SECRET' }
+    });
+    await assertChannelFields(page, 'tailnet');
+    for (const field of ['id', 'name', 'url', 'server', 'username', 'password']) {
+      assert.equal(await page.locator(`#channel-${field}`).inputValue(), '');
+    }
+    assert.equal(await page.locator('#channel-port').inputValue(), '1080');
     assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
     assert.equal(sourceView.auto, undefined);
     assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
@@ -265,14 +318,19 @@ const server = http.createServer((req, res) => {
     await page.waitForFunction(() => document.querySelector('#channel-list').textContent.includes('3 个缓存节点'));
     assert.equal(await page.locator('button[data-refresh="new-sub"]').isEnabled(), true);
     // Duplicate IDs are a visible, sanitized error and preserve the form draft.
+    await page.locator('#channel-kind').selectOption('subscription');
+    await assertChannelFields(page, 'subscription');
     await page.locator('#channel-id').fill('new-sub');
     await page.locator('#channel-name').fill('重复');
     await page.locator('#channel-url').fill('https://fixture.example.invalid/SYNTHETIC_DUPLICATE_SECRET');
     await page.locator('#channel-add-submit').click();
     await page.waitForFunction(() => document.querySelector('#channel-action-note').textContent.includes('已存在'));
     assert.equal(await page.locator('#channel-id').inputValue(), 'new-sub');
+    await assertChannelFields(page, 'subscription');
+    assert.equal(await page.locator('#channel-url').inputValue(), 'https://fixture.example.invalid/SYNTHETIC_DUPLICATE_SECRET');
     const proxyPostsBefore = posts.length;
     await page.locator('#channel-kind').selectOption('proxy');
+    await assertChannelFields(page, 'proxy');
     await page.locator('#channel-id').fill('new-proxy');
     await page.locator('#channel-name').fill('公网备用');
     await page.locator('#channel-server').fill('192.0.2.30');
@@ -285,6 +343,11 @@ const server = http.createServer((req, res) => {
     // Manual proxy channels never offer a subscription refresh button.
     assert.equal(await page.locator('button[data-refresh="new-proxy"]').count(), 0);
     assert.equal(JSON.parse(posts.at(-1)[1]).definition.url, undefined);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), {
+      id: 'new-proxy', definition: { kind: 'proxy', display_name: '公网备用', server: '192.0.2.30', port: 1088,
+        username: 'SYNTHETIC_PROXY_USER', password: 'SYNTHETIC_PROXY_PASSWORD' }
+    });
+    await assertChannelFields(page, 'tailnet');
     assert.equal(await page.locator('#auto-candidate-rows select[data-rank="0"]').inputValue(), '');
     assert.equal(sourceView.active, 'nmd-sub-a-0123456789abcdef0123');
     const publicChannels = await page.evaluate(() => fetch('/api/sources').then(response => response.json()));
