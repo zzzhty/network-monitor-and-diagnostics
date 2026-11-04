@@ -1,11 +1,14 @@
 """User-level desktop shell lifecycle with a fake cargo and temp-only receipt.
 
-No real build, GUI, service manager or system paths are touched.
+No real build, GUI, service manager or system paths are touched. Linux and
+macOS flows are both exercised through a subprocess platform wrapper.
 """
 import json
 import os
+import plistlib
 from pathlib import Path
 import shlex
+import struct
 import shutil
 import stat
 import subprocess
@@ -21,7 +24,7 @@ import manager
 SCRIPTS = ("manager.py", "install_scope.py", "egress_sources.py", "nmd_platform.py")
 
 
-class DesktopTests(unittest.TestCase):
+class DesktopFixture(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -34,7 +37,11 @@ class DesktopTests(unittest.TestCase):
         crate = self.checkout / "apps/desktop/src-tauri"
         (crate / "icons").mkdir(parents=True)
         (crate / "Cargo.toml").write_text("[package]\nname = 'synthetic'\n", encoding="utf-8")
+        (crate / "tauri.conf.json").write_text(json.dumps({
+            "productName": "nmd", "version": "0.1.0",
+            "identifier": "io.github.zzzhty.nmd-desktop"}), encoding="utf-8")
         (crate / "icons/icon.png").write_bytes(b"PNG")
+        (crate / "icons/icon.icns").write_bytes(b"ICNS")
         for key, value in (("home", self.checkout), ("scope", "user"),
                            ("configDir", self.base / "config/nmd"),
                            ("stateDir", self.base / "state/nmd-monitor"),
@@ -57,7 +64,7 @@ class DesktopTests(unittest.TestCase):
         self.home = self.base / "home"
         self.home.mkdir()
 
-    def invoke(self, *args, fail_cargo=False, xdg=None):
+    def invoke(self, *args, fail_cargo=False, xdg=None, platform="linux"):
         env = dict(os.environ)
         env["PATH"] = str(self.fake_bin) + os.pathsep + "/usr/bin:/bin"
         env["HOME"] = str(self.home)
@@ -66,9 +73,10 @@ class DesktopTests(unittest.TestCase):
         env["NMD_FAKE_CARGO_FAIL"] = "1" if fail_cargo else "0"
         if xdg:
             env.update(xdg)
-        # Exercise Linux installation logic on any host, in this private fixture
-        # only. Production platform guards remain unchanged.
-        wrapper = "import runpy,sys; sys.platform='linux'; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+        # Exercise one platform's installation logic on any host, in this
+        # private fixture only. Production platform guards remain unchanged.
+        wrapper = (f"import runpy,sys; sys.platform={platform!r}; "
+                   "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
         env["PYTHONPATH"] = str(self.checkout / "scripts")
         return subprocess.run([sys.executable, "-c", wrapper, str(self.checkout / "scripts/manager.py"), "desktop", *args],
                               env=env, capture_output=True, text=True, timeout=60)
@@ -78,6 +86,8 @@ class DesktopTests(unittest.TestCase):
                                  "--get", "nmd." + key], capture_output=True, text=True)
         return result.stdout.strip()
 
+
+class DesktopTests(DesktopFixture):
     def test_install_writes_bin_icon_entry_and_receipt_with_fixed_argv(self):
         result = self.invoke("install")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -162,8 +172,8 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("用法:", bad_usage.stderr)
         # The platform guard is checked in-process: patch here and call the
         # dispatcher directly instead of hoping a subprocess inherits the patch.
-        with patch("sys.platform", "darwin"):
-            with self.assertRaisesRegex(manager.ManagerError, "desktop_requires_linux"):
+        with patch("sys.platform", "win32"):
+            with self.assertRaisesRegex(manager.ManagerError, "desktop_requires_unix"):
                 manager.desktop_main(self.checkout, ["status"])
 
     def test_receipt_paths_stay_inside_recorded_bin_dir(self):
@@ -281,6 +291,185 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(victim.read_text(), "keep")
         self.assertTrue(alias.is_symlink())
+
+
+class MacosDesktopTests(DesktopFixture):
+    """macOS lifecycle in the same private fixture: nmd.app bundle plus LaunchAgent."""
+
+    def invoke(self, *args, **kwargs):
+        kwargs.setdefault("platform", "darwin")
+        return super().invoke(*args, **kwargs)
+
+    def destinations(self):
+        app = self.home / "Applications/nmd.app"
+        return {"binary": app / "Contents/MacOS/nmd-desktop",
+                "info": app / "Contents/Info.plist",
+                "icon": app / "Contents/Resources/AppIcon.icns",
+                "autostart": self.home / "Library/LaunchAgents/io.github.zzzhty.nmd-desktop.plist"}
+
+    def test_install_wraps_built_binary_in_app_bundle(self):
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = self.destinations()
+        self.assertEqual(paths["binary"].read_bytes(), b"synthetic-binary")
+        self.assertEqual(stat.S_IMODE(paths["binary"].stat().st_mode), 0o755)
+        self.assertEqual(paths["icon"].read_bytes(), b"ICNS")
+        self.assertEqual(stat.S_IMODE(paths["icon"].stat().st_mode), 0o644)
+        info = plistlib.loads(paths["info"].read_bytes())
+        self.assertEqual(info["CFBundleExecutable"], "nmd-desktop")
+        self.assertEqual(info["CFBundleIdentifier"], "io.github.zzzhty.nmd-desktop")
+        self.assertEqual(info["CFBundleName"], "nmd")
+        self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+        self.assertEqual(info["CFBundleIconFile"], "AppIcon")
+        self.assertTrue(info["NSHighResolutionCapable"])
+        self.assertEqual(self.receipt("desktopInstalled"), "true")
+        first = self.cargo_log.read_text().splitlines()[0]
+        self.assertTrue(first.startswith("build --release --locked|"), first)
+        # Re-running is a safe rebuild + reinstall of the same bundle.
+        self.assertEqual(self.invoke("install").returncode, 0)
+
+    def test_missing_committed_icns_fails_before_any_write(self):
+        (self.checkout / "apps/desktop/src-tauri/icons/icon.icns").unlink()
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("desktop_icons_missing", result.stderr)
+        self.assertFalse(self.destinations()["binary"].exists())
+        self.assertEqual(self.receipt("desktopInstalled"), "false")
+
+    def test_autostart_launchagent_only_runs_owned_bundle_binary(self):
+        denied = self.invoke("autostart", "on")
+        self.assertEqual(denied.returncode, 1)
+        self.assertIn("desktop_not_installed", denied.stderr)
+        self.assertEqual(self.invoke("install").returncode, 0)
+        enabled = self.invoke("autostart", "on")
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        agent = self.destinations()["autostart"]
+        data = plistlib.loads(agent.read_bytes())
+        self.assertEqual(data["Label"], "io.github.zzzhty.nmd-desktop")
+        self.assertEqual(data["ProgramArguments"], [str(self.destinations()["binary"])])
+        self.assertTrue(data["RunAtLoad"])
+        self.assertEqual(set(data), {"Label", "ProgramArguments", "RunAtLoad"})
+        self.assertEqual(self.receipt("desktopAutostart"), "true")
+        self.assertEqual(self.invoke("autostart", "off").returncode, 0)
+        self.assertFalse(agent.exists())
+        self.assertEqual(self.receipt("desktopAutostart"), "false")
+
+    def test_uninstall_removes_whole_bundle_and_agent_only(self):
+        self.assertEqual(self.invoke("install").returncode, 0)
+        self.assertEqual(self.invoke("autostart", "on").returncode, 0)
+        preserved = self.base / "config/nmd/user.json"
+        preserved.parent.mkdir(parents=True, exist_ok=True)
+        preserved.write_bytes(b"existing user data")
+        result = self.invoke("uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / "Applications/nmd.app").exists())
+        self.assertTrue((self.home / "Applications").is_dir())
+        self.assertFalse(self.destinations()["autostart"].exists())
+        self.assertEqual(self.receipt("desktopInstalled"), "false")
+        self.assertEqual(self.receipt("desktopAutostart"), "false")
+        self.assertEqual(preserved.read_bytes(), b"existing user data")
+
+    def test_foreign_bundle_without_receipt_blocks_install(self):
+        app = self.home / "Applications/nmd.app"
+        (app / "Contents/MacOS").mkdir(parents=True)
+        (app / "Contents/MacOS/foreign-tool").write_text("foreign")
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("desktop_file_not_owned", result.stderr)
+        self.assertEqual((app / "Contents/MacOS/foreign-tool").read_text(), "foreign")
+        self.assertFalse(self.destinations()["binary"].exists())
+        self.assertEqual(self.receipt("desktopInstalled"), "false")
+
+    def test_tampered_bundle_file_blocks_reinstall_and_uninstall(self):
+        self.assertEqual(self.invoke("install").returncode, 0)
+        self.destinations()["info"].write_text("user edited")
+        for action in [("install",), ("uninstall",)]:
+            result = self.invoke(*action)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("desktop_file_not_owned", result.stderr)
+            self.assertEqual(self.destinations()["info"].read_text(), "user edited")
+        self.assertTrue(self.destinations()["binary"].is_file())
+
+    def test_foreign_agent_plist_blocks_toggle_and_uninstall(self):
+        self.assertEqual(self.invoke("install").returncode, 0)
+        agent = self.destinations()["autostart"]
+        agent.parent.mkdir(parents=True)
+        agent.write_text("foreign agent")
+        for action in [("autostart", "on"), ("autostart", "off"), ("uninstall",)]:
+            self.assertEqual(self.invoke(*action).returncode, 1)
+            self.assertEqual(agent.read_text(), "foreign agent")
+            self.assertTrue(self.destinations()["binary"].is_file())
+
+    def test_status_reports_bundle_without_installing(self):
+        before = self.invoke("status")
+        self.assertEqual(before.returncode, 0, before.stderr)
+        self.assertIn("未安装", before.stdout)
+        self.assertIn("nmd.app", before.stdout)
+        self.assertEqual(self.invoke("install").returncode, 0)
+        after = self.invoke("status")
+        self.assertIn("已安装", after.stdout)
+        self.assertIn(str(self.home / "Applications/nmd.app"), after.stdout)
+
+    def test_linux_receipt_cannot_claim_files_on_macos(self):
+        linux_receipt = {"version": 1, "root": str(self.checkout),
+                         "paths": {key: str(self.base / "linux" / key)
+                                   for key in ("binary", "icon", "entry", "autostart")},
+                         "files": {}}
+        manager.setting(self.checkout, "desktopReceipt",
+                        json.dumps(linux_receipt, sort_keys=True))
+        for action in [("status",), ("install",)]:
+            result = self.invoke(*action)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("desktop_invalid_receipt", result.stderr)
+
+
+class IconArtifactTests(unittest.TestCase):
+    """The committed icon family stays structurally valid (stdlib-only checks)."""
+
+    ICONS = ROOT / "apps/desktop/src-tauri/icons"
+    PNG_MAGIC = bytes.fromhex("89504e470d0a1a0a")
+    ICNS_SIZES = {"ic11": 32, "ic12": 64, "ic07": 128,
+                  "ic08": 256, "ic09": 512, "ic10": 1024}
+
+    def png_header(self, raw):
+        self.assertEqual(raw[:8], self.PNG_MAGIC)
+        width, height, depth, color = struct.unpack(">IIBB", raw[16:26])
+        return width, height, depth, color
+
+    def test_png_masters_are_square_rgba(self):
+        for name, size in (("icon-1024.png", 1024), ("icon.png", 32)):
+            with self.subTest(name=name):
+                width, height, depth, color = self.png_header((self.ICONS / name).read_bytes())
+                self.assertEqual((width, height), (size, size))
+                self.assertEqual((depth, color), (8, 6))
+
+    def test_icns_container_matches_chunk_pixel_sizes(self):
+        data = (self.ICONS / "icon.icns").read_bytes()
+        self.assertEqual(data[:4], b"icns")
+        self.assertEqual(struct.unpack(">I", data[4:8])[0], len(data))
+        offset, seen = 8, {}
+        while offset < len(data):
+            kind = data[offset:offset + 4].decode()
+            size = struct.unpack(">I", data[offset + 4:offset + 8])[0]
+            self.assertGreater(size, 8)
+            payload = data[offset + 8:offset + size]
+            width, height, _, color = self.png_header(payload)
+            seen[kind] = (width, height, color)
+            offset += size
+        self.assertEqual(offset, len(data))
+        self.assertEqual(seen, {kind: (size, size, 6) for kind, size in self.ICNS_SIZES.items()})
+
+    def test_windows_ico_is_multi_size_rgba(self):
+        data = (self.ICONS / "icon.ico").read_bytes()
+        self.assertEqual(data[:4], b"\x00\x00\x01\x00")
+        count = struct.unpack("<H", data[4:6])[0]
+        self.assertEqual(count, 6)
+        widths = set()
+        for index in range(count):
+            entry = data[6 + index * 16:6 + (index + 1) * 16]
+            widths.add(entry[0] or 256)
+            self.assertEqual(struct.unpack("<H", entry[6:8])[0], 32)
+        self.assertEqual(widths, {16, 32, 48, 64, 128, 256})
 
 
 if __name__ == "__main__":

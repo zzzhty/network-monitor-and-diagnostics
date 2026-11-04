@@ -2,8 +2,9 @@
 
 开发位置：`~/Projects/network-monitor-and-diagnostics`，分支 `feat/macos-support`。
 需要机器上已有的 Python 3.9+ 与 Bash；诊断、SQLite 和 HTTP 使用 Python 标准库。
-不要求安装 PyYAML、Node、Tauri 或其他运行时；来源管理的既有可选依赖只用于 Linux 功能。
-当前界面是浏览器面板，没有原生 `.app` 包装。
+不要求安装 PyYAML、Node 或其他运行时；来源管理的既有可选依赖只用于 Linux 功能。
+当前界面是浏览器面板；可选的用户级 Tauri 桌面壳（需 Rust 工具链）提供
+`~/Applications/nmd.app` 包装，见 [desktop.md](desktop.md)。
 
 ## 先运行安全演示
 
@@ -38,16 +39,19 @@ macOS 的 `/api/sources` 固定为
 | systemd 服务 | 不支持；`services` 为空，`service_observation_error` 为 `unsupported_platform` |
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host |
-| 后台安装/LaunchAgent、来源控制、网络管理 | 不支持；CLI 在读取安装状态或执行动作前拒绝 |
+| 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/nmd.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
+| 后台采集/网络服务安装、来源控制、网络管理 | 不支持；CLI 在读取安装状态或执行动作前拒绝 |
 
 两个本机元数据命令分别有 2 秒超时；超过 64 KiB 的命令输出明确视为不可观测。
 不持久化接口 IP、MAC 地址、网关明细或命令原文。接口/路由存在、快照新鲜、单次探测成功
 都不能证明整体联网、VPN 路径或实际代理出口可用。
 
 适配不会修改系统代理、路由、DNS、VPN、Tailscale、防火墙或网络工具配置，不抓包，
-不安装/启用 LaunchAgent，不启动后台常驻，不自动测速、修复或切换网络。
-`install`、`update`、`adopt`、`source`、顶层网络命令及 `monitor start/enable/install/...`
-是 Linux 管理能力，在 macOS 明确报不支持。请勿通过直接运行 Linux 脚本尝试这些操作。
+不启动后台常驻，不自动测速、修复或切换网络。唯一例外是显式 `nmd desktop autostart on`
+写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
+macOS 支持 `bootstrap --manager-only`、`update` 与 `desktop` 生命周期；`install`
+（monitor）、`adopt`、`source`、顶层网络命令及 `monitor start/enable/install/...`
+仍是 Linux 管理能力，在 macOS 明确报不支持。请勿通过直接运行 Linux 脚本尝试这些操作。
 
 ## 可选：显式本机单次观测
 

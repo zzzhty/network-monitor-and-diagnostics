@@ -171,9 +171,10 @@ Store 打开旧库时幂等创建；行数与时间窗口取交集，仍保留�
 
 ### 3.6 macOS 能力缺失
 
-macOS 支持源码 help/version、demo、monitor config-check/run/status、gui 和 machine
-capabilities/status；Linux 安装/更新、source/channel、网络管理、systemd 动作、desktop
-均提前拒绝。这里“只读诊断”指不管理网络/系统服务，前台采集仍会写私有历史。
+macOS 支持源码 help/version、demo、monitor config-check/run/status、gui、machine
+capabilities/status，以及管理安装（bootstrap --manager-only）、代码更新 update 与
+用户级桌面壳 desktop（见 desktop.md）；source/channel、网络管理、systemd 动作与
+monitor 安装仍提前拒绝。这里“只读诊断”指不管理网络/系统服务，前台采集仍会写私有历史。
 
 需要一次本机观测时，源码命令必须包括配置，例如
 `./nmd monitor run --config examples/monitor-local.json --state-dir <私有目录> --once`。
