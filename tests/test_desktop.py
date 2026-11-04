@@ -437,9 +437,11 @@ class IconArtifactTests(unittest.TestCase):
         return width, height, depth, color
 
     def test_png_masters_are_square_rgba(self):
-        for name, size in (("icon-1024.png", 1024), ("icon.png", 32)):
-            with self.subTest(name=name):
-                width, height, depth, color = self.png_header((self.ICONS / name).read_bytes())
+        pairs = ((self.ICONS / "icon-1024.png", 1024), (self.ICONS / "icon.png", 32),
+                 (ROOT / "web/logo.png", 96))
+        for path, size in pairs:
+            with self.subTest(name=path.name):
+                width, height, depth, color = self.png_header(path.read_bytes())
                 self.assertEqual((width, height), (size, size))
                 self.assertEqual((depth, color), (8, 6))
 
