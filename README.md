@@ -212,9 +212,9 @@ VPS 校验失败不激活、探测失败恢复以及已运行服务重启。不�
 新增诊断组件不要求先部署 mihomo，也不会修改现有 DNS、路由、TUN 或 Tailscale 偏好。
 CLI、持续采集与本机浏览器面板分别运行；关闭面板不停止采集。面板提供出口节点
 切换、单节点测速、通道保存/重命名与双候选策略配置（仅 Linux；详见诊断 MVP 文档）。`apps/desktop` 另有实验性
-Tauri 桌面壳（托盘、自动切换系统通知；逻辑仍唯一由 Python 拥有），Linux 上
-`nmd desktop install` 一条命令用户级安装（需 Rust 工具链，见
-[docs/desktop.md](docs/desktop.md)）。
+Tauri 桌面壳（托盘、自动切换系统通知；逻辑仍唯一由 Python 拥有），Linux/macOS 上
+`nmd desktop install` 一条命令用户级安装（需 Rust 工具链；macOS 无需证书、不生成
+DMG，首次先 `./install.sh --manager-only`，见 [docs/desktop.md](docs/desktop.md)）。
 
 ```bash
 # 先验证本地观测配置；不会发出主动网络探测

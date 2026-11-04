@@ -148,13 +148,22 @@ class SafeMacOSCLITests(unittest.TestCase):
 
     def test_macos_lifecycle_and_network_commands_fail_before_any_side_effect(self):
         for args in [['apply'], ['start'], ['verify'], ['source', 'status'], ['channel', 'list'],
-                     ['bootstrap'], ['update'], ['adopt', '--user'],
-                     ['install'], ['monitor', 'install'], ['monitor', 'start'],
+                     ['adopt', '--user'], ['install'], ['monitor', 'install'], ['monitor', 'start'],
                      ['monitor', 'enable'], ['monitor', 'uninstall']]:
             with self.subTest(args=args), patch.object(manager, 'run', side_effect=AssertionError('command')), \
                     patch.object(manager, 'setting', side_effect=AssertionError('settings')), \
                     patch.object(manager, 'managed', side_effect=AssertionError('installation')):
                 with self.assertRaisesRegex(manager.ManagerError, 'Linux'):
+                    manager.main(args)
+
+    def test_macos_bootstrap_requires_manager_only_before_any_side_effect(self):
+        # bootstrap and update are the macOS-supported lifecycle commands; the
+        # desktop shell needs them. Everything else above stays rejected.
+        for args in [['bootstrap'], ['bootstrap', '--system']]:
+            with self.subTest(args=args), patch.object(manager, 'run', side_effect=AssertionError('command')), \
+                    patch.object(manager, 'setting', side_effect=AssertionError('settings')), \
+                    patch.object(manager, 'managed', side_effect=AssertionError('installation')):
+                with self.assertRaisesRegex(manager.ManagerError, '--manager-only'):
                     manager.main(args)
 
     def test_macos_gui_never_selects_real_source_registry(self):

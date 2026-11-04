@@ -200,6 +200,10 @@ def deploy(root, command="deploy"):
 
 def bootstrap(args):
     scope = "system" if args.system else "user"
+    if nmd_platform.name() == "macos" and (scope == "system" or not args.manager_only):
+        # macOS owns the desktop shell and read-only diagnostics only; the monitor
+        # unit and network deployment stay Linux-only.
+        raise ManagerError("macOS 仅支持个人范围 --manager-only 安装；网络部署与采集服务仍仅限 Linux。")
     if scope == "user" and os.environ.get("SUDO_USER"):
         raise ManagerError("个人安装请去掉 sudo；sudo 不会选择系统模式。系统安装需显式 --system。")
     if scope == "system" and os.geteuid() != 0:
@@ -297,11 +301,13 @@ def monitor_install(root):
     setting(root, "monitorInstalled", "true")
 
 
-# --- Desktop shell (Tauri) user-level lifecycle; Linux only, logic stays in Rust/Python split. ---
+# --- Desktop shell (Tauri) user-level lifecycle; Linux and macOS, logic stays in Rust/Python split. ---
 
 DESKTOP_BIN_NAME = "nmd-desktop"
 DESKTOP_CRATE = Path("apps/desktop/src-tauri")
 DESKTOP_BUILD_TIMEOUT = 900
+DESKTOP_PATH_KEYS = {"linux": frozenset({"binary", "icon", "entry", "autostart"}),
+                     "darwin": frozenset({"binary", "info", "icon", "autostart"})}
 
 
 def _desktop_entry(binary_path):
@@ -321,6 +327,82 @@ def _desktop_homes():
     return data, config
 
 
+def _desktop_metadata(crate):
+    """The bundle identity mirrors tauri.conf.json; no second source of truth."""
+    try:
+        data = json.loads((crate / "tauri.conf.json").read_text(encoding="utf-8"))
+        identifier, version, product = data["identifier"], str(data["version"]), data["productName"]
+        if not all(isinstance(value, str) and value for value in (identifier, version, product)):
+            raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ManagerError(
+            "desktop_config_invalid:tauri.conf.json 缺少有效的 identifier/version/productName;未安装") from None
+    return identifier, version, product
+
+
+def _xml(value):
+    return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _macos_info_plist(executable, identifier, version, name):
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n<dict>\n'
+            '\t<key>CFBundleDevelopmentRegion</key><string>zh_CN</string>\n'
+            f'\t<key>CFBundleExecutable</key><string>{_xml(executable)}</string>\n'
+            f'\t<key>CFBundleIdentifier</key><string>{_xml(identifier)}</string>\n'
+            '\t<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n'
+            f'\t<key>CFBundleName</key><string>{_xml(name)}</string>\n'
+            '\t<key>CFBundlePackageType</key><string>APPL</string>\n'
+            '\t<key>CFBundleIconFile</key><string>AppIcon</string>\n'
+            f'\t<key>CFBundleShortVersionString</key><string>{_xml(version)}</string>\n'
+            f'\t<key>CFBundleVersion</key><string>{_xml(version)}</string>\n'
+            '\t<key>LSMinimumSystemVersion</key><string>10.13</string>\n'
+            '\t<key>NSHighResolutionCapable</key><true/>\n'
+            '</dict>\n</plist>\n')
+
+
+def _macos_launchagent_plist(executable, label):
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n<dict>\n'
+            f'\t<key>Label</key><string>{_xml(label)}</string>\n'
+            '\t<key>ProgramArguments</key>\n\t<array>\n'
+            f'\t\t<string>{_xml(executable)}</string>\n'
+            '\t</array>\n'
+            '\t<key>RunAtLoad</key><true/>\n'
+            '</dict>\n</plist>\n')
+
+
+def _macos_paths(root):
+    identifier, _, product = _desktop_metadata(root / DESKTOP_CRATE)
+    app = Path.home() / "Applications" / f"{product}.app"
+    return {"binary": app / "Contents/MacOS" / DESKTOP_BIN_NAME,
+            "info": app / "Contents/Info.plist",
+            "icon": app / "Contents/Resources/AppIcon.icns",
+            "autostart": Path.home() / "Library/LaunchAgents" / f"{identifier}.plist"}
+
+
+def _macos_bundle_root(paths):
+    # paths["binary"] lives at <product>.app/Contents/MacOS/nmd-desktop.
+    return paths["binary"].parents[2]
+
+
+def _macos_check_bundle(paths, receipt):
+    """The bundle directory itself must be absent or receipt-proven, not only its files."""
+    app = _macos_bundle_root(paths)
+    install_scope._plain_path(app)
+    if not app.exists():
+        return
+    if not app.is_dir():
+        raise ManagerError(f"desktop_file_not_owned:应用包路径被非目录文件占用;未修改: {app}")
+    if not receipt:
+        raise ManagerError(f"desktop_file_not_owned:存在无归属记录的应用包;未覆盖/删除: {app}")
+
+
 def _desktop_receipt(root):
     raw = setting(root, "desktopReceipt")
     if not raw:
@@ -328,7 +410,7 @@ def _desktop_receipt(root):
     try:
         receipt = json.loads(raw)
         if (receipt["version"] != 1 or receipt["root"] != str(root)
-                or set(receipt["paths"]) != {"binary", "icon", "entry", "autostart"}
+                or set(receipt["paths"]) != DESKTOP_PATH_KEYS.get(sys.platform, frozenset())
                 or not isinstance(receipt["files"], dict)
                 or set(receipt["files"]) - set(receipt["paths"])):
             raise ValueError()
@@ -353,6 +435,8 @@ def desktop_paths(root):
     receipt = _desktop_receipt(root)
     if receipt:
         return {key: Path(path) for key, path in receipt["paths"].items()}
+    if sys.platform == "darwin":
+        return _macos_paths(root)
     data, config = _desktop_homes()
     return {"binary": Path(setting(root, "binDir")) / DESKTOP_BIN_NAME,
             "icon": data / "icons/hicolor/32x32/apps/nmd-desktop.png",
@@ -402,17 +486,20 @@ def _desktop_remember(root, receipt, key, path):
     _save_desktop_receipt(root, receipt)
 
 
-def _desktop_write_entry(root, receipt, key, paths):
-    path = paths[key]
+def _desktop_write_file(root, receipt, key, path, content):
     _desktop_check(path, key, receipt)
     path.parent.mkdir(parents=True, exist_ok=True)
-    install_scope._atomic_write(path, _desktop_entry(paths["binary"]), 0o644)
+    install_scope._atomic_write(path, content, 0o644)
     _desktop_remember(root, receipt, key, path)
 
 
+def _desktop_write_entry(root, receipt, key, paths):
+    _desktop_write_file(root, receipt, key, paths[key], _desktop_entry(paths["binary"]))
+
+
 def desktop_main(root, args):
-    if sys.platform != "linux":
-        raise ManagerError("desktop_requires_linux:桌面壳仅在 Linux 上安装与验证")
+    if sys.platform not in DESKTOP_PATH_KEYS:
+        raise ManagerError("desktop_requires_unix:桌面壳仅在 Linux/macOS 上安装与验证")
     if args and args[0] == "autostart":
         if len(args) != 2 or args[1] not in {"on", "off"}:
             raise ManagerError("用法: nmd desktop autostart on|off")
@@ -429,17 +516,34 @@ def desktop_main(root, args):
         _desktop_status(root, paths)
 
 
+def _macos_install(root, receipt, paths, built, crate):
+    """Wrap the cargo binary in a minimal unsigned local .app; no bundler dependency."""
+    identifier, version, product = _desktop_metadata(crate)
+    _desktop_copy(built, paths["binary"], 0o755,
+                  lambda: _desktop_check(paths["binary"], "binary", receipt))
+    _desktop_remember(root, receipt, "binary", paths["binary"])
+    _desktop_copy(crate / "icons/icon.icns", paths["icon"], 0o644,
+                  lambda: _desktop_check(paths["icon"], "icon", receipt))
+    _desktop_remember(root, receipt, "icon", paths["icon"])
+    _desktop_write_file(root, receipt, "info", paths["info"],
+                        _macos_info_plist(DESKTOP_BIN_NAME, identifier, version, product))
+
+
 def _desktop_install(root, paths):
     if scope_of(root) != "user":
         raise ManagerError("desktop_requires_user_scope:桌面壳仅支持用户范围安装")
     receipt = _desktop_receipt(root)
     for key, path in paths.items():
         _desktop_check(path, key, receipt)
+    if sys.platform == "darwin":
+        _macos_check_bundle(paths, receipt)
     if not shutil.which("cargo"):
         raise ManagerError("desktop_requires_cargo:未找到 cargo;请先安装 Rust 工具链(rustup)后重试")
     crate = root / DESKTOP_CRATE
     if not (crate / "Cargo.toml").is_file():
         raise ManagerError("desktop_crate_missing:管理安装缺少桌面壳源码;请先 nmd update 后重试")
+    if sys.platform == "darwin" and not (crate / "icons/icon.icns").is_file():
+        raise ManagerError("desktop_icons_missing:管理安装缺少桌面壳图标(icon.icns);请先 nmd update 后重试")
     print("正在构建桌面壳(cargo build --release --locked,首次可能需要数分钟)...", flush=True)
     try:
         run("cargo", "build", "--release", "--locked", cwd=crate)
@@ -451,15 +555,22 @@ def _desktop_install(root, paths):
     receipt = receipt or {"version": 1, "root": str(root),
                           "paths": {key: str(path) for key, path in paths.items()}, "files": {}}
     _save_desktop_receipt(root, receipt)
-    for key, source, mode in (("binary", built, 0o755),
-                              ("icon", crate / "icons/icon.png", 0o644)):
-        _desktop_copy(source, paths[key], mode,
-                      lambda: _desktop_check(paths[key], key, receipt))
-        _desktop_remember(root, receipt, key, paths[key])
-    _desktop_write_entry(root, receipt, "entry", paths)
+    if sys.platform == "darwin":
+        _macos_install(root, receipt, paths, built, crate)
+    else:
+        for key, source, mode in (("binary", built, 0o755),
+                                  ("icon", crate / "icons/icon.png", 0o644)):
+            _desktop_copy(source, paths[key], mode,
+                          lambda: _desktop_check(paths[key], key, receipt))
+            _desktop_remember(root, receipt, key, paths[key])
+        _desktop_write_entry(root, receipt, "entry", paths)
     setting(root, "desktopInstalled", "true")
-    print(f"已安装: {paths['binary']}\n桌面入口: {paths['entry']}\n"
-          f"开机自启(默认关): nmd desktop autostart on", flush=True)
+    if sys.platform == "darwin":
+        print(f"已安装: {_macos_bundle_root(paths)}\n"
+              f"开机自启(默认关): nmd desktop autostart on", flush=True)
+    else:
+        print(f"已安装: {paths['binary']}\n桌面入口: {paths['entry']}\n"
+              f"开机自启(默认关): nmd desktop autostart on", flush=True)
 
 
 def _desktop_autostart(root, paths, state):
@@ -470,7 +581,12 @@ def _desktop_autostart(root, paths, state):
                 or not paths["binary"].is_file()):
             raise ManagerError("desktop_not_installed:请先运行 nmd desktop install")
         _desktop_check(paths["binary"], "binary", receipt)
-        _desktop_write_entry(root, receipt, "autostart", paths)
+        if sys.platform == "darwin":
+            # The label travels with the recorded autostart path, not today's config.
+            content = _macos_launchagent_plist(paths["binary"], paths["autostart"].stem)
+        else:
+            content = _desktop_entry(paths["binary"])
+        _desktop_write_file(root, receipt, "autostart", paths["autostart"], content)
         setting(root, "desktopAutostart", "true")
         print(f"开机自启已开启: {paths['autostart']}", flush=True)
     else:
@@ -487,12 +603,20 @@ def _desktop_uninstall(root, paths):
     # Preflight all paths first: a foreign collision must not partially uninstall.
     for key, path in paths.items():
         _desktop_check(path, key, receipt)
+    if sys.platform == "darwin":
+        _macos_check_bundle(paths, receipt)
     for key, path in paths.items():
         _desktop_check(path, key, receipt)
         path.unlink(missing_ok=True)
         if receipt:
             receipt["files"].pop(key, None)
             _save_desktop_receipt(root, receipt)
+    if sys.platform == "darwin":
+        app = _macos_bundle_root(paths)
+        install_scope._plain_path(app)
+        if app.exists():
+            # Only the receipt-proven bundle remainder (directories) is left here.
+            shutil.rmtree(app)
     setting(root, "desktopInstalled", "false")
     setting(root, "desktopAutostart", "false")
     print("桌面壳已卸载;保留 cargo 构建缓存,不影响 dashboard 与监控。", flush=True)
@@ -500,6 +624,14 @@ def _desktop_uninstall(root, paths):
 
 def _desktop_status(root, paths):
     installed = paths["binary"].is_file()
+    if sys.platform == "darwin":
+        app = _macos_bundle_root(paths)
+        print(f"安装范围: {scope_of(root)}\n"
+              f"桌面壳: {'已安装' if installed else '未安装'}\n"
+              f"应用包: {app} ({'存在' if app.is_dir() else '不存在'})\n"
+              f"开机自启: {'已开启' if paths['autostart'].is_file() else '未开启'}\n"
+              f"提示: 开启自启 nmd desktop autostart on;卸载 nmd desktop uninstall", flush=True)
+        return
     print(f"安装范围: {scope_of(root)}\n"
           f"桌面壳: {'已安装' if installed else '未安装'}\n"
           f"二进制: {paths['binary']}\n"
@@ -553,18 +685,28 @@ def main(argv=None):
     platform = nmd_platform.name()
     service_actions = {"install", "uninstall", "start", "stop", "restart", "enable", "disable", "logs", "service-status"}
     if platform != "linux":
-        if (command not in {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
+        allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
+        if platform == "macos":
+            # User-level shell lifecycle and managed-install code updates only;
+            # deployment and systemd stay Linux-only.
+            allowed |= {"desktop", "bootstrap", "update"}
+        if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
-            raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读 GUI 和模拟 demo，不管理网络或后台服务。")
+            raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读 GUI、模拟 demo、"
+                               "管理安装（bootstrap --manager-only）、代码更新与用户级桌面壳，"
+                               "不管理网络或后台服务。")
         if command in {"help", "--help", "-h"}:
-            print("NMD macOS 实验性只读诊断（不接管流量）\n"
+            print("NMD macOS：只读诊断（不接管流量）与用户级桌面壳\n"
                   "  demo [--once] [--port PORT]  临时合成数据演示，不采集本机、不读取来源配置\n"
                   "  monitor config-check --config FILE\n"
                   "  monitor run --config FILE --state-dir DIR [--once]  显式前台采集\n"
                   "  monitor status --state-dir DIR\n"
                   "  gui --state-dir DIR [--port PORT]\n"
                   "  machine capabilities | machine status --state-dir DIR\n"
-                  "Linux 网络管理、安装/更新和 systemd 生命周期在 macOS 不支持。")
+                  "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
+                  "  update [--check]  快进更新代码，不部署网络\n"
+                  "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
+                  "Linux 网络管理、apply 与 systemd 生命周期在 macOS 不支持。")
             return
         if command == "version":
             if argv[1:]:
@@ -616,7 +758,7 @@ def main(argv=None):
     if command == "desktop":
         if not argv[1:] or argv[1] in {"-h", "--help", "help"}:
             print("用法: nmd desktop install|uninstall|status 或 nmd desktop autostart on|off\n"
-                  "用户级桌面壳(Linux);构建需要 Rust 工具链。详见 docs/desktop.md。", flush=True)
+                  "用户级桌面壳(Linux/macOS);构建需要 Rust 工具链。详见 docs/desktop.md。", flush=True)
             return
         managed(ROOT)
         with lock(ROOT / ".git" / "nmd.lock"):
@@ -671,7 +813,7 @@ def main(argv=None):
               "               管理已记录 scope 的采集器（独立于 mihomo）\n"
               "  uninstall    卸载采集器和命令链接；保留配置、历史与代码\n"
               "  desktop install/uninstall/status/autostart on|off\n"
-              "               用户级桌面壳（Linux，构建需 Rust；见 docs/desktop.md）\n"
+              "               用户级桌面壳（Linux/macOS，构建需 Rust；见 docs/desktop.md）\n"
               "  version      查看管理安装版本\n  install-cli  修复已安装的命令链接\n", flush=True)
         run("bash", ROOT / "local-setup.sh", "help")
         return
