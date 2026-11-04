@@ -12,7 +12,7 @@ body{margin:0}
 .shell{display:flex;min-height:100vh}
 .sidebar{width:230px;flex-shrink:0;border-right:var(--border-size-1) solid var(--border-plain);padding:var(--size-px-7) 22px;display:flex;flex-direction:column;background:var(--bg-sunken)}
 .brand{display:flex;gap:13px;align-items:center;margin-bottom:56px}
-.brandmark{font-weight:800;font-size:28px;background:var(--accent-300);color:var(--accent-900);width:43px;height:43px;border-radius:14px;text-align:center}
+.brandmark{display:block;width:43px;height:43px}
 .brand strong{font-size:23px}
 .brand small{display:block;font-size:11px;color:var(--ink-300);margin-top:3px;letter-spacing:2px}
 .nav-label,.eyebrow{font-size:10px;letter-spacing:1.8px;color:var(--ink-300);font-weight:600}
@@ -69,7 +69,7 @@ footer{display:flex;justify-content:space-between;gap:var(--size-px-3);border-to
 button:focus-visible{outline:2px solid var(--accent-300);outline-offset:3px}
 [hidden]{display:none!important}
 @media(max-width:1000px){.sidebar{width:180px;padding:var(--size-px-6) var(--size-px-3)}main{padding:30px var(--size-px-5)}.stats{gap:10px}.card{padding:18px}.metric{font-size:24px}.metric.time{font-size:15px}}
-@media(max-width:720px){.shell{display:block}.sidebar{width:100%;padding:18px;border-right:0;border-bottom:var(--border-size-1) solid var(--border-plain)}.brand{margin-bottom:18px}.brandmark{width:34px;height:34px;font-size:23px}.brand small,.nav-label,.sidebar-foot{display:none}nav{grid-template-columns:repeat(4,1fr);gap:var(--size-px-1)}.nav{justify-content:center;font-size:12px;padding:11px 5px}.nav span{display:none}main{padding:var(--size-px-5) var(--size-px-3)}h1{font-size:24px}.stats,.paths{grid-template-columns:1fr}.stats{gap:12px}.metric{margin:10px 0;font-size:25px}.details{grid-template-columns:1fr;gap:13px}.section-heading{align-items:start}.section-heading .muted{font-size:10px}footer{flex-wrap:wrap}.subtitle{max-width:260px;line-height:1.7}}
+@media(max-width:720px){.shell{display:block}.sidebar{width:100%;padding:18px;border-right:0;border-bottom:var(--border-size-1) solid var(--border-plain)}.brand{margin-bottom:18px}.brandmark{width:34px;height:34px}.brand small,.nav-label,.sidebar-foot{display:none}nav{grid-template-columns:repeat(4,1fr);gap:var(--size-px-1)}.nav{justify-content:center;font-size:12px;padding:11px 5px}.nav span{display:none}main{padding:var(--size-px-5) var(--size-px-3)}h1{font-size:24px}.stats,.paths{grid-template-columns:1fr}.stats{gap:12px}.metric{margin:10px 0;font-size:25px}.details{grid-template-columns:1fr;gap:13px}.section-heading{align-items:start}.section-heading .muted{font-size:10px}footer{flex-wrap:wrap}.subtitle{max-width:260px;line-height:1.7}}
 
 #egress-active,#egress-sources{overflow-wrap:anywhere}
 #egress-node-list .card{padding:14px var(--size-px-3)}

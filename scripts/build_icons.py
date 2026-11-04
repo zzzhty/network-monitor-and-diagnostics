@@ -15,6 +15,10 @@ apps/desktop/src-tauri/icons/:
   icon.png       32x32 RGBA (the Linux install copies this verbatim)
   icon.ico       16..256 RGBA (Windows bundler)
 
+and the web dashboard brand mark:
+
+  web/logo.png   96x96 RGBA (served at /logo.png, also the favicon)
+
 Rerun with a new master to redesign; outputs are byte-stable for the same
 input and Pillow version.
 """
@@ -26,6 +30,7 @@ import sys
 from PIL import Image, ImageDraw
 
 ICONS = Path(__file__).resolve().parents[1] / "apps/desktop/src-tauri/icons"
+WEB_LOGO = Path(__file__).resolve().parents[1] / "web/logo.png"
 ICNS_CHUNKS = ((32, "ic11"), (64, "ic12"), (128, "ic07"),
                (256, "ic08"), (512, "ic09"), (1024, "ic10"))
 ICO_SIZES = (16, 32, 48, 64, 128, 256)
@@ -76,7 +81,8 @@ def main(argv):
     (ICONS / "icon.png").write_bytes(png_bytes(image, 32))
     image.save(ICONS / "icon.ico", format="ICO",
                sizes=[(size, size) for size in ICO_SIZES])
-    print(f"wrote icon-1024.png icon.icns icon.png icon.ico into {ICONS}")
+    WEB_LOGO.write_bytes(png_bytes(image, 96))
+    print(f"wrote icon-1024.png icon.icns icon.png icon.ico into {ICONS} and {WEB_LOGO}")
 
 
 if __name__ == "__main__":

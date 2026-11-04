@@ -134,11 +134,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 # System GUI's service UID cannot read root-private sources.
                 self.json_response(503, {"schema_version": 1, "error": "sources_unavailable", "active": None})
-        elif path in {"/", "/app.js", "/style.css"}:
+        elif path in {"/", "/app.js", "/style.css", "/logo.png"}:
             name, mime = {
                 "/": ("index.html", "text/html; charset=utf-8"),
                 "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                 "/style.css": ("style.css", "text/css; charset=utf-8"),
+                "/logo.png": ("logo.png", "image/png"),
             }[path]
             try:
                 self.send_body(200, (ROOT / "web" / name).read_bytes(), mime)

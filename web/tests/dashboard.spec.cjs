@@ -52,7 +52,7 @@ const autoConfig = { version: 3, enabled: true, paused: false,
   fail_after: 3, recover_after: 2, cooldown: 2 };
 const server = http.createServer((req, res) => {
   requests.push([req.method, req.url]);
-  res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+  res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'");
   if (req.method === 'POST') {
     let raw = '';
     req.on('data', chunk => { raw += chunk; });
@@ -132,9 +132,9 @@ const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
     return res.end(JSON.stringify(mode === 'invalid' ? { schema_version: 2 } : snapshot));
   }
-  const name = ({ '/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css' })[req.url];
+  const name = ({ '/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css', '/logo.png': 'logo.png' })[req.url];
   if (!name) { res.writeHead(404); return res.end(); }
-  res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
+  res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : name.endsWith('.png') ? 'image/png' : 'text/html');
   res.end(fs.readFileSync(path.join(root, name)));
 });
 (async () => {
@@ -478,7 +478,7 @@ const server = http.createServer((req, res) => {
     const before = requests.filter(r => r[1] === '/api/snapshot').length;
     await page.waitForTimeout(5200);
     assert.ok(requests.filter(r => r[1] === '/api/snapshot').length > before, 'visible page polls');
-    const readable = ['/', '/app.js', '/style.css', '/api/snapshot', '/api/sources', '/api/capabilities', '/favicon.ico'];
+    const readable = ['/', '/app.js', '/style.css', '/logo.png', '/api/snapshot', '/api/sources', '/api/capabilities', '/favicon.ico'];
     const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh'];
     assert.ok(requests.every(([method, url]) => (method === 'GET' && readable.includes(url)) || (method === 'POST' && writable.includes(url))), 'only intended same-origin requests');
     // Render only the bundled error page. Never launch the desktop binary,

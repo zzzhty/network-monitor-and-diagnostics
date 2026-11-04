@@ -100,7 +100,8 @@ class DashboardAPITests(unittest.TestCase):
         self.assertEqual(json.loads(body)['error'], 'snapshot_unavailable')
 
     def test_assets_have_expected_types_and_no_cors(self):
-        for path, content in (('/', 'text/html'), ('/app.js', 'text/javascript'), ('/style.css', 'text/css')):
+        for path, content in (('/', 'text/html'), ('/app.js', 'text/javascript'),
+                              ('/style.css', 'text/css'), ('/logo.png', 'image/png')):
             status, headers, body = self.request(path)
             self.assertEqual(status, 200, body)
             self.assertTrue(headers['Content-Type'].startswith(content))
