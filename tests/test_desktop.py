@@ -38,7 +38,7 @@ class DesktopFixture(unittest.TestCase):
         (crate / "icons").mkdir(parents=True)
         (crate / "Cargo.toml").write_text("[package]\nname = 'synthetic'\n", encoding="utf-8")
         (crate / "tauri.conf.json").write_text(json.dumps({
-            "productName": "nmd", "version": "0.1.0",
+            "productName": "NMD", "version": "0.1.0",
             "identifier": "io.github.zzzhty.nmd-desktop"}), encoding="utf-8")
         (crate / "icons/icon.png").write_bytes(b"PNG")
         (crate / "icons/icon.icns").write_bytes(b"ICNS")
@@ -294,14 +294,14 @@ class DesktopTests(DesktopFixture):
 
 
 class MacosDesktopTests(DesktopFixture):
-    """macOS lifecycle in the same private fixture: nmd.app bundle plus LaunchAgent."""
+    """macOS lifecycle in the same private fixture: NMD.app bundle plus LaunchAgent."""
 
     def invoke(self, *args, **kwargs):
         kwargs.setdefault("platform", "darwin")
         return super().invoke(*args, **kwargs)
 
     def destinations(self):
-        app = self.home / "Applications/nmd.app"
+        app = self.home / "Applications/NMD.app"
         return {"binary": app / "Contents/MacOS/nmd-desktop",
                 "info": app / "Contents/Info.plist",
                 "icon": app / "Contents/Resources/AppIcon.icns",
@@ -318,7 +318,7 @@ class MacosDesktopTests(DesktopFixture):
         info = plistlib.loads(paths["info"].read_bytes())
         self.assertEqual(info["CFBundleExecutable"], "nmd-desktop")
         self.assertEqual(info["CFBundleIdentifier"], "io.github.zzzhty.nmd-desktop")
-        self.assertEqual(info["CFBundleName"], "nmd")
+        self.assertEqual(info["CFBundleName"], "NMD")
         self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
         self.assertEqual(info["CFBundleIconFile"], "AppIcon")
         self.assertTrue(info["NSHighResolutionCapable"])
@@ -362,7 +362,7 @@ class MacosDesktopTests(DesktopFixture):
         preserved.write_bytes(b"existing user data")
         result = self.invoke("uninstall")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.home / "Applications/nmd.app").exists())
+        self.assertFalse((self.home / "Applications/NMD.app").exists())
         self.assertTrue((self.home / "Applications").is_dir())
         self.assertFalse(self.destinations()["autostart"].exists())
         self.assertEqual(self.receipt("desktopInstalled"), "false")
@@ -370,7 +370,7 @@ class MacosDesktopTests(DesktopFixture):
         self.assertEqual(preserved.read_bytes(), b"existing user data")
 
     def test_foreign_bundle_without_receipt_blocks_install(self):
-        app = self.home / "Applications/nmd.app"
+        app = self.home / "Applications/NMD.app"
         (app / "Contents/MacOS").mkdir(parents=True)
         (app / "Contents/MacOS/foreign-tool").write_text("foreign")
         result = self.invoke("install")
@@ -404,11 +404,11 @@ class MacosDesktopTests(DesktopFixture):
         before = self.invoke("status")
         self.assertEqual(before.returncode, 0, before.stderr)
         self.assertIn("未安装", before.stdout)
-        self.assertIn("nmd.app", before.stdout)
+        self.assertIn("NMD.app", before.stdout)
         self.assertEqual(self.invoke("install").returncode, 0)
         after = self.invoke("status")
         self.assertIn("已安装", after.stdout)
-        self.assertIn(str(self.home / "Applications/nmd.app"), after.stdout)
+        self.assertIn(str(self.home / "Applications/NMD.app"), after.stdout)
 
     def test_linux_receipt_cannot_claim_files_on_macos(self):
         linux_receipt = {"version": 1, "root": str(self.checkout),

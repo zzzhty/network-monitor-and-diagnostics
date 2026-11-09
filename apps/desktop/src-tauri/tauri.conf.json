@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nmd",
+  "productName": "NMD",
   "version": "0.1.0",
   "identifier": "io.github.zzzhty.nmd-desktop",
   "build": {

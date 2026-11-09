@@ -4,7 +4,7 @@
 需要机器上已有的 Python 3.9+ 与 Bash；诊断、SQLite 和 HTTP 使用 Python 标准库。
 不要求安装 PyYAML、Node 或其他运行时；来源管理的既有可选依赖只用于 Linux 功能。
 当前界面是浏览器面板；可选的用户级 Tauri 桌面壳（需 Rust 工具链）提供
-`~/Applications/nmd.app` 包装，见 [desktop.md](desktop.md)。
+`~/Applications/NMD.app` 包装，见 [desktop.md](desktop.md)。
 
 ## 先运行安全演示
 
@@ -39,7 +39,7 @@ macOS 的 `/api/sources` 固定为
 | systemd 服务 | 不支持；`services` 为空，`service_observation_error` 为 `unsupported_platform` |
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host |
-| 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/nmd.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
+| 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
 | 后台采集/网络服务安装、来源控制、网络管理 | 不支持；CLI 在读取安装状态或执行动作前拒绝 |
 
 两个本机元数据命令分别有 2 秒超时；超过 64 KiB 的命令输出明确视为不可观测。

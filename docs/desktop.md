@@ -74,13 +74,13 @@ nmd desktop uninstall          # 移除二进制、图标、桌面入口与自�
 
 ```bash
 ./install.sh --manager-only    # 等价 nmd bootstrap --manager-only；macOS 强制该模式
-nmd desktop install            # cargo build --release --locked → ~/Applications/nmd.app
+nmd desktop install            # cargo build --release --locked → ~/Applications/NMD.app
 nmd desktop autostart on       # 写 ~/Library/LaunchAgents/io.github.zzzhty.nmd-desktop.plist（默认关）
 nmd desktop status
-nmd desktop uninstall          # 预检通过后移除整个 nmd.app 与自启 plist
+nmd desktop uninstall          # 预检通过后移除整个 NMD.app 与自启 plist
 ```
 
-- `nmd.app` 是壳二进制加 `Info.plist` 的最小应用包；标识、版本与名称读自
+- `NMD.app` 是壳二进制加 `Info.plist` 的最小应用包；标识、版本与名称读自
   `tauri.conf.json`（单一事实来源）。不启用 Tauri bundler、不引入 tauri-cli/node
   依赖，也不生成 DMG：安装走本机 `cargo build`，产物无隔离属性，Gatekeeper 不拦截，
   **无需任何签名证书**。只有把 DMG 分发给他人时才需要 Apple Developer Program 的
@@ -89,7 +89,7 @@ nmd desktop uninstall          # 预检通过后移除整个 nmd.app 与自启 p
   命令本身不立即启动壳、不执行 launchctl，关闭即删文件，语义与 XDG 自启一致
 - 三个安装路径之外，应用图标 `Contents/Resources/AppIcon.icns` 同样入凭据
   （共四个产物：应用内二进制、`Info.plist`、图标、自启 plist），规则与 Linux 一致；
-  无归属记录的 `nmd.app` 目录、被修改的产物、符号链接及链接父目录均拒绝
+  无归属记录的 `NMD.app` 目录、被修改的产物、符号链接及链接父目录均拒绝
   覆盖/删除。平台不匹配的凭据（如 Linux 凭据）直接判无效，不会认领对方文件
 - 图标：`icons/` 下的整套图标（`icon-1024.png` 源、`icon.icns` 32–1024px、
   `icon.png` 32px、`icon.ico`）由 `scripts/build_icons.py` 从 1024px 源图
