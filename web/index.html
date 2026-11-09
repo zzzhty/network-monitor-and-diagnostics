@@ -89,7 +89,26 @@
       </article>
     </section>
     <section id="help" class="page" aria-label="设置与帮助" hidden>
-      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 和模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速；「一键排查」按固定公共目标分层探测一次并给出固定结论码，仅作快速分诊。自动故障切换是手动开启的可选模式，在按优先级排序的候选列表（2–8 个）之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅可在通道列表中点击「更新订阅」显式刷新；删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。此界面不提供系统网络设置、任意命令执行或网络部署；订阅刷新仅按通道显式发起，通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒，订阅刷新与一键排查最长 30 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
+      <article class="card" id="config-card" hidden>
+        <h2>监控配置</h2>
+        <p id="config-path" class="muted">配置文件路径未知。</p>
+        <form id="monitor-config-form" class="channel-form" autocomplete="off">
+          <fieldset id="monitor-config-fields">
+            <label>采样周期（秒，5–3600）<input id="config-interval" type="number" min="5" max="3600" step="1" inputmode="numeric" required></label>
+            <label>探测超时（秒，1–30）<input id="config-timeout" type="number" min="1" max="30" step="1" inputmode="numeric" required></label>
+            <label>保留时长（小时，24–720）<input id="config-retention" type="number" min="24" max="720" step="1" inputmode="numeric" required></label>
+            <label>样本上限（100–200000）<input id="config-max-samples" type="number" min="100" max="200000" step="1" inputmode="numeric" required></label>
+          </fieldset>
+          <h3>探测项（最多 16 个）</h3>
+          <div id="config-probe-list" class="list" aria-label="探测配置列表"></div>
+          <button id="config-probe-add" type="button">添加探测</button>
+          <button id="config-save" type="submit">保存配置</button>
+          <p class="muted">保存只写入上方路径的私有配置文件：不启动或重启采集、不发送探测、不修改系统网络。改动在下次显式运行 nmd monitor run 时生效。探测目标属于敏感信息，请勿填写内部地址。</p>
+          <p id="config-note" class="muted" role="status"></p>
+        </form>
+      </article>
+      <p id="config-unavailable" class="muted" hidden>此环境的监控配置由 nmd CLI 与安装流程管理，面板不提供编辑。</p>
+      <article class="card prose"><p class="eyebrow">OBSERVE AND CONTROL, EXPLICITLY</p><h2>一个独立的观察与出口控制窗口</h2><p>此界面读取本地监控快照；Linux 可提供本机出口节点的切换、单节点测速与自动故障切换开关，macOS 面板可在「设置与帮助」编辑监控配置（保存只写私有配置文件），模拟演示仅提供只读诊断。关闭窗口不会停止监控，刷新页面也不会启动采集器。</p><h3>访问路径是什么意思？</h3><p>系统默认路径使用当前系统路由，可能已经过 TUN、出口节点或系统代理，不能直接理解为“直连”。显式代理路径通过指定代理端点发起探测。</p><h3>出口节点页能做什么？</h3><p>Linux 出口控制启用时，切换会立即修改本机 mihomo 选择器并读回确认；测速仅对单个节点手动发起，探测地址固定，不提供批量或后台测速；「一键排查」按固定公共目标分层探测一次并给出固定结论码，仅作快速分诊。自动故障切换是手动开启的可选模式，在按优先级排序的候选列表（2–8 个）之间切换。Linux 可添加和重命名通道，保存配置不会下载订阅、部署或切换。订阅可在通道列表中点击「更新订阅」显式刷新；删除/改连接与网络部署由 nmd CLI 显式执行。</p><h3>如何理解状态？</h3><p>成功只表示对应探测在采样时成功；失败仅反映该次探测结果。未知、数据过期、采集器停止或监控空窗均不能当作网络正常。此界面不会自动推断根因。</p><h3>如何操作？</h3><p>采集器的启动、停止和网络配置由独立的 nmd CLI 管理。macOS 的「监控配置」只保存采样周期与探测项定义，不启动采集或修改网络；Linux 的监控配置由 nmd CLI 与 systemd 安装管理。此界面不提供系统网络设置、任意命令执行或网络部署；订阅刷新仅按通道显式发起，通道配置只保存到所属用户的私有注册表。</p><h3>刷新与时间</h3><p>页面可见时每 5 秒读取一次快照，请求超时为 4 秒（出口操作为 8 秒，订阅刷新与一键排查最长 30 秒），不并发轮询。页面隐藏时暂停轮询。数据超过 max(30 秒, 预期采集周期 × 2) 将标为过期。时间使用浏览器本地时区，持续时间根据记录时间计算。</p><p id="timezone" class="muted"></p></article>
     </section>
     <footer><span>NMD / 本地面板</span><span>证据优先 · 独立监控 · 无云端依赖</span></footer>
   </main>

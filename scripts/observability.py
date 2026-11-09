@@ -22,8 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # GUI subscription refresh reuses the CLI --confirm path; deployment stays CLI-only.
 NODE_ID = re.compile(r"nmd-[a-z][a-z0-9-]{0,31}-[a-f0-9]{20}")
 POST_ROUTES = {"/api/egress/select", "/api/egress/delay", "/api/egress/diagnose", "/api/auto",
-               "/api/channels", "/api/channels/rename", "/api/channels/refresh"}
+               "/api/channels", "/api/channels/rename", "/api/channels/refresh", "/api/config"}
 MAX_BODY_BYTES = 4096
+# A full 16-probe config stays well under this; load_config caps the file at 64 KiB.
+MAX_CONFIG_BODY_BYTES = 16384
 
 
 def default_state_dir():
@@ -37,18 +39,33 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, state_dir, sources_dir=None):
+    def __init__(self, port, state_dir, sources_dir=None, config_path=None):
         self.state_dir = Path(state_dir)
         self.sources_dir = (Path(sources_dir) if sources_dir is not None
                             and nmd_platform.name() == "linux" else None)
+        # Monitor-config editing is the single macOS write capability: the file is
+        # the user's own config; nothing is spawned, probed or deployed on save.
+        self.config_path = (Path(config_path) if config_path is not None
+                            and nmd_platform.name() == "macos" else None)
         # Never offer a wildcard or user-supplied bind address in this MVP.
         super().__init__(("127.0.0.1", port), DashboardHandler)
 
     def capabilities(self):
         value = nmd_platform.capabilities()
         enabled = nmd_platform.name() == 'linux' and self.sources_dir is not None
-        value.update(local_egress_control=enabled, channel_management=enabled, read_only_gui=not enabled)
+        config_enabled = self.config_path is not None
+        value.update(local_egress_control=enabled, channel_management=enabled,
+                     config_management=config_enabled, read_only_gui=not (enabled or config_enabled))
         return value
+
+    def read_config_status(self):
+        """Current config plus existence; a missing file still edits defaults."""
+        if not self.config_path.is_file():
+            return {"config": nmd_monitor.validate_config({}), "exists": False}
+        try:
+            return {"config": nmd_monitor.load_config(self.config_path), "exists": True}
+        except (OSError, ValueError):
+            raise ValueError('config_invalid') from None
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -134,6 +151,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 # System GUI's service UID cannot read root-private sources.
                 self.json_response(503, {"schema_version": 1, "error": "sources_unavailable", "active": None})
+        elif path == "/api/config":
+            if self.server.config_path is None:
+                self.json_response(405, {"error": "read_only"})
+                return
+            try:
+                status = self.server.read_config_status()
+            except ValueError:
+                self.json_response(409, {"schema_version": 1, "error": "config_invalid"})
+            else:
+                self.json_response(200, {"schema_version": 1, "config_path": str(self.server.config_path),
+                                         "exists": status["exists"], "config": status["config"]})
         elif path in {"/", "/app.js", "/style.css", "/logo.png"}:
             name, mime = {
                 "/": ("index.html", "text/html; charset=utf-8"),
@@ -148,12 +176,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.json_response(404, {"error": "not_found"})
 
-    def _read_json_body(self):
+    def _read_json_body(self, max_bytes=MAX_BODY_BYTES):
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             length = 0
-        if not 1 <= length <= MAX_BODY_BYTES or not self.headers.get("Content-Type", "").startswith("application/json"):
+        if not 1 <= length <= max_bytes or not self.headers.get("Content-Type", "").startswith("application/json"):
             self.json_response(400, {"error": "invalid_body"})
             return None
         try:
@@ -217,6 +245,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             self.json_response(503, {"schema_version": 1, "error": "sources_unavailable"})
 
+    def _config_post(self, body):
+        """The only non-Linux write: strictly the user's own monitor config file."""
+        if set(body) != {"config"} or not isinstance(body["config"], dict):
+            self.json_response(400, {"error": "invalid_body"})
+            return
+        try:
+            saved = nmd_monitor.save_config(self.server.config_path, body["config"])
+        except ValueError as exc:
+            self.json_response(409, {"schema_version": 1, "error": str(exc)})
+            return
+        except OSError:
+            self.json_response(503, {"schema_version": 1, "error": "config_unavailable"})
+            return
+        # Saving never starts, restarts or probes anything; the next explicit
+        # `nmd monitor run` picks the new file up by itself.
+        self.json_response(200, {"result": "config_saved", "config_path": str(self.server.config_path),
+                                 "config": saved})
+
     def do_POST(self):
         if self._guard() is None:
             return
@@ -226,15 +272,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path not in POST_ROUTES:
             self.json_response(405, {"error": "method_not_allowed"})
             return
-        if nmd_platform.name() != "linux":
-            self.json_response(405, {"error": "read_only"})
-            return
-        if self.server.sources_dir is None:
-            self.json_response(503, {"schema_version": 1, "error": "sources_unavailable"})
-            return
-        body = self._read_json_body()
+        if path == "/api/config":
+            if self.server.config_path is None:
+                self.json_response(405, {"error": "read_only"})
+                return
+        else:
+            if nmd_platform.name() != "linux":
+                self.json_response(405, {"error": "read_only"})
+                return
+            if self.server.sources_dir is None:
+                self.json_response(503, {"schema_version": 1, "error": "sources_unavailable"})
+                return
+        body = self._read_json_body(MAX_CONFIG_BODY_BYTES if path == "/api/config" else MAX_BODY_BYTES)
         if body is not None:
-            self._egress_post(path, body)
+            if path == "/api/config":
+                self._config_post(body)
+            else:
+                self._egress_post(path, body)
 
     def do_PUT(self):
         self.json_response(405, {"error": "method_not_allowed"})
@@ -272,11 +326,13 @@ def demo_state():
         yield state
 
 
-def serve_dashboard(port, state_dir, sources_dir=None):
+def serve_dashboard(port, state_dir, sources_dir=None, config_path=None):
     if not 0 <= port <= 65535:
         raise ValueError('invalid_port')
-    with DashboardServer(port, state_dir, sources_dir) as server:
-        mode = "read-only" if server.capabilities()["read_only_gui"] else "local egress control"
+    with DashboardServer(port, state_dir, sources_dir, config_path=config_path) as server:
+        capabilities = server.capabilities()
+        mode = ("local egress control" if capabilities["local_egress_control"]
+                else "monitor configuration" if capabilities["config_management"] else "read-only")
         print(f"Dashboard: http://127.0.0.1:{server.server_address[1]}/ ({mode}; collector runs separately)", flush=True)
         try:
             server.serve_forever()
@@ -301,6 +357,8 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     check.add_argument("--config", type=Path, required=config_file is None, default=config_file)
     gui = commands.add_parser("gui", help="local browser dashboard with node switching; collector is separate")
     gui.add_argument("--state-dir", type=Path, default=state_dir or default_state_dir())
+    gui.add_argument("--config", type=Path, default=config_file,
+                     help="monitor config file editable on the dashboard (macOS only)")
     gui.add_argument("--port", type=int, default=8765)
     machine = commands.add_parser("machine", help="versioned machine-readable interface")
     machine.add_argument("action", choices=["capabilities", "status"])
@@ -320,7 +378,7 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
                 print_json(nmd_monitor.read_snapshot(state))
             else:
                 print("模拟演示：所有样本均为合成数据，不代表本机网络状态。", flush=True)
-                serve_dashboard(args.port, state, sources_dir=None)
+                serve_dashboard(args.port, state, sources_dir=None, config_path=None)
         return
     if args.command == "machine" and args.action == "capabilities":
         print_json(nmd_platform.capabilities())
@@ -344,7 +402,13 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     else:
         if not 0 <= args.port <= 65535:
             parser.error("port must be between 0 and 65535")
-        serve_dashboard(args.port, args.state_dir, sources_dir)
+        # macOS has no other config entry point (Linux owns config via CLI and
+        # the systemd install), so only there the dashboard edits the user's
+        # own monitor config; a missing file starts from validated defaults.
+        config_path = args.config
+        if config_path is None and nmd_platform.name() == "macos":
+            config_path = nmd_monitor.default_config_path()
+        serve_dashboard(args.port, args.state_dir, sources_dir, config_path=config_path)
 
 
 if __name__ == "__main__":

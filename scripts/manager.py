@@ -692,7 +692,8 @@ def main(argv=None):
             allowed |= {"desktop", "bootstrap", "update"}
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
-            raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读 GUI、模拟 demo、"
+            raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
+                               "（「设置与帮助」页可编辑监控配置）、模拟 demo、"
                                "管理安装（bootstrap --manager-only）、代码更新与用户级桌面壳，"
                                "不管理网络或后台服务。")
         if command in {"help", "--help", "-h"}:
@@ -701,7 +702,7 @@ def main(argv=None):
                   "  monitor config-check --config FILE\n"
                   "  monitor run --config FILE --state-dir DIR [--once]  显式前台采集\n"
                   "  monitor status --state-dir DIR\n"
-                  "  gui --state-dir DIR [--port PORT]\n"
+                  "  gui [--state-dir DIR] [--config FILE] [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
                   "  machine capabilities | machine status --state-dir DIR\n"
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
                   "  update [--check]  快进更新代码，不部署网络\n"
@@ -786,6 +787,11 @@ def main(argv=None):
                         raise ManagerError("系统 monitor 尚未安装；管理员先运行 nmd monitor install。")
                     if os.geteuid() != account.pw_uid:
                         raise ManagerError("系统监控数据仅限 nmd-monitor UID；GUI/读取请由管理员以该身份运行，或使用个人模式。不会放宽权限。")
+            elif (platform == "macos" and command == "gui"
+                    and (ROOT / ".git").is_dir() and setting(ROOT, "home") == str(ROOT)):
+                # Manager-only install: the dashboard edits the recorded config
+                # file; uninstalled checkouts use the XDG default on their own.
+                kwargs["config_file"] = Path(setting(ROOT, "configDir")) / "monitor.json"
             observe(argv, **kwargs)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             import json

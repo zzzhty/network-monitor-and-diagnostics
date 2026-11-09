@@ -2,6 +2,7 @@
 import os
 import json
 import io
+import stat
 import http.client
 import threading
 from contextlib import redirect_stdout
@@ -167,11 +168,123 @@ class SafeMacOSCLITests(unittest.TestCase):
                     manager.main(args)
 
     def test_macos_gui_never_selects_real_source_registry(self):
+        # Uninstalled checkout: no install state consulted, no registry opened.
         with patch.object(manager, 'source_directory', side_effect=AssertionError('private registry')), \
-                patch.object(manager, 'setting', side_effect=AssertionError('installed settings')), \
+                patch.object(manager, 'setting', return_value=''), \
                 patch.object(observability, 'main') as observe:
             manager.main(['gui', '--port', '0'])
         self.assertIsNone(observe.call_args.kwargs['sources_dir'])
+        self.assertNotIn('config_file', observe.call_args.kwargs)
+
+    def test_macos_installed_gui_edits_recorded_config_file(self):
+        # Manager-only install: the dashboard edits the recorded config file.
+        settings = {'home': str(manager.ROOT), 'configDir': str(Path(self.temp.name) / 'config/nmd')}
+        with patch.object(manager, 'source_directory', side_effect=AssertionError('private registry')), \
+                patch.object(manager, 'setting', side_effect=lambda root, key, value=None: settings[key]), \
+                patch.object(observability, 'main') as observe:
+            manager.main(['gui', '--port', '0'])
+        kwargs = observe.call_args.kwargs
+        self.assertIsNone(kwargs['sources_dir'])
+        self.assertEqual(Path(kwargs['config_file']), Path(settings['configDir']) / 'monitor.json')
+
+
+class ConfigEditAPITests(unittest.TestCase):
+    """The single macOS write path: the user's own monitor config, strictly validated."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.config = self.base / 'config/nmd/monitor.json'  # parent chain does not exist yet
+
+    def dashboard(self, platform='macos', config_path='default'):
+        platform_mock = patch.object(observability.nmd_platform, 'name', return_value=platform)
+        platform_mock.start(); self.addCleanup(platform_mock.stop)
+        server = observability.DashboardServer(
+            0, self.base / 'state', None,
+            config_path=(self.config if config_path == 'default' else config_path))
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        def stop():
+            server.shutdown(); server.server_close(); worker.join(3)
+        self.addCleanup(stop)
+        return server
+
+    def request(self, server, method, route, body=None, headers=None):
+        connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+        try:
+            head = {**({'Content-Type': 'application/json'} if body is not None else {}), **(headers or {})}
+            payload = json.dumps(body).encode() if body is not None else None
+            connection.request(method, route, body=payload, headers=head)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_config_round_trip_creates_private_file(self):
+        server = self.dashboard()
+        capabilities = json.loads(self.request(server, 'GET', '/api/capabilities')[1])
+        self.assertTrue(capabilities['config_management'])
+        status, body = self.request(server, 'GET', '/api/config')
+        data = json.loads(body)
+        self.assertEqual((status, data['exists'], data['config_path']),
+                         (200, False, str(self.config)))
+        self.assertEqual(data['config']['interval_seconds'], 30)
+        self.assertEqual(data['config']['probes'], [])
+        config = dict(schema_version=1, interval_seconds=15, timeout_seconds=4, retention_hours=48,
+                      max_samples=5000, probes=[dict(id='edge-http', type='http',
+                                                     target='https://example.com/', path='system')])
+        status, body = self.request(server, 'POST', '/api/config', {'config': config})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)['result'], 'config_saved')
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.config.parent.stat().st_mode), 0o700)
+        on_disk = json.loads(self.config.read_text())
+        self.assertEqual(on_disk['interval_seconds'], 15)
+        self.assertEqual(on_disk['probes'][0]['id'], 'edge-http')
+        status, body = self.request(server, 'GET', '/api/config')
+        data = json.loads(body)
+        self.assertEqual((data['exists'], data['config']['interval_seconds']), (True, 15))
+
+    def test_invalid_configs_are_rejected_without_touching_the_file(self):
+        server = self.dashboard()
+        good = dict(schema_version=1, interval_seconds=15, timeout_seconds=4, retention_hours=48,
+                    max_samples=5000, probes=[dict(id='edge-http', type='http',
+                                                   target='https://example.com/', path='system')])
+        self.assertEqual(self.request(server, 'POST', '/api/config', {'config': good})[0], 200)
+        before = self.config.read_bytes()
+        for payload, expected in (
+                ({'config': dict(good, interval_seconds=1)}, ('invalid_interval_seconds', 409)),
+                ({'config': dict(good, probes=[dict(id='x', type='tcp', target='example.com', path='system')])}, ('port_required', 409)),
+                ({'config': dict(good, probes=[dict(id='local', type='http', target='https://a.invalid/', path='system')])}, ('invalid_probe_id', 409)),
+                ({'config': dict(good, interval_seconds=15), 'apply': True}, ('invalid_body', 400)),
+                ({'definition': good}, ('invalid_body', 400))):
+            with self.subTest(payload=payload):
+                status, body = self.request(server, 'POST', '/api/config', payload)
+                self.assertEqual((json.loads(body)['error'], status), expected)
+        self.assertEqual(self.request(server, 'POST', '/api/config', {'config': good},
+                                      headers={'Origin': 'https://evil.invalid'})[0], 403)
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_unreadable_existing_config_reports_config_invalid(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('{"schema_version": 1, "bogus": true}')
+        server = self.dashboard()
+        status, body = self.request(server, 'GET', '/api/config')
+        self.assertEqual((status, json.loads(body)['error']), (409, 'config_invalid'))
+
+    def test_config_editing_requires_opt_in_and_linux_stays_cli_managed(self):
+        readonly = self.dashboard(config_path=None)
+        self.assertEqual(self.request(readonly, 'GET', '/api/config')[0], 405)
+        self.assertEqual(self.request(readonly, 'POST', '/api/config', {'config': {}})[0], 405)
+        self.assertFalse(json.loads(self.request(readonly, 'GET', '/api/capabilities')[1])['config_management'])
+        linux = self.dashboard('linux', config_path=self.config)
+        self.assertEqual(self.request(linux, 'GET', '/api/config')[0], 405)
+        self.assertEqual(self.request(linux, 'POST', '/api/config', {'config': {}})[0], 405)
+        # With config editing on, egress routes stay rejected on macOS.
+        mac = self.dashboard()
+        self.assertEqual(self.request(mac, 'POST', '/api/channels', {'id': 'a', 'definition': {}})[0], 405)
+        self.assertEqual(self.request(mac, 'POST', '/api/egress/select', {'node': 'nmd-a-0-0123456789abcdef0123'})[0], 405)
 
 
 class CapabilityTests(unittest.TestCase):

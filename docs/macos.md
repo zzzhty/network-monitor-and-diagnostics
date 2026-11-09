@@ -23,10 +23,17 @@ cd ~/Projects/network-monitor-and-diagnostics
 演示记录只生成一次，稍后显示过期属于预期行为，不会后台刷新假数据。
 
 只读面板与采集器独立。启动普通 `gui` 或刷新页面不会启动采集；`monitor status` 只读取
-已有 SQLite，状态不存在时返回 `no_data` 且不创建目录。Linux 的新出口控制界面与自动故障切换保留。macOS 和 demo 的控制按钮禁用，
-macOS 拒绝通道保存/重命名、策略、测速和选择等五类 POST 端点及 `monitor run --sources-dir`，不会执行来源自动评估。
+已有 SQLite，状态不存在时返回 `no_data` 且不创建目录。Linux 的新出口控制界面与自动故障切换保留。macOS 和 demo 的出口控制按钮禁用，
+macOS 拒绝通道保存/重命名、策略、测速和选择等五类出口 POST 端点及 `monitor run --sources-dir`，不会执行来源自动评估。
 macOS 的 `/api/sources` 固定为
 未配置状态，不读取私有来源注册表或查询控制器。
+
+macOS 面板唯一的写能力是「设置与帮助」页的监控配置编辑（`/api/config`，`gui` 默认指向
+`~/.config/nmd/monitor.json`，管理安装指向安装时记录的配置路径）：读取与保存采样周期、
+超时、保留时长、样本上限和最多 16 个探测项，复用 `nmd monitor config-check` 的同一套
+严格校验后原子写入（新建目录 0700、文件 0600）。保存不启动、重启或探测任何东西，
+改动在下次显式 `nmd monitor run --config` 时生效；Linux 的监控配置仍由 nmd CLI 与
+systemd 安装管理，面板不提供编辑。
 
 ## 能力与边界
 
@@ -38,7 +45,7 @@ macOS 的 `/api/sources` 固定为
 | 命令失败、超时、无有效输出 | unknown / 对应字段不可观测，保留脱敏错误原因 |
 | systemd 服务 | 不支持；`services` 为空，`service_observation_error` 为 `unsupported_platform` |
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
-| 浏览器面板 | 只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host |
+| 浏览器面板 | 诊断只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host；macOS 额外仅开放 `/api/config` 编辑自己的 monitor 配置（不启动采集） |
 | 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
 | 后台采集/网络服务安装、来源控制、网络管理 | 不支持；CLI 在读取安装状态或执行动作前拒绝 |
 

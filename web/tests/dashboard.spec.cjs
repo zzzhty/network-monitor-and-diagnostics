@@ -45,8 +45,10 @@ const assertChannelFields = async (page, kind) => {
 };
 let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
 let diagnoseView = null;
-let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, read_only_gui: false };
+let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, config_management: false, read_only_gui: false };
 let sourceView = { schema_version: 1, sources: [], nodes: [], active: null, controller: 'not_queried', selection_mode: 'manual' };
+let configView = { schema_version: 1, config_path: '/tmp/nmd-fixture/monitor.json', exists: false,
+  config: { schema_version: 1, interval_seconds: 30, timeout_seconds: 5, retention_hours: 168, max_samples: 100000, probes: [] } };
 const failingNodes = [];
 const autoConfig = { version: 3, enabled: true, paused: false,
   fail_after: 3, recover_after: 2, cooldown: 2 };
@@ -99,6 +101,15 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(diagnoseView));
       }
+      if (req.url === '/api/config') {
+        if (!capabilityView.config_management || !body || Object.keys(body).length !== 1 || typeof body.config !== 'object') {
+          res.writeHead(body && 'config' in body ? 409 : 400);
+          return res.end('{"schema_version":1,"error":"invalid_body"}');
+        }
+        configView = { ...configView, exists: true, config: body.config };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ result: 'config_saved', config_path: configView.config_path, config: configView.config }));
+      }
       if (req.url === '/api/auto' && body && typeof body.action === 'string') {
         if (body.action === 'enable') {
           const pin = node => ({ source: sourceView.nodes.find(row => row.id === node).source, node });
@@ -117,6 +128,11 @@ const server = http.createServer((req, res) => {
       res.writeHead(400); res.end('{"error":"invalid_body"}');
     });
     return;
+  }
+  if (req.url === '/api/config') {
+    if (!capabilityView.config_management) { res.writeHead(405); return res.end('{"error":"read_only"}'); }
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(JSON.stringify(configView));
   }
   if (req.url === '/api/capabilities') {
     res.setHeader('Content-Type', 'application/json');
@@ -435,6 +451,46 @@ const server = http.createServer((req, res) => {
       document.getElementById('auto-config-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     });
     assert.equal(posts.length, postsBeforeReadOnly);
+    // macOS keeps exactly one write path: monitor-config editing on the
+    // settings page. Saving posts one strict config object and nothing else.
+    capabilityView.config_management = true;
+    await refresh();
+    assert.match(await page.locator('#sidebar-mode').textContent(), /观察与配置编辑/);
+    assert.match(await page.locator('#platform-capabilities').textContent(), /监控配置可在「设置与帮助」页编辑/);
+    await page.locator('[data-page="help"]').click();
+    assert.equal(await page.locator('#config-card').isVisible(), true);
+    assert.equal(await page.locator('#config-unavailable').isVisible(), false);
+    assert.match(await page.locator('#config-path').textContent(), /monitor\.json/);
+    assert.match(await page.locator('#config-path').textContent(), /尚未创建/);
+    assert.equal(await page.locator('#config-interval').inputValue(), '30');
+    assert.equal(await page.locator('#config-probe-list').textContent(), '尚未配置探测项；显式添加并保存后，显式采集才会发起真实探测。');
+    await page.locator('#config-probe-add').click();
+    const probeRow = page.locator('#config-probe-list .probe-row');
+    assert.equal(await probeRow.locator('[name=proxy]').isVisible(), false);
+    await probeRow.locator('[name=id]').fill('fixture-http');
+    await probeRow.locator('[name=target]').fill('https://example.com/');
+    await probeRow.locator('[name=path]').selectOption('proxy');
+    assert.equal(await probeRow.locator('[name=proxy]').isVisible(), true);
+    await probeRow.locator('[name=path]').selectOption('system');
+    assert.equal(await probeRow.locator('[name=proxy]').isVisible(), false);
+    await page.locator('#config-interval').fill('15');
+    const configPostsBefore = posts.length;
+    await page.locator('#config-save').click();
+    await page.waitForFunction(() => document.querySelector('#config-note').textContent.includes('已保存'));
+    assert.deepEqual(posts.slice(configPostsBefore).map(([url]) => url), ['/api/config']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), { config: { interval_seconds: 15, timeout_seconds: 5,
+      retention_hours: 168, max_samples: 100000,
+      probes: [{ id: 'fixture-http', type: 'http', target: 'https://example.com/', path: 'system', enabled: true }] } });
+    assert.match(await page.locator('#config-note').textContent(), /未启动或重启任何采集/);
+    assert.equal((await page.locator('#config-path').textContent()).includes('尚未创建'), false);
+    // Polling refreshes never clobber the saved values or fire extra writes.
+    await refresh();
+    assert.equal(await page.locator('#config-interval').inputValue(), '15');
+    assert.equal(posts.length, configPostsBefore + 1);
+    capabilityView.config_management = false;
+    await refresh();
+    assert.equal(await page.locator('#config-card').isVisible(), false);
+    assert.equal(await page.locator('#config-unavailable').isVisible(), true);
     capabilityView.platform = 'linux';
     capabilityView.local_egress_control = true;
     capabilityView.channel_management = true;
@@ -478,8 +534,8 @@ const server = http.createServer((req, res) => {
     const before = requests.filter(r => r[1] === '/api/snapshot').length;
     await page.waitForTimeout(5200);
     assert.ok(requests.filter(r => r[1] === '/api/snapshot').length > before, 'visible page polls');
-    const readable = ['/', '/app.js', '/style.css', '/logo.png', '/api/snapshot', '/api/sources', '/api/capabilities', '/favicon.ico'];
-    const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh'];
+    const readable = ['/', '/app.js', '/style.css', '/logo.png', '/api/snapshot', '/api/sources', '/api/capabilities', '/api/config', '/favicon.ico'];
+    const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh', '/api/config'];
     assert.ok(requests.every(([method, url]) => (method === 'GET' && readable.includes(url)) || (method === 'POST' && writable.includes(url))), 'only intended same-origin requests');
     // Render only the bundled error page. Never launch the desktop binary,
     // invoke a custom URL handler, read real configuration, or start a sidecar.

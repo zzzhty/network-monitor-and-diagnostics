@@ -4,6 +4,7 @@
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
   const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map(), pendingRefresh = new Set();
   let pendingChannel = false, pendingPolicy = false, candidateDrafts = null, diagnoseReport = null, pendingDiagnose = false;
+  let configState = null, configLoading = false, pendingConfig = false;
   const $ = id => document.getElementById(id);
   const make = (tag, value, cls) => {
     const el = document.createElement(tag);
@@ -35,10 +36,12 @@
   }
   const controlsEnabled = () => capabilities?.platform === 'linux' && capabilities?.local_egress_control === true && snapshot?.collector?.data_origin !== 'demo';
   const channelManagementEnabled = () => controlsEnabled() && capabilities?.channel_management === true;
+  // Monitor-config editing is the macOS write path; demo stays fully read-only.
+  const configManagementEnabled = () => capabilities?.config_management === true && snapshot?.collector?.data_origin !== 'demo';
   const channelLabel = channel => channel.display_name || channel.id;
   const connectionLabel = kind => ({ subscription: '订阅 · URL 已隐藏', tailnet: 'SOCKS5 · Tailnet 路径', proxy: 'SOCKS5 · 普通路径' }[kind] || '未知通道');
-  async function postJSON(path, body, timeoutMs = 8000) {
-    if (!controlsEnabled()) throw new Error('read_only');
+  async function postJSON(path, body, timeoutMs = 8000, guard = controlsEnabled) {
+    if (!guard()) throw new Error('read_only');
     const abort = new AbortController(), timeout = setTimeout(() => abort.abort(), timeoutMs);
     try {
       const response = await fetch(path, { method: 'POST', signal: abort.signal, cache: 'no-store', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
@@ -234,14 +237,144 @@
     } finally { pendingDiagnose = false; render(); }
   }
   $('diagnose-run').addEventListener('click', runDiagnose);
+  const configErrors = {
+    read_only: '此环境不支持在面板编辑监控配置。', invalid_body: '请求无效或过长，请检查字段。',
+    config_unavailable: '配置文件读取或写入失败，请检查目录权限。', config_invalid: '当前配置文件无效；请先运行 nmd monitor config-check 修正后再编辑。',
+    unsupported_schema: '不支持的配置 schema 版本。', invalid_config_keys: '含未知配置字段。',
+    invalid_interval_seconds: '采样周期须为 5–3600 秒。', invalid_timeout_seconds: '探测超时须为 1–30 秒。',
+    invalid_retention_hours: '保留时长须为 24–720 小时。', invalid_max_samples: '样本上限须为 100–200000 的整数。',
+    invalid_probes: '探测项最多 16 个。', invalid_probe_keys: '探测项含未知字段。',
+    invalid_probe_id: '探测 ID 需为 1–48 位字母、数字、下划线或短横线，不能重复，也不能是 local。',
+    invalid_enabled: '启用状态无效。', invalid_probe_type_or_path: '探测类型或路径无效。',
+    invalid_target: '目标格式无效（仅可打印字符，最长 1024）。', port_required: 'TCP/TLS 目标需包含端口（如 example.com:443）。',
+    proxy_requires_http: '仅 HTTP 探测可使用显式代理路径。', invalid_url: 'URL 无效；不能包含用户名、密码、查询串或片段。',
+    unexpected_proxy: '系统默认路径不能指定代理。', duplicate_config_key: '配置文件含重复键。', config_too_large: '配置内容过大。'
+  };
+  const probeTypeNames = { http: 'HTTP(S)', dns: 'DNS', tcp: 'TCP', tls: 'TLS' };
+  const configFieldIds = { interval_seconds: 'config-interval', timeout_seconds: 'config-timeout',
+                           retention_hours: 'config-retention', max_samples: 'config-max-samples' };
+  function syncProxyField(row) {
+    // Only explicit-proxy HTTP probes carry a proxy URL; the validator requires one there.
+    const proxy = row.querySelector('[name=proxy]');
+    const proxyOn = row.querySelector('[name=path]').value === 'proxy' && row.querySelector('[name=type]').value === 'http';
+    proxy.closest('label').hidden = !proxyOn;
+    proxy.required = proxyOn;
+  }
+  function probeRowConfig(row) {
+    const probe = { id: row.querySelector('[name=id]').value.trim(),
+                    type: row.querySelector('[name=type]').value,
+                    target: row.querySelector('[name=target]').value.trim(),
+                    path: row.querySelector('[name=path]').value,
+                    enabled: row.querySelector('[name=enabled]').checked };
+    if (probe.path === 'proxy') probe.proxy = row.querySelector('[name=proxy]').value.trim();
+    return probe;
+  }
+  function buildProbeRow(probe) {
+    const row = make('div', undefined, 'probe-row');
+    const idLabel = make('label', '探测 ID');
+    const idInput = make('input'); idInput.name = 'id'; idInput.required = true; idInput.maxLength = 48;
+    idInput.pattern = '[A-Za-z0-9_-]{1,48}'; idInput.value = probe.id || '';
+    idInput.autocomplete = 'off'; idInput.spellcheck = false;
+    idLabel.append(idInput);
+    const typeLabel = make('label', '类型');
+    const typeSelect = make('select'); typeSelect.name = 'type';
+    for (const [value, label] of Object.entries(probeTypeNames)) {
+      const option = make('option', label); option.value = value; typeSelect.append(option);
+    }
+    typeSelect.value = probe.type && probeTypeNames[probe.type] ? probe.type : 'http';
+    typeLabel.append(typeSelect);
+    const targetLabel = make('label', '目标');
+    const targetInput = make('input'); targetInput.name = 'target'; targetInput.required = true;
+    targetInput.maxLength = 1024; targetInput.value = probe.target || '';
+    targetInput.autocomplete = 'off'; targetInput.spellcheck = false;
+    targetLabel.append(targetInput);
+    const pathLabel = make('label', '路径');
+    const pathSelect = make('select'); pathSelect.name = 'path';
+    const systemOption = make('option', '系统默认路径'); systemOption.value = 'system';
+    const proxyOption = make('option', '显式代理路径'); proxyOption.value = 'proxy';
+    pathSelect.append(systemOption, proxyOption);
+    pathSelect.value = probe.path === 'proxy' ? 'proxy' : 'system';
+    pathLabel.append(pathSelect);
+    const proxyLabel = make('label', '代理 URL（http/https/socks5）');
+    const proxyInput = make('input'); proxyInput.name = 'proxy'; proxyInput.required = true;
+    proxyInput.maxLength = 1024; proxyInput.value = probe.proxy || '';
+    proxyInput.autocomplete = 'off'; proxyInput.spellcheck = false;
+    proxyLabel.append(proxyInput);
+    const enabledLabel = make('label', '启用');
+    const enabledInput = make('input'); enabledInput.type = 'checkbox'; enabledInput.name = 'enabled';
+    enabledInput.checked = probe.enabled !== false;
+    enabledLabel.append(enabledInput);
+    const remove = make('button', '移除'); remove.type = 'button'; remove.className = 'probe-remove';
+    row.append(idLabel, typeLabel, targetLabel, pathLabel, proxyLabel, enabledLabel, remove);
+    syncProxyField(row);
+    return row;
+  }
+  function renderConfigProbes(probes) {
+    const box = $('config-probe-list');
+    if (box.contains(document.activeElement) && document.activeElement.matches('input, select')) return;
+    box.replaceChildren();
+    if (!probes.length) box.append(make('p', '尚未配置探测项；显式添加并保存后，显式采集才会发起真实探测。', 'muted'));
+    else for (const probe of probes.slice(0, 16)) box.append(buildProbeRow(probe));
+  }
+  function renderConfig() {
+    if (!configState) { text('config-path', '配置文件路径未知。'); return; }
+    text('config-path', `配置文件：${configState.path || '未知'}${configState.exists ? '' : '（尚未创建，保存后新建该文件）'}`);
+    const form = $('monitor-config-form');
+    const editing = configState.dirty || pendingConfig
+      || (form.contains(document.activeElement) && document.activeElement.matches('input, select'));
+    if (!editing && configState.config) {
+      for (const [key, id] of Object.entries(configFieldIds)) $(id).value = configState.config[key];
+      renderConfigProbes(Array.isArray(configState.config.probes) ? configState.config.probes : []);
+    }
+    $('config-probe-add').disabled = !configManagementEnabled() || pendingConfig
+      || $('config-probe-list').querySelectorAll('.probe-row').length >= 16;
+    $('config-save').disabled = !configManagementEnabled() || pendingConfig;
+    $('monitor-config-fields').disabled = pendingConfig;
+  }
+  function markConfigDirty() {
+    if (!configState) return;
+    configState = { ...configState, dirty: true };
+    renderConfig();
+  }
+  async function loadConfig(force = false) {
+    if (!configManagementEnabled() || configLoading || pendingConfig) return;
+    if (!force && configState) return;
+    if (configState?.dirty) return;  // Never reload over an in-progress edit.
+    configLoading = true;
+    try {
+      const response = await fetch('/api/config', { cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' } });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || data?.schema_version !== 1 || typeof data.config !== 'object') throw new Error('failed');
+      configState = { path: data.config_path, exists: data.exists === true, config: data.config, dirty: false };
+    } catch {
+      text('config-note', '读取配置失败；请稍后重试，或用 nmd monitor config-check 检查现有文件。');
+    } finally {
+      configLoading = false; renderConfig();
+    }
+  }
+  function gatherConfig() {
+    const config = {};
+    for (const [key, id] of Object.entries(configFieldIds)) {
+      const value = Number($(id).value);
+      if (Number.isFinite(value)) config[key] = value;
+    }
+    config.max_samples = Math.trunc(config.max_samples);
+    config.probes = Array.from($('config-probe-list').querySelectorAll('.probe-row')).map(probeRowConfig);
+    return config;
+  }
   function render() {
     const demoMode = snapshot?.collector?.data_origin === 'demo';
     const canControl = controlsEnabled();
     $('auto-actions').hidden = !canControl;
-    text('sidebar-mode', canControl ? '观察与出口控制' : '只读观察模式');
+    text('sidebar-mode', canControl ? '观察与出口控制' : configManagementEnabled() ? '观察与配置编辑' : '只读观察模式');
     $('demo-notice').hidden = !demoMode;
     const platformName = { macos: 'macOS', linux: 'Linux', unsupported: '未支持的平台' }[capabilities?.platform];
-    text('platform-capabilities', platformName ? `${platformName} · ${canControl ? '本机出口控制' : '只读面板'}${capabilities.platform === 'macos' ? ' · systemd 服务、后台安装和网络管理不支持；不读取出口来源配置。' : ''}` : '平台能力未知。');
+    const configHint = configManagementEnabled() ? '；监控配置可在「设置与帮助」页编辑。' : '。';
+    text('platform-capabilities', platformName ? `${platformName} · ${canControl ? '本机出口控制' : configManagementEnabled() ? '只读诊断与配置编辑' : '只读面板'}${capabilities.platform === 'macos' ? ` · systemd 服务、后台安装和网络管理不支持；不读取出口来源配置${configHint}` : ''}` : '平台能力未知。');
+    $('config-card').hidden = !configManagementEnabled();
+    $('config-unavailable').hidden = configManagementEnabled() || capabilities === null;
+    if (configManagementEnabled() && !configState && !configLoading) loadConfig();
+    renderConfig();
     renderChannels();
     const nodes = Array.isArray(sources?.nodes) ? sources.nodes : [];
     const displayOf = id => { const node = nodes.find(item => item.id === id); return node?.display || id; };
@@ -397,6 +530,7 @@
       if (nav === button) nav.setAttribute('aria-current', 'page'); else nav.removeAttribute('aria-current');
     });
     text('page-title', titles[button.dataset.page]);
+    if (button.dataset.page === 'help' && configState && !configState.dirty) loadConfig(true);
   }));
   async function controlSelect(id) {
     if (pendingSelect) return;
@@ -521,6 +655,47 @@
       finally { pendingPolicy = false; await refresh(); }
     });
   }
+  $('config-probe-add').addEventListener('click', () => {
+    if (!configManagementEnabled() || pendingConfig || !configState?.config) return;
+    const box = $('config-probe-list');
+    if (box.querySelectorAll('.probe-row').length >= 16) return;
+    if (!box.querySelector('.probe-row')) box.replaceChildren();
+    box.append(buildProbeRow({}));
+    markConfigDirty();
+  });
+  $('config-probe-list').addEventListener('input', event => {
+    if (configState && event.target.closest('.probe-row')) markConfigDirty();
+  });
+  $('config-probe-list').addEventListener('change', event => {
+    const row = event.target.closest('.probe-row');
+    if (!row || !configState) return;
+    if (event.target.name === 'path' || event.target.name === 'type') syncProxyField(row);
+    markConfigDirty();
+  });
+  $('config-probe-list').addEventListener('click', event => {
+    const remove = event.target.closest('.probe-remove');
+    if (!remove || !configState || pendingConfig) return;
+    remove.closest('.probe-row').remove();
+    markConfigDirty();
+  });
+  $('monitor-config-fields').addEventListener('input', () => {
+    if (configState) markConfigDirty();
+  });
+  $('monitor-config-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!configManagementEnabled() || pendingConfig || !configState?.config) return;
+    pendingConfig = true; text('config-note', '正在保存配置…'); renderConfig();
+    try {
+      const data = await postJSON('/api/config', { config: gatherConfig() }, 8000, configManagementEnabled);
+      configState = { path: data?.config_path || configState.path, exists: true,
+                      config: data?.config || gatherConfig(), dirty: false };
+      text('config-note', '已保存；未启动或重启任何采集。改动在下次显式运行 nmd monitor run 时生效。');
+    } catch (error) {
+      text('config-note', configErrors[error.message] || '保存失败，请检查输入后重试。');
+    } finally {
+      pendingConfig = false; renderConfig();
+    }
+  });
   $('refresh').addEventListener('click', refresh);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   text('timezone', `浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}`);

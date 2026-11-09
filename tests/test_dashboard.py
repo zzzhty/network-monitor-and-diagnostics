@@ -47,6 +47,16 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('模拟演示', html)
         self.assertIn("fetch('/api/capabilities'", js)
 
+    def test_monitor_config_editing_is_wired(self):
+        html = (ROOT / 'web/index.html').read_text()
+        js = (ROOT / 'web/app.js').read_text()
+        self.assertIn('id="config-card"', html)
+        self.assertIn('id="monitor-config-form"', html)
+        self.assertIn('id="config-unavailable"', html)
+        self.assertIn("fetch('/api/config'", js)
+        self.assertIn("postJSON('/api/config'", js)
+        self.assertIn('config_management', js)
+
     def test_product_identity(self):
         html = (ROOT / 'web/index.html').read_text()
         js = (ROOT / 'web/app.js').read_text()

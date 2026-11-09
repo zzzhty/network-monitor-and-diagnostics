@@ -37,8 +37,9 @@ cargo run --release
 ```
 
 Windows 壳代码由 CI 编译验证（`desktop-shell` job 三平台矩阵），本机安装流程支持
-Linux 与 macOS；macOS 上 dashboard 自身按 `/api/capabilities` 显示只读诊断
-（见 `nmd_platform.py`），壳无需平台分支。
+Linux 与 macOS；macOS 上 dashboard 自身按 `/api/capabilities` 显示只读诊断，并额外
+开放「设置与帮助」页的监控配置编辑（`/api/config`，只写用户自己的 monitor.json），
+壳无需平台分支。
 
 ## 安装与自启（用户级）
 

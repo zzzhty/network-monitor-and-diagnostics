@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit, quote
 
@@ -105,6 +106,40 @@ def load_config(path=None):
             d[k] = v
         return d
     return validate_config(json.loads(data, object_pairs_hook=pairs))
+
+
+def default_config_path():
+    """User-scope config location; honors an absolute XDG_CONFIG_HOME like the rest of NMD."""
+    base = os.environ.get('XDG_CONFIG_HOME')
+    base = Path(base) if base and Path(base).is_absolute() else Path.home() / '.config'
+    return base / 'nmd' / 'monitor.json'
+
+
+def save_config(path, config):
+    """Atomically write a validated config; new private directories are 0700, the file 0600."""
+    path = Path(path)
+    config = validate_config(config)
+    missing, current = [], path.parent
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        os.chmod(directory, 0o700)
+    payload = json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False).encode() + b'\n'
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix='.' + path.name + '.')
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return config
 
 
 def _run(argv, timeout):
