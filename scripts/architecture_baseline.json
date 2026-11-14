@@ -1,0 +1,39 @@
+{
+  "notes": "棘轮，不是豁免。theme_contrast 的 ratio 是该文字对已经低于阈值时允许的最低对比度，不能为了新违规或变得更差而改低。macos_test_omit 只记录 macOS 显式 unittest 名单里已经缺的模块。不要为了让新的 tests/test_*.py 通过去加条目；能在 macOS 上跑的模块应写进 macos-tests 的命令。",
+  "theme_contrast": [
+    {
+      "key": "dark|html>body>div.shell>aside.sidebar>nav>button.nav.active>span|4.50",
+      "ratio": 4.29,
+      "reason": "导航序号 10px、opacity .6，自 1527ac5 令牌化主题起就这样。a4035eb 和 029d334 修的是不透明弱化文字，没有动这条。"
+    },
+    {
+      "key": "dark|html>body>div.shell>aside.sidebar>nav>button.nav>span|4.50",
+      "ratio": 3.75,
+      "reason": "同上，未选中导航序号。自 1527ac5 起 opacity .6。"
+    },
+    {
+      "key": "light|html>body>div.shell>aside.sidebar>nav>button.nav.active>span|4.50",
+      "ratio": 3.03,
+      "reason": "同上，亮色选中导航序号。自 1527ac5 起 opacity .6。"
+    },
+    {
+      "key": "light|html>body>div.shell>aside.sidebar>nav>button.nav>span|4.50",
+      "ratio": 2.44,
+      "reason": "同上，亮色未选中导航序号。自 1527ac5 起 opacity .6。"
+    }
+  ],
+  "macos_test_omit": {
+    "test_assets.py": "772f18c 起就不在合成 macOS 名单里：它检查安装包下载失败，不是回环诊断。",
+    "test_channel_policy_state.py": "9248667 新增后没有写进 macOS 名单。140969a 的诊断手册写明 T03 仍未列入。先记在棘轮里，不在这次改 CI 覆盖范围。",
+    "test_egress_diagnose.py": "3e13506 新增后没有写进 macOS 名单。和 9248667 是同一类遗漏。先记在棘轮里。",
+    "test_egress_sources.py": "772f18c 起就不在合成 macOS 名单里。模块在 Linux 发现测试里跑。",
+    "test_install_scope.py": "772f18c 起就不在合成 macOS 名单里：安装范围和 systemd 替身。",
+    "test_legacy_endpoint_config.py": "772f18c 起就不在合成 macOS 名单里：shell 端点配置。",
+    "test_lifecycle.py": "772f18c 起就不在合成 macOS 名单里：真实 Git 安装生命周期。",
+    "test_local_env_data.py": "772f18c 起就不在合成 macOS 名单里：特权 helper 的 shell 数据。",
+    "test_manager.py": "772f18c 起就不在合成 macOS 名单里：local-setup.sh。",
+    "test_recovery.py": "772f18c 起就不在合成 macOS 名单里：shell 故障注入。",
+    "test_scope_lifecycle.py": "772f18c 起就不在合成 macOS 名单里：管理器范围和 Git。",
+    "test_timeline_metrics.py": "9248667 新增后没有写进 macOS 名单。140969a 的诊断手册写明 T04 仍未列入。先记在棘轮里，不在这次改 CI 覆盖范围。"
+  }
+}

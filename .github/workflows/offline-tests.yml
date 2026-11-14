@@ -25,6 +25,8 @@ jobs:
         run: |
           python3 -c 'import sqlite3, sys; print(sys.version); print("SQLite", sqlite3.sqlite_version)'
           python3 -m compileall -q scripts tests
+      - name: Architecture checks
+        run: python3 scripts/check_architecture.py
       - name: Source YAML dependency
         run: |
           python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
@@ -44,10 +46,12 @@ jobs:
           bash -n nmd
           node --check web/app.js
           python3 -m compileall -q scripts tests
+      - name: Architecture checks
+        run: python3 scripts/check_architecture.py
       - name: Source YAML dependency
         run: python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
       - name: Synthetic macOS diagnostics and loopback API
-        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state -v
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state test_architecture_check -v
         # Tests use synthetic fixtures and loopback; no host metadata, real sources or service installs.
   desktop-shell:
     strategy:
