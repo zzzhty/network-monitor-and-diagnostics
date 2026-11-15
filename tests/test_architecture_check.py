@@ -226,15 +226,21 @@ class ArchitectureCheckTests(unittest.TestCase):
             caught = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
             self.assertGreaterEqual(len(caught), 1)
             phrase = "具体软件调研中，待定"
-            write(root, "README.md", phrase + "\n[分工](docs/platforms.md)\n")
-            write(root, "docs/macos.md", phrase + "\n[分工](platforms.md)\n")
-            write(root, "docs/windows.md", phrase + "\n[分工](platforms.md)\n")
-            write(root, "docs/platforms.md", phrase + " systemd LaunchAgent 计划任务 配置校验（规划）\n")
+            role = "Clash Verge Rev monitor diagnostics " + phrase
+            write(root, "README.md", role + "\n[分工](docs/platforms.md)\n")
+            section = role + "\nClash Verge Rev 配置校验（规划）\nexternal-controller\n[分工](platforms.md)\n"
+            write(root, "docs/macos.md", section)
+            write(root, "docs/windows.md", section)
+            write(
+                root,
+                "docs/platforms.md",
+                section + "systemd LaunchAgent 计划任务 需按实际 Verge/mihomo 版本核对\n",
+            )
             self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
-            write(root, "docs/macos.md", phrase + "\nClash Verge Rev\n[分工](platforms.md)\n")
-            named = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
-            self.assertEqual(len(named), 1)
-            self.assertIn("Clash Verge", named[0].violation)
+            write(root, "docs/platforms.md", section + "systemd LaunchAgent 计划任务\n")
+            dropped = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
+            self.assertEqual(len(dropped), 1)
+            self.assertIn("需按实际 Verge/mihomo 版本核对", dropped[0].violation)
 
     def test_windows_python_rejects_uv_venv_and_keeps_the_stdlib_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,16 +1,16 @@
 # NMD Windows 本机采集
 
-Windows 是桌面机。桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。
-NMD 在这里只做只读监控和诊断：当前用户的 CLI、SQLite 历史，以及可编辑监控配置的浏览器面板。
+Windows 是桌面机。NMD 在这里的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期客户端仍在调研（具体软件调研中，待定）。
+NMD 在这里做只读监控和诊断：当前用户的 CLI、SQLite 历史，以及可编辑监控配置的浏览器面板。
 不部署 mihomo，不改 DNS、路由、TUN 或系统代理，也不安装桌面壳。服务器侧部署仍是 Linux。
 平台分工见 [跨平台分工](platforms.md)。
 
 后台用当前用户的计划任务，任务文件夹 `\NMD\`，任务名 `Monitor`。不使用 Windows 服务：状态在用户配置里，
 不需要管理员，也不额外安装 NSSM 或其他运行时。任务只在该用户已登录时运行，登录前不会采集。
 
-## 外部客户端
+## Clash Verge Rev 配置校验（规划）
 
-桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。与 Linux `config.yaml` 对齐的分流意图、Tailscale 共存，以及规划中的只读校验，写在 [跨平台分工](platforms.md)。NMD 不写入该客户端的配置。
+与 Clash Verge Rev 共同使用时，NMD 只做监控（monitor）和诊断（diagnostics），流量由 Clash Verge Rev 管理。后续以只读方式校验它的配置，确认当前方案能跑通，并把结果和时间戳记在 NMD 自己的状态里。不调用 external-controller，不修改它的配置。设计和验收标准见 [跨平台分工](platforms.md)。本 PR 不实现校验器。
 
 ## Python 与智能应用控制
 

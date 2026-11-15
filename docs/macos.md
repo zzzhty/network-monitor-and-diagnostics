@@ -1,7 +1,7 @@
 # NMD macOS 实验性只读诊断
 
-macOS 是桌面机。桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。
-NMD 在这里只做只读监控和诊断，不部署 mihomo，不改 DNS、路由、TUN 或系统代理。
+macOS 是桌面机。NMD 在这里的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期客户端仍在调研（具体软件调研中，待定）。
+NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。
 平台分工见 [跨平台分工](platforms.md)。
 
 开发位置：`~/Projects/network-monitor-and-diagnostics`，分支 `feat/macos-support`。
@@ -39,9 +39,9 @@ macOS 面板唯一的写能力是「设置与帮助」页的监控配置编辑�
 改动在下次显式 `nmd monitor run --config` 时生效；Linux 的监控配置仍由 nmd CLI 与
 systemd 安装管理，面板不提供编辑。
 
-## 外部客户端
+## Clash Verge Rev 配置校验（规划）
 
-桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。与 Linux `config.yaml` 对齐的分流意图、Tailscale 共存，以及规划中的只读校验，写在 [跨平台分工](platforms.md)。NMD 不写入该客户端的配置。
+与 Clash Verge Rev 共同使用时，NMD 只做监控（monitor）和诊断（diagnostics），流量由 Clash Verge Rev 管理。后续以只读方式校验它的配置，确认当前方案能跑通，并把结果和时间戳记在 NMD 自己的状态里。不调用 external-controller，不修改它的配置。设计和验收标准见 [跨平台分工](platforms.md)。本 PR 不实现校验器。
 
 ## 能力与边界
 

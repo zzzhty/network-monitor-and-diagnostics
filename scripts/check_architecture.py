@@ -58,11 +58,11 @@ PRINCIPLES = {
         "stdlib recipe python -m venv --without-pip. Do not invoke uv venv."
     ),
     "platform-docs": (
-        "Desktop egress belongs to an external mihomo client that is still "
-        "undecided, and the Linux gateway stays with NMD. docs/platforms.md "
-        "records that split. README, docs/macos.md, and docs/windows.md have to "
-        "keep the link and the undecided wording; naming one product here drops "
-        "the guide the reader actually opens."
+        "On macOS and Windows, NMD is monitor and diagnostics. Traffic stays "
+        "with Clash Verge Rev when they are used together, and the long-term "
+        "desktop client is still undecided. docs/platforms.md records that "
+        "split and the planned read-only config check. README, docs/macos.md, "
+        "and docs/windows.md have to keep the link."
     ),
 }
 
@@ -1012,11 +1012,16 @@ def check_windows_python(root: Path) -> list[Violation]:
 
 
 _PLATFORM_SPLIT = "具体软件调研中，待定"
+_VERGE_CHECK = "Clash Verge Rev 配置校验（规划）"
+_PLATFORM_ROLE = ("Clash Verge Rev", "monitor", "diagnostics", _PLATFORM_SPLIT)
 _PLATFORM_DOCS = (
-    ("README.md", ("platforms.md", _PLATFORM_SPLIT)),
-    ("docs/macos.md", ("platforms.md", _PLATFORM_SPLIT)),
-    ("docs/windows.md", ("platforms.md", _PLATFORM_SPLIT)),
-    ("docs/platforms.md", (_PLATFORM_SPLIT, "systemd", "LaunchAgent", "计划任务", "配置校验（规划）")),
+    ("README.md", _PLATFORM_ROLE + ("platforms.md",)),
+    ("docs/macos.md", _PLATFORM_ROLE + ("platforms.md", _VERGE_CHECK, "external-controller")),
+    ("docs/windows.md", _PLATFORM_ROLE + ("platforms.md", _VERGE_CHECK, "external-controller")),
+    ("docs/platforms.md", _PLATFORM_ROLE + (
+        _VERGE_CHECK, "external-controller", "systemd", "LaunchAgent", "计划任务",
+        "需按实际 Verge/mihomo 版本核对",
+    )),
 )
 
 
@@ -1035,25 +1040,19 @@ def check_platform_docs(root: Path) -> list[Violation]:
             violations.append(_violation(
                 rel, 1, "platform-docs",
                 f"{rel} is missing, so the cross-platform split is no longer linked.",
-                "Restore the file, keep desktop egress undecided, and link docs/platforms.md.",
+                "Restore the file, keep the Clash Verge Rev monitor role, and link docs/platforms.md.",
             ))
             continue
         text = path.read_text(encoding="utf-8")
-        if "Clash Verge" in text:
-            violations.append(_violation(
-                rel, 1, "platform-docs",
-                f"{rel} names Clash Verge. Desktop egress software is still undecided.",
-                "Say that an external mihomo client manages desktop traffic and that "
-                "the product is still being chosen.",
-            ))
         missing = [needle for needle in needles if needle not in text]
         if missing:
             violations.append(_violation(
                 rel, 1, "platform-docs",
                 f"{rel} no longer contains {', '.join(missing)}.",
-                "Keep the undecided desktop-client sentence and the link to "
-                "docs/platforms.md. The guide names systemd, LaunchAgent, the Windows "
-                "scheduled task, and the planned read-only config check.",
+                "Keep the monitor/diagnostics role, the undecided long-term client, "
+                "and the link to docs/platforms.md. The guide names the planned "
+                "Clash Verge Rev check, external-controller, systemd, LaunchAgent, "
+                "and the Windows scheduled task.",
             ))
     return violations
 
