@@ -229,6 +229,7 @@ class TaskTests(unittest.TestCase):
         text = body.decode("utf-8-sig")
         self.assertIn("\r\n", text)
         self.assertIn("monitor run", text)
+        self.assertIn("exit $LASTEXITCODE", text)
         self.assertIn(str(self.python), text)
         self.assertNotIn("uv venv", text)
         self.assertEqual(json.loads((self.config / "monitor.json").read_text(encoding="utf-8"))["probes"], [])
@@ -266,9 +267,20 @@ class TaskTests(unittest.TestCase):
         self.assertIn("\r\n", entry)
         self.assertIn(str(self.python), entry)
         self.assertIn("Managed by NMD install_scope:", entry)
+        self.assertIn("exit $LASTEXITCODE", entry)
 
 
 class CommandTests(unittest.TestCase):
+    def test_windows_setting_read_uses_utf8(self):
+        completed = Mock(returncode=0, stdout="C:\\Users\\José\\AppData\\Roaming\\nmd\n")
+        with patch.object(manager.sys, "platform", "win32"), \
+                patch.object(manager.subprocess, "run", return_value=completed) as run:
+            value = manager.setting(Path("C:/nmd"), "configDir")
+        self.assertEqual(value, "C:\\Users\\José\\AppData\\Roaming\\nmd")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
+
     def test_network_commands_fail_before_side_effects_and_monitor_install_is_allowed(self):
         with patch.object(nmd_platform, "name", return_value="windows"):
             for args in (["apply"], ["start"], ["source", "status"], ["channel", "list"],

@@ -63,8 +63,14 @@ def setting(root, key, value=None):
     if value is not None:
         run("git", "config", "--file", root / ".git/config", "nmd." + key, str(value))
         return value
+    kwargs = {}
+    if sys.platform == "win32":
+        # Git stores the value as UTF-8. text=True alone follows the ANSI code
+        # page, so a profile path such as José is misread before UTF-8 mode.
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
     result = subprocess.run(["git", "config", "--file", str(root / ".git/config"),
-                             "--get", "nmd." + key], capture_output=True, text=True)
+                             "--get", "nmd." + key], capture_output=True, text=True, **kwargs)
     if result.returncode not in (0, 1):
         raise ManagerError(f"无法读取安装状态: {root}")
     return result.stdout.strip()

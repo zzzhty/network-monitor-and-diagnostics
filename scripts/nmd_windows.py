@@ -196,7 +196,7 @@ def render_cmd():
 
 def render_entry_ps1(python, root):
     line = "& " + ps_quote(python) + " " + ps_quote(Path(root) / "scripts" / "manager.py") + " @args"
-    lines = ["# " + description(root), "$ErrorActionPreference = 'Stop'", line]
+    lines = ["# " + description(root), "$ErrorActionPreference = 'Stop'", line, "exit $LASTEXITCODE"]
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -207,7 +207,7 @@ def render_task_script(python, observability, config, state, log, root):
         + " --state-dir " + ps_quote(state)
         + " *>> " + ps_quote(log)
     )
-    lines = ["# " + description(root), "$ErrorActionPreference = 'Stop'", line]
+    lines = ["# " + description(root), "$ErrorActionPreference = 'Stop'", line, "exit $LASTEXITCODE"]
     return "\r\n".join(lines) + "\r\n"
 
 
