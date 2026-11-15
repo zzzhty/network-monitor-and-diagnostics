@@ -14,6 +14,15 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+
+
+def isolated_directory():
+    """Fixture root whose ancestors are real directories.
+
+    macOS CI puts the default temporary directory under /var, and /var is a
+    symlink to /private/var. The Windows path walk rejects that ancestor.
+    """
+    return tempfile.TemporaryDirectory(dir=ROOT)
 import install_scope
 import manager
 import nmd_monitor
@@ -164,7 +173,7 @@ class SamplerTests(unittest.TestCase):
 
 class StateTests(unittest.TestCase):
     def test_windows_directory_rejects_a_symlink_and_round_trips_sqlite(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with isolated_directory() as tmp:
             base = Path(tmp)
             real = base / "real"
             real.mkdir()
@@ -192,7 +201,7 @@ class StateTests(unittest.TestCase):
 
 class TaskTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = isolated_directory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.root = self.base / "checkout"
@@ -246,7 +255,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn("Triggers.Clear", disable)
         self.assertNotIn("Stop-ScheduledTask", disable)
         self.assertIn("Start-ScheduledTask", start)
-        self.assertIn(str(self.root), enable)
+        self.assertIn(json.dumps(str(self.root)), enable)
         with self.assertRaises(install_scope.ScopeError):
             install_scope.install_windows_monitor(
                 self.root, self.config, self.state, self.root / "bin", self.python, runner=lambda script: None)
