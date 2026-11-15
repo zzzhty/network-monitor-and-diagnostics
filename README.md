@@ -3,7 +3,7 @@
 家庭网络分流：国内和私网直连，其余经 Tailscale 内的 VPS SOCKS5 出海。
 Tailscale 登录、控制服务、DERP 和 MagicDNS 独立于 VPS 代理。
 
-Linux 作为服务器或网关，由 NMD 部署系统 mihomo，用 TUN 接管整机流量。macOS 与 Windows 是桌面机，出口由 Clash Verge Rev 管理；NMD 在这两个平台只做只读监控和诊断。分工、可复用规则和 Tailscale 共存见 [跨平台分工](docs/platforms.md)。
+Linux 作为服务器或网关，由 NMD 部署系统 mihomo，用 TUN 接管整机流量。macOS 与 Windows 是桌面机。桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。NMD 在这两个平台只做只读监控和诊断。分工见 [跨平台分工](docs/platforms.md)。
 
 可选的[出口通道 Channel](docs/egress-sources.md)复用已有 source 注册表：默认添加 Tailnet 直连
 VPS 通道，也支持手工普通路径 SOCKS5 与（可选的）订阅通道，并重命名显示名称而不改变节点 ID。

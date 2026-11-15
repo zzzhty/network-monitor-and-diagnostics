@@ -58,10 +58,11 @@ PRINCIPLES = {
         "stdlib recipe python -m venv --without-pip. Do not invoke uv venv."
     ),
     "platform-docs": (
-        "Desktop egress belongs to Clash Verge Rev, and the Linux gateway stays "
-        "with NMD. docs/platforms.md records that split. README, docs/macos.md, "
-        "and docs/windows.md have to keep the link; a platform guide that only "
-        "lives in one file gets dropped from the page a reader actually opens."
+        "Desktop egress belongs to an external mihomo client that is still "
+        "undecided, and the Linux gateway stays with NMD. docs/platforms.md "
+        "records that split. README, docs/macos.md, and docs/windows.md have to "
+        "keep the link and the undecided wording; naming one product here drops "
+        "the guide the reader actually opens."
     ),
 }
 
@@ -1010,11 +1011,12 @@ def check_windows_python(root: Path) -> list[Violation]:
     return violations
 
 
+_PLATFORM_SPLIT = "具体软件调研中，待定"
 _PLATFORM_DOCS = (
-    ("README.md", ("platforms.md", "Clash Verge Rev")),
-    ("docs/macos.md", ("platforms.md", "Clash Verge Rev")),
-    ("docs/windows.md", ("platforms.md", "Clash Verge Rev")),
-    ("docs/platforms.md", ("Clash Verge Rev", "systemd", "LaunchAgent", "计划任务")),
+    ("README.md", ("platforms.md", _PLATFORM_SPLIT)),
+    ("docs/macos.md", ("platforms.md", _PLATFORM_SPLIT)),
+    ("docs/windows.md", ("platforms.md", _PLATFORM_SPLIT)),
+    ("docs/platforms.md", (_PLATFORM_SPLIT, "systemd", "LaunchAgent", "计划任务", "配置校验（规划）")),
 )
 
 
@@ -1033,18 +1035,25 @@ def check_platform_docs(root: Path) -> list[Violation]:
             violations.append(_violation(
                 rel, 1, "platform-docs",
                 f"{rel} is missing, so the cross-platform split is no longer linked.",
-                "Restore the file and link Clash Verge Rev desktop egress to docs/platforms.md.",
+                "Restore the file, keep desktop egress undecided, and link docs/platforms.md.",
             ))
             continue
         text = path.read_text(encoding="utf-8")
+        if "Clash Verge" in text:
+            violations.append(_violation(
+                rel, 1, "platform-docs",
+                f"{rel} names Clash Verge. Desktop egress software is still undecided.",
+                "Say that an external mihomo client manages desktop traffic and that "
+                "the product is still being chosen.",
+            ))
         missing = [needle for needle in needles if needle not in text]
         if missing:
             violations.append(_violation(
                 rel, 1, "platform-docs",
                 f"{rel} no longer contains {', '.join(missing)}.",
-                "Put the Clash Verge Rev desktop role back in this file and keep its "
-                "link to docs/platforms.md. The guide names systemd, LaunchAgent, and "
-                "the Windows scheduled task.",
+                "Keep the undecided desktop-client sentence and the link to "
+                "docs/platforms.md. The guide names systemd, LaunchAgent, the Windows "
+                "scheduled task, and the planned read-only config check.",
             ))
     return violations
 

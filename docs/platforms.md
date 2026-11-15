@@ -5,11 +5,11 @@ NMD 按机器角色分工，不在每台电脑上重复做一遍网关。
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | 角色 | 服务器 / 网关 | 桌面机 | 桌面机 |
-| 谁管流量 | NMD 部署并管理系统 mihomo，TUN 接管整机 | Clash Verge Rev，含它的 TUN | Clash Verge Rev，含它的 TUN |
+| 谁管流量 | NMD 部署并管理系统 mihomo，TUN 接管整机 | 外部 mihomo/代理客户端（具体软件调研中，待定） | 外部 mihomo/代理客户端（具体软件调研中，待定） |
 | NMD 在这里做什么 | 部署、分流、监控、自动修复 | 只读监控和诊断 | 只读监控和诊断 |
 | 后台 | systemd：系统 mihomo，以及独立的 monitor 单元 | 没有采集服务。可选 LaunchAgent 只启动桌面壳 | 当前用户的计划任务 `\NMD\Monitor`，登录期间运行 |
 
-桌面机的出口由 Clash Verge Rev 管理。NMD 在 macOS 和 Windows 上不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
+桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。NMD 在 macOS 和 Windows 上只做监控和诊断，不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
 
 ## 为什么这样分
 
@@ -17,7 +17,7 @@ NMD 按机器角色分工，不在每台电脑上重复做一遍网关。
 
 Linux 有 nftables、fwmark 和 systemd-resolved，NMD 才能做可校验、可回滚的部署。本仓库的模板让 Tailscale 的 5210–5270 规则先于 mihomo 的 9000 规则；带标记的 tailscaled 传输走主路由表，mihomo 使用自己的路由表。这些是 Linux 策略路由，不是桌面 TUN 的开关。细节和依据在 [runbook.md](../runbook.md) 的「避免 Tailscale 与 VPS 循环依赖」。
 
-桌面系统的 TUN 驱动、权限和登录自启，Clash Verge Rev 已经做成日常可用的图形客户端。NMD 再部署一套 mihomo TUN，会和 Verge、Tailscale 抢同一条默认路由。所以桌面机只留 NMD 的观察：macOS 用可选的用户级 LaunchAgent 启动桌面壳，不安装采集服务；Windows 用当前用户的计划任务采集，任务只在该用户登录后运行。
+桌面系统的 TUN 驱动、权限和登录自启交给外部客户端。NMD 再部署一套 mihomo TUN，会和那个客户端、Tailscale 抢同一条默认路由。具体用哪一个客户端还在调研，文档不绑定某一款。桌面机只留 NMD 的观察：macOS 用可选的用户级 LaunchAgent 启动桌面壳，不安装采集服务；Windows 用当前用户的计划任务采集，任务只在该用户登录后运行。
 
 ## Linux
 
@@ -46,40 +46,34 @@ monitor 单元和 mihomo 服务是两件事。`nmd monitor install` 不部署网
 
 两边都拒绝 `apply`、来源/通道管理、`adopt` 和系统网络命令。
 
-### 配合 Clash Verge Rev
+### 外部客户端
 
-在 Clash Verge Rev 里管理外部流量，并打开它的 TUN 模式，让 Tailscale 网络也走这套分流。不要同时打开 Tailscale 的 exit node。exit node 会把整机再交回某个出口；Verge 的 TUN 也在接管默认路由，两套叠在一起就会抢路由。Linux 上的 `cutover` 同样要求先清掉 exit node，再启动 mihomo。
+桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。它负责外部流量，包括 Tailscale 网络上的出口。NMD 不部署这套客户端，也不写它的配置。
 
-Verge 的配置文件是 mihomo 配置。下面这些 `rules:` 行与 `config.yaml` 的意图相同，可以直接放进桌面配置，代理节点的名字换成这份 Verge 配置里的实际节点：
+Linux `config.yaml` 里可以跨平台对照的意图是：`tailscale.com` 与 `tailscale.io` 直连，tailnet `100.64.0.0/10` 和 `fd7a:115c:a1e0::/48` 直连，`GEOSITE,cn`、`GEOIP,private`、`GEOIP,CN` 直连，其余走自有 VPS。`GEOSITE` / `GEOIP` 依赖对应的 geodata，客户端是否自带这份数据，要等软件选定后再看。
 
-```yaml
-- DOMAIN-SUFFIX,tailscale.com,DIRECT
-- DOMAIN-SUFFIX,tailscale.io,DIRECT
-- IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
-- IP-CIDR6,fd7a:115c:a1e0::/48,DIRECT,no-resolve
-- GEOSITE,cn,DIRECT
-- GEOIP,private,DIRECT,no-resolve
-- GEOIP,CN,DIRECT
-- MATCH,你的出口节点
-```
-
-`GEOSITE,cn` 和 `GEOIP,CN` 需要对应的 geodata。Verge 是否随版本带上 `geoip.metadb` 与 `GeoSite.dat`，需按实际 Verge/mihomo 版本核对。
-
-这些 Linux 条目不要原样抄进桌面配置：
+这些 Linux 条目留在网关模板里，不当作桌面客户端的配置：
 
 | 条目 | 原因 |
 | --- | --- |
-| `PROCESS-NAME,tailscaled,DIRECT` | 这是 Linux 上的进程名。macOS 与 Windows 的进程名不同，需按实际 Verge/mihomo 版本核对。 |
+| `PROCESS-NAME,tailscaled,DIRECT` | Linux 上的进程名。macOS 与 Windows 的进程名不同。 |
 | `DOMAIN,connectivity-check.ubuntu.com,DIRECT` | 只服务于 Ubuntu 的 NetworkManager。 |
-| `interface-name: tailscale0` | 只是 Linux 上的 Tailscale 接口。桌面接口名不同。 |
-| `iproute2-table-index`、`iproute2-rule-index`、fwmark | Linux 策略路由。桌面 TUN 没有这套 nftables 绕行。 |
+| 接口名 `tailscale0` | Linux 上的 Tailscale 接口。桌面接口名不同。 |
+| `iproute2-table-index`、`iproute2-rule-index`、fwmark | Linux 策略路由。桌面没有这套 nftables 绕行。 |
 | `198.51.100.0/24`、`203.0.113.0/24` 以及模板里的 `203.0.113.20` | 本仓库的文档占位，不是 Tailscale 或 VPS 的真实地址。 |
 
 与 Tailscale 共存时，保持这几条：
 
-- tailnet `100.64.0.0/10` 和 IPv6 `fd7a:115c:a1e0::/48` 直连，规则上加 `no-resolve`，避免为了匹配网段再去解析。
-- MagicDNS 继续由 Tailscale 解析。模板把 `+.ts.net`、`+.tailscale.com`、`+.tailscale.io` 放进 `fake-ip-filter`，避免这些名字拿到 fake-ip。`+.ts.net` 在 Linux 上送到 `100.100.100.100`。桌面配置可以保留同样的过滤；要不要把解析绑定到某个接口，需按实际 Verge/mihomo 版本核对，不要写死 `tailscale0`。
-- DERP 和打洞流量不要被 TUN 劫持。Linux 靠 tailscaled 的 fwmark，不靠一份固定网段。桌面没有这套标记路由。`config.yaml` 里的 `198.51.100.0/24` 与 `203.0.113.0/24` 不能当作 DERP 排除项。Verge 用哪一项避开 DERP 和打洞，需按实际 Verge/mihomo 版本核对。
-- 不要同时开 Tailscale exit node。关掉 Verge 之后，exit node 仍会让整机依赖那个出口。
+- tailnet `100.64.0.0/10` 和 IPv6 `fd7a:115c:a1e0::/48` 直连。Linux 规则带 `no-resolve`，避免为了匹配网段再去解析。
+- MagicDNS 继续由 Tailscale 解析。Linux 模板把 `+.ts.net` 送到 `100.100.100.100`，并绑定接口 `tailscale0`。桌面不要写死这个接口名。
+- DERP 和打洞流量不要被 TUN 劫持。Linux 靠 tailscaled 的 fwmark，不靠一份固定网段。`config.yaml` 里的 `198.51.100.0/24` 与 `203.0.113.0/24` 不能当作 DERP 排除项。
+- 不要同时开 Tailscale exit node。exit node 会把整机再交回某个出口，和客户端接管默认路由叠在一起。Linux 上的 `cutover` 同样先清掉 exit node，再启动 mihomo。
 
-Verge 打开 TUN 之后，是否改写配置里的 `tun:`、`dns-hijack` 或系统代理，需按实际 Verge/mihomo 版本核对。NMD 不替桌面机写这些字段。
+### 配置校验（规划）
+
+这一节是规划，当前没有实现。校验分成两块，配置彼此分开：
+
+- 外部客户端只读校验。选定软件之后，只读取它已经生效的配置或状态，对照上面列出的跨平台意图。不写入该客户端，不预设它的配置路径、字段或操作步骤。
+- NMD 自有探测。沿用监控配置里的 DNS、TCP、TLS、HTTP 探测，观察本机连通性。探测项写在 NMD 自己的 `monitor.json`。
+
+解耦保持不变：NMD 的监控配置和外部客户端的配置是两份东西。校验失败只留下观察结果，不因此部署 mihomo，也不改 DNS、路由、TUN 或系统代理。

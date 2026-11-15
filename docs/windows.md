@@ -1,6 +1,6 @@
 # NMD Windows 本机采集
 
-Windows 是桌面机。出口由 Clash Verge Rev 管理，包括用它的 TUN 处理 Tailscale 网络。
+Windows 是桌面机。桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。
 NMD 在这里只做只读监控和诊断：当前用户的 CLI、SQLite 历史，以及可编辑监控配置的浏览器面板。
 不部署 mihomo，不改 DNS、路由、TUN 或系统代理，也不安装桌面壳。服务器侧部署仍是 Linux。
 平台分工见 [跨平台分工](platforms.md)。
@@ -8,9 +8,9 @@ NMD 在这里只做只读监控和诊断：当前用户的 CLI、SQLite 历史�
 后台用当前用户的计划任务，任务文件夹 `\NMD\`，任务名 `Monitor`。不使用 Windows 服务：状态在用户配置里，
 不需要管理员，也不额外安装 NSSM 或其他运行时。任务只在该用户已登录时运行，登录前不会采集。
 
-## 配合 Clash Verge Rev
+## 外部客户端
 
-打开 Clash Verge Rev 的 TUN 模式来管理外部流量。分流里的 private/CN 直连、tailnet `100.64.0.0/10` 和 MagicDNS 的处理，与 Linux `config.yaml` 里可以复用的规则一起写在 [跨平台分工](platforms.md)。不要同时打开 Tailscale exit node。NMD 不替 Windows 写入 Verge 或 mihomo 配置。
+桌面端外部流量由外部 mihomo/代理客户端管理（具体软件调研中，待定）。与 Linux `config.yaml` 对齐的分流意图、Tailscale 共存，以及规划中的只读校验，写在 [跨平台分工](platforms.md)。NMD 不写入该客户端的配置。
 
 ## Python 与智能应用控制
 

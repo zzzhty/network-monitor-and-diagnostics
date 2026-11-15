@@ -225,11 +225,16 @@ class ArchitectureCheckTests(unittest.TestCase):
             write(root, "README.md", "Linux gateway only.\n")
             caught = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
             self.assertGreaterEqual(len(caught), 1)
-            write(root, "README.md", "Clash Verge Rev\n[分工](docs/platforms.md)\n")
-            write(root, "docs/macos.md", "Clash Verge Rev\n[分工](platforms.md)\n")
-            write(root, "docs/windows.md", "Clash Verge Rev\n[分工](platforms.md)\n")
-            write(root, "docs/platforms.md", "Clash Verge Rev systemd LaunchAgent 计划任务\n")
+            phrase = "具体软件调研中，待定"
+            write(root, "README.md", phrase + "\n[分工](docs/platforms.md)\n")
+            write(root, "docs/macos.md", phrase + "\n[分工](platforms.md)\n")
+            write(root, "docs/windows.md", phrase + "\n[分工](platforms.md)\n")
+            write(root, "docs/platforms.md", phrase + " systemd LaunchAgent 计划任务 配置校验（规划）\n")
             self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
+            write(root, "docs/macos.md", phrase + "\nClash Verge Rev\n[分工](platforms.md)\n")
+            named = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
+            self.assertEqual(len(named), 1)
+            self.assertIn("Clash Verge", named[0].violation)
 
     def test_windows_python_rejects_uv_venv_and_keeps_the_stdlib_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

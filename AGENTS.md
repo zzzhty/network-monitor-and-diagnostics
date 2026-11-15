@@ -10,5 +10,5 @@
 | 新的 `tests/test_*.py` 要出现在 macOS 作业的 unittest 名单里 | `scripts/check_architecture.py`（`macos-test-list`）。Linux 用 `unittest discover`。基线里的 `macos_test_omit` 只保留已经不在名单上的模块。 |
 | `windows-tests` 在 `windows-latest` 上运行 `test_windows` | `scripts/check_architecture.py`（`windows-job`）。Linux 仍 discover 全部 `tests/test_*.py`；macOS 名单里也要有 `test_windows`。 |
 | Windows 安装不调用 `uv venv`，并保留 `python -m venv --without-pip` | `scripts/check_architecture.py`（`windows-python`）。`scripts/nmd_windows.ps1`、`install.ps1`、`nmd.ps1` 不得出现命令行 `uv venv`。说明文字可以提到 uv。智能应用控制会拦截 uv 生成的 `python.exe` 跳板。 |
-| 跨平台分工说明和各平台文档的链接还在 | `scripts/check_architecture.py`（`platform-docs`）。仓库有 `README.md` 时，`docs/platforms.md`、README、`docs/macos.md`、`docs/windows.md` 都要提到 Clash Verge Rev，并链到 `platforms.md`。平台说明还要保留 systemd、LaunchAgent 和计划任务。 |
+| 跨平台分工说明和各平台文档的链接还在 | `scripts/check_architecture.py`（`platform-docs`）。仓库有 `README.md` 时，`docs/platforms.md`、README、`docs/macos.md`、`docs/windows.md` 都要写明桌面端外部流量由外部客户端管理且具体软件待定，并链到 `platforms.md`。这些文件不得再绑定 Clash Verge。平台说明还要保留 systemd、LaunchAgent 和计划任务。 |
 | 行为 | `python3 -m unittest discover -s tests -p 'test_*.py'` |
