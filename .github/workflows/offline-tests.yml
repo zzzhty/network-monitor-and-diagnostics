@@ -51,7 +51,7 @@ jobs:
       - name: Source YAML dependency
         run: python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
       - name: Synthetic macOS diagnostics and loopback API
-        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state test_architecture_check -v
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state test_architecture_check test_channel_policy_state test_timeline_metrics test_egress_diagnose -v
         # Tests use synthetic fixtures and loopback; no host metadata, real sources or service installs.
   desktop-shell:
     strategy:
