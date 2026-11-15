@@ -57,6 +57,12 @@ PRINCIPLES = {
         "The Windows entry must keep rejecting those paths and must keep the "
         "stdlib recipe python -m venv --without-pip. Do not invoke uv venv."
     ),
+    "platform-docs": (
+        "Desktop egress belongs to Clash Verge Rev, and the Linux gateway stays "
+        "with NMD. docs/platforms.md records that split. README, docs/macos.md, "
+        "and docs/windows.md have to keep the link; a platform guide that only "
+        "lives in one file gets dropped from the page a reader actually opens."
+    ),
 }
 
 
@@ -1004,12 +1010,52 @@ def check_windows_python(root: Path) -> list[Violation]:
     return violations
 
 
+_PLATFORM_DOCS = (
+    ("README.md", ("platforms.md", "Clash Verge Rev")),
+    ("docs/macos.md", ("platforms.md", "Clash Verge Rev")),
+    ("docs/windows.md", ("platforms.md", "Clash Verge Rev")),
+    ("docs/platforms.md", ("Clash Verge Rev", "systemd", "LaunchAgent", "计划任务")),
+)
+
+
+def check_platform_docs(root: Path) -> list[Violation]:
+    """Keep the cross-platform split linked from the pages readers open.
+
+    Fixture trees without a README are not this repository, so they are left
+    alone. A tree that has README.md is expected to keep the guide.
+    """
+    if not (root / "README.md").is_file():
+        return []
+    violations: list[Violation] = []
+    for rel, needles in _PLATFORM_DOCS:
+        path = root / rel
+        if not path.is_file():
+            violations.append(_violation(
+                rel, 1, "platform-docs",
+                f"{rel} is missing, so the cross-platform split is no longer linked.",
+                "Restore the file and link Clash Verge Rev desktop egress to docs/platforms.md.",
+            ))
+            continue
+        text = path.read_text(encoding="utf-8")
+        missing = [needle for needle in needles if needle not in text]
+        if missing:
+            violations.append(_violation(
+                rel, 1, "platform-docs",
+                f"{rel} no longer contains {', '.join(missing)}.",
+                "Put the Clash Verge Rev desktop role back in this file and keep its "
+                "link to docs/platforms.md. The guide names systemd, LaunchAgent, and "
+                "the Windows scheduled task.",
+            ))
+    return violations
+
+
 def check(root: Path, baseline: dict[str, Any]) -> list[Violation]:
     violations = [
         *check_theme_contrast(root, baseline),
         *check_macos_test_list(root, baseline),
         *check_windows_job(root),
         *check_windows_python(root),
+        *check_platform_docs(root),
     ]
     violations.sort(key=lambda item: (item.path, item.line, item.rule, item.violation))
     return violations

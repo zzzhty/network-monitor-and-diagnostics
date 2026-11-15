@@ -218,6 +218,19 @@ class ArchitectureCheckTests(unittest.TestCase):
             )
             self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "windows-job"], [])
 
+    def test_platform_docs_keep_the_cross_platform_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
+            write(root, "README.md", "Linux gateway only.\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
+            self.assertGreaterEqual(len(caught), 1)
+            write(root, "README.md", "Clash Verge Rev\n[分工](docs/platforms.md)\n")
+            write(root, "docs/macos.md", "Clash Verge Rev\n[分工](platforms.md)\n")
+            write(root, "docs/windows.md", "Clash Verge Rev\n[分工](platforms.md)\n")
+            write(root, "docs/platforms.md", "Clash Verge Rev systemd LaunchAgent 计划任务\n")
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
+
     def test_windows_python_rejects_uv_venv_and_keeps_the_stdlib_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
