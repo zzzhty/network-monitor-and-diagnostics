@@ -109,6 +109,20 @@ class ArchitectureCheckTests(unittest.TestCase):
             keys.add(item.violation.split(" is ", 1)[0])
         self.assertEqual(keys, {entry["key"] for entry in baseline["theme_contrast"]})
 
+    def test_navigation_numbers_cannot_restore_translucent_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "web").mkdir()
+            for source in (ROOT / "web").glob("*.html"):
+                (root / "web" / source.name).write_text(source.read_text(), encoding="utf-8")
+            for source in (ROOT / "web").glob("*.css"):
+                (root / "web" / source.name).write_text(source.read_text(), encoding="utf-8")
+            css = root / "web" / "style.css"
+            css.write_text(css.read_text() + "\n.nav span{opacity:.6}\n", encoding="utf-8")
+            caught = theme_errors(arch.check(root, EMPTY))
+            nav = [item for item in caught if "button.nav" in item.violation and ">span|4.50" in item.violation]
+            self.assertEqual(len(nav), 4)
+
     def test_footer_contrast_before_a4035eb_is_caught(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

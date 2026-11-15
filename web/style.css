@@ -21,7 +21,7 @@ nav{display:grid;gap:var(--size-px-2)}
 button{font:inherit;cursor:pointer}
 @media (prefers-reduced-motion: no-preference){.nav,.refresh,.delay-btn,.node-row,#diagnose-run,.channel-form button,.channel-rename-form button,.auto-actions button,.candidate-row button{transition:background-color var(--duration-quick-1) var(--ease-2),border-color var(--duration-quick-1) var(--ease-2),color var(--duration-quick-1) var(--ease-2)}}
 .nav{border:0;background:transparent;color:var(--ink-400);text-align:left;padding:14px 12px;border-radius:9px;display:flex;justify-content:space-between;font-size:14px}
-.nav span{font-size:10px;opacity:.6}
+.nav span{font-size:10px}
 .nav.active{background:var(--bg-accent-soft);color:var(--ink-750)}
 .nav:hover{background:var(--bg-hover)}
 .sidebar-foot{margin-top:auto;padding-top:40px;color:var(--ink-500);font-size:12px}
