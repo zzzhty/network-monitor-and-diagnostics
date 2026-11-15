@@ -30,6 +30,23 @@ CLI、SQLite 历史、事件/空窗逻辑及只读 GUI 复用现有实现。macO
 使用方式、状态目录限制和实验边界见 [macOS 使用说明](docs/macos.md)。
 下文的安装、后台服务和网络管理流程仍仅针对 Linux；macOS CLI 会提前拒绝这些命令。
 
+## Windows 本机采集
+
+Windows 可以在当前用户下安装本机采集和诊断，不部署 mihomo、Tailscale 或 VPS，也不改系统网络。
+后台用当前用户的计划任务（登录期间运行），不是 Windows 服务。安装不启动任务，也不加登录触发；
+`enable` 只加登录触发，`start` / `stop` 另算。说明、路径和 Town 上的核对命令见
+[Windows 使用说明](docs/windows.md)。
+
+智能应用控制（Smart App Control）会拦截 uv 生成的 `python.exe` 跳板，包括
+`%USERPROFILE%\.local\bin\python.exe` 和 `uv venv` 建出的 `.venv\Scripts\python.exe`。
+安装脚本不会调用 `uv venv`。需要虚拟环境时，用已经能运行的 python：
+
+```powershell
+python -m venv --without-pip .venv
+```
+
+之后 `uv pip install`、`uv sync` 或 `uv run` 会复用这个环境。采集器只用标准库，安装本身不建虚拟环境。
+
 ## 安装范围与目录分工
 
 开发源码与日常管理安装是独立的 Git checkout；安装后可移动开发仓库，不能直接移动

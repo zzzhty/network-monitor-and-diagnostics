@@ -203,6 +203,33 @@ class ArchitectureCheckTests(unittest.TestCase):
             self.assertEqual(len(caught), 1)
             self.assertIn("no longer an omission", caught[0].violation)
 
+    def test_windows_job_must_run_test_windows_on_windows_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, ".github/workflows/offline-tests.yml", "jobs:\n  windows-tests:\n    runs-on: ubuntu-latest\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "windows-job"]
+            self.assertEqual(len(caught), 1)
+            self.assertIn("windows-latest", caught[0].violation)
+            write(
+                root,
+                ".github/workflows/offline-tests.yml",
+                "jobs:\n  windows-tests:\n    runs-on: windows-latest\n    steps:\n"
+                "      - run: python -m unittest test_windows test_architecture_check -v\n",
+            )
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "windows-job"], [])
+
+    def test_windows_python_rejects_uv_venv_and_keeps_the_stdlib_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "scripts/nmd_windows.ps1", "python -m venv --without-pip .venv\n.local\n")
+            write(root, "install.ps1", ". .\\scripts\\nmd_windows.ps1\n")
+            write(root, "nmd.ps1", ". .\\scripts\\nmd_windows.ps1\n")
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "windows-python"], [])
+            write(root, "install.ps1", ". .\\scripts\\nmd_windows.ps1\nuv venv .venv\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "windows-python"]
+            self.assertEqual(len(caught), 1)
+            self.assertIn("uv venv", caught[0].violation)
+
     def test_unittest_discover_covers_new_modules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

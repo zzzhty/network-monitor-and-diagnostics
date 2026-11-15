@@ -29,6 +29,10 @@ MAX_CONFIG_BODY_BYTES = 16384
 
 
 def default_state_dir():
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        base = Path(base) if base else Path.home() / "AppData" / "Local"
+        return base / "nmd-monitor"
     base = os.environ.get("XDG_STATE_HOME")
     if base and Path(base).is_absolute():
         return Path(base) / "nmd-monitor"
@@ -43,10 +47,10 @@ class DashboardServer(ThreadingHTTPServer):
         self.state_dir = Path(state_dir)
         self.sources_dir = (Path(sources_dir) if sources_dir is not None
                             and nmd_platform.name() == "linux" else None)
-        # Monitor-config editing is the single macOS write capability: the file is
-        # the user's own config; nothing is spawned, probed or deployed on save.
+        # Monitor-config editing is the one non-Linux write: the user's own file.
+        # Nothing is spawned, probed or deployed on save. Linux keeps CLI/systemd.
         self.config_path = (Path(config_path) if config_path is not None
-                            and nmd_platform.name() == "macos" else None)
+                            and nmd_platform.name() in ("macos", "windows") else None)
         # Never offer a wildcard or user-supplied bind address in this MVP.
         super().__init__(("127.0.0.1", port), DashboardHandler)
 
@@ -358,7 +362,7 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     gui = commands.add_parser("gui", help="local browser dashboard with node switching; collector is separate")
     gui.add_argument("--state-dir", type=Path, default=state_dir or default_state_dir())
     gui.add_argument("--config", type=Path, default=config_file,
-                     help="monitor config file editable on the dashboard (macOS only)")
+                     help="monitor config file editable on the dashboard (macOS and Windows)")
     gui.add_argument("--port", type=int, default=8765)
     machine = commands.add_parser("machine", help="versioned machine-readable interface")
     machine.add_argument("action", choices=["capabilities", "status"])
@@ -402,11 +406,11 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     else:
         if not 0 <= args.port <= 65535:
             parser.error("port must be between 0 and 65535")
-        # macOS has no other config entry point (Linux owns config via CLI and
-        # the systemd install), so only there the dashboard edits the user's
-        # own monitor config; a missing file starts from validated defaults.
+        # Linux owns monitor config via the CLI and the systemd install.
+        # macOS and Windows edit that same file from the dashboard; a missing
+        # file starts from validated defaults and does not start collection.
         config_path = args.config
-        if config_path is None and nmd_platform.name() == "macos":
+        if config_path is None and nmd_platform.name() in ("macos", "windows"):
             config_path = nmd_monitor.default_config_path()
         serve_dashboard(args.port, args.state_dir, sources_dir, config_path=config_path)
 

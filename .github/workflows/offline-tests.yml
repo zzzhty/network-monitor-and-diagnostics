@@ -51,8 +51,28 @@ jobs:
       - name: Source YAML dependency
         run: python3 -m pip install --target "$RUNNER_TEMP/nmd-source-deps" -r requirements-sources.txt
       - name: Synthetic macOS diagnostics and loopback API
-        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state test_architecture_check test_channel_policy_state test_timeline_metrics test_egress_diagnose -v
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="tests:scripts:$RUNNER_TEMP/nmd-source-deps" python3 -m unittest test_macos test_monitor test_socket_probe test_observability test_dashboard test_review_regressions test_desktop test_auto_event_retention test_channels test_auto_state test_architecture_check test_channel_policy_state test_timeline_metrics test_egress_diagnose test_windows -v
         # Tests use synthetic fixtures and loopback; no host metadata, real sources or service installs.
+  windows-tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - name: Architecture checks
+        run: python scripts/check_architecture.py
+      - name: Compile
+        run: python -m compileall -q scripts tests
+      - name: Windows branch tests
+        run: python -m unittest test_windows test_architecture_check -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: tests;scripts
+        # test_windows mocks commands on every OS and, on Windows, also opens a private state directory.
   desktop-shell:
     strategy:
       matrix:

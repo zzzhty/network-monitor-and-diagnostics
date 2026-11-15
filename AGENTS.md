@@ -1,6 +1,6 @@
 # 仓库约束
 
-改完代码后运行 `python3 scripts/check_architecture.py`，再结束。CI 的 Linux 与 macOS 作业执行同一条命令。它有 error 就退出 1。不要抬高 `scripts/architecture_baseline.json` 来放过新的违规。
+改完代码后运行 `python3 scripts/check_architecture.py`，再结束。CI 的 Linux、macOS 与 Windows 作业执行同一条命令。它有 error 就退出 1。不要抬高 `scripts/architecture_baseline.json` 来放过新的违规。
 
 ## 规则与执行方式
 
@@ -8,4 +8,6 @@
 | --- | --- |
 | 面板文字在暗色和亮色下达到 WCAG AA（正文 4.5:1，大字 3:1） | `scripts/check_architecture.py`（`theme-contrast`）。对比度按 `web/*.html` 和它们引用的样式计算，不依赖浏览器。导航序号与正文一样按 4.5:1 检查，不再保留低对比度基线。`web/tests/dashboard.spec.cjs` 仍用真实计算样式检查页脚、弱化文字和未选中导航。 |
 | 新的 `tests/test_*.py` 要出现在 macOS 作业的 unittest 名单里 | `scripts/check_architecture.py`（`macos-test-list`）。Linux 用 `unittest discover`。基线里的 `macos_test_omit` 只保留已经不在名单上的模块。 |
+| `windows-tests` 在 `windows-latest` 上运行 `test_windows` | `scripts/check_architecture.py`（`windows-job`）。Linux 仍 discover 全部 `tests/test_*.py`；macOS 名单里也要有 `test_windows`。 |
+| Windows 安装不调用 `uv venv`，并保留 `python -m venv --without-pip` | `scripts/check_architecture.py`（`windows-python`）。`scripts/nmd_windows.ps1`、`install.ps1`、`nmd.ps1` 不得出现命令行 `uv venv`。说明文字可以提到 uv。智能应用控制会拦截 uv 生成的 `python.exe` 跳板。 |
 | 行为 | `python3 -m unittest discover -s tests -p 'test_*.py'` |

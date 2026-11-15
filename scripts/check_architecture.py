@@ -46,6 +46,17 @@ PRINCIPLES = {
         "for modules already absent."
     ),
     "syntax": "The architecture check has to read its inputs before the other rules can run.",
+    "windows-job": (
+        "Windows branch tests are easy to drop from the windows-latest job after "
+        "the job exists. windows-tests runs test_windows there. Linux still "
+        "discovers tests/test_*.py, and the macOS job lists modules by hand."
+    ),
+    "windows-python": (
+        "Smart App Control blocks uv-generated python.exe trampolines, including "
+        "%USERPROFILE%\\.local\\bin\\python.exe and the interpreter from uv venv. "
+        "The Windows entry must keep rejecting those paths and must keep the "
+        "stdlib recipe python -m venv --without-pip. Do not invoke uv venv."
+    ),
 }
 
 
@@ -929,10 +940,76 @@ def load_baseline(path: Path = BASELINE_PATH) -> dict[str, Any]:
     return data
 
 
+def check_windows_job(root: Path) -> list[Violation]:
+    workflow_path = root / WORKFLOW
+    if not workflow_path.is_file():
+        return []
+    text = workflow_path.read_text(encoding="utf-8")
+    job = _job_text(text, "windows-tests")
+    if job is None or "windows-latest" not in job or re.search(r"\btest_windows\b", job) is None:
+        return [_violation(
+            WORKFLOW.as_posix(),
+            1,
+            "windows-job",
+            "windows-tests must run on windows-latest and invoke test_windows.",
+            "Add a windows-tests job on windows-latest whose unittest command includes test_windows.",
+        )]
+    return []
+
+
+def _uv_venv_invocation(line: str) -> bool:
+    code = re.sub(r"#.*", "", line).strip()
+    return re.search(r"(^|[;&|])\s*uv(\.exe)?\s+venv\b", code, re.I) is not None
+
+
+def check_windows_python(root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    helper_rel = "scripts/nmd_windows.ps1"
+    helper = root / helper_rel
+    if helper.is_file():
+        text = helper.read_text(encoding="utf-8-sig")
+        for index, line in enumerate(text.splitlines(), 1):
+            if _uv_venv_invocation(line):
+                violations.append(_violation(
+                    helper_rel, index, "windows-python",
+                    "The Windows helper invokes uv venv.",
+                    "Remove that invocation. A virtual environment is created with "
+                    "python -m venv --without-pip, then uv can reuse it.",
+                ))
+        if "python -m venv --without-pip" not in text or ".local" not in text:
+            violations.append(_violation(
+                helper_rel, 1, "windows-python",
+                "The Windows helper no longer names the blocked .local\\bin launcher "
+                "and the python -m venv --without-pip recipe.",
+                "Keep both in the message shown when no usable Python is found.",
+            ))
+    for rel in ("install.ps1", "nmd.ps1"):
+        path = root / rel
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8-sig")
+        if "nmd_windows.ps1" not in text:
+            violations.append(_violation(
+                rel, 1, "windows-python",
+                f"{rel} does not load scripts/nmd_windows.ps1.",
+                "Dot-source scripts/nmd_windows.ps1 so Python discovery stays in one place.",
+            ))
+        for index, line in enumerate(text.splitlines(), 1):
+            if _uv_venv_invocation(line):
+                violations.append(_violation(
+                    rel, index, "windows-python",
+                    f"{rel} invokes uv venv.",
+                    "Remove that invocation and keep using Find-NmdPython.",
+                ))
+    return violations
+
+
 def check(root: Path, baseline: dict[str, Any]) -> list[Violation]:
     violations = [
         *check_theme_contrast(root, baseline),
         *check_macos_test_list(root, baseline),
+        *check_windows_job(root),
+        *check_windows_python(root),
     ]
     violations.sort(key=lambda item: (item.path, item.line, item.rule, item.violation))
     return violations
