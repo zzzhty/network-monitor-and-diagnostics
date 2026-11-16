@@ -736,7 +736,7 @@ class InstalledCLITests(SourceFixture):
         super().setUp()
         self.checkout = self.base / "installed-code"
         (self.checkout / "scripts").mkdir(parents=True)
-        for name in ("manager.py", "install_scope.py", "egress_sources.py", "nmd_platform.py"):
+        for name in ("manager.py", "install_scope.py", "egress_sources.py", "nmd_platform.py", "nmd_windows.py"):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         subprocess.run(["git", "init", "--quiet", str(self.checkout)], check=True, capture_output=True)
         self.saved_config = self.base / "recorded-config"

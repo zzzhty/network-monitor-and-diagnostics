@@ -5,7 +5,10 @@ A system probe follows kernel routing (including TUN); it is NOT a TUN bypass.
 """
 import contextlib
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; the Unix lock path is not used there.
+    fcntl = None
 import json
 import math
 import os
@@ -22,6 +25,7 @@ import time
 from urllib.parse import urlsplit, quote
 
 import nmd_platform
+import nmd_windows
 
 SCHEMA_VERSION = 1
 DEFAULT_CONFIG = dict(schema_version=1, interval_seconds=30, timeout_seconds=5,
@@ -110,6 +114,10 @@ def load_config(path=None):
 
 def default_config_path():
     """User-scope config location; honors an absolute XDG_CONFIG_HOME like the rest of NMD."""
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA')
+        base = Path(base) if base else Path.home() / 'AppData' / 'Roaming'
+        return base / 'nmd' / 'monitor.json'
     base = os.environ.get('XDG_CONFIG_HOME')
     base = Path(base) if base and Path(base).is_absolute() else Path.home() / '.config'
     return base / 'nmd' / 'monitor.json'
@@ -142,8 +150,42 @@ def save_config(path, config):
     return config
 
 
+def _run_windows(argv, timeout):
+    """Absolute argv, no inherited proxy environment. Kill the process on timeout.
+
+    Windows PowerShell writes UTF-16 to a pipe often enough that the decoder
+    accepts a BOM, a NUL-padded UTF-16 buffer, or UTF-8.
+    """
+    root = nmd_windows.system_root()
+    kept = ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+            'LOCALAPPDATA', 'APPDATA', 'USERNAME', 'USERDOMAIN', 'SYSTEMDRIVE')
+    env = {key: os.environ[key] for key in kept if key in os.environ}
+    env.update(PATH=root + r'\System32', SYSTEMROOT=root, WINDIR=root,
+               COMSPEC=root + r'\System32\cmd.exe', PATHEXT='.COM;.EXE;.BAT;.CMD',
+               PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=env, creationflags=flags)
+    except FileNotFoundError:
+        return None, '', 'tool_missing'
+    except OSError:
+        return None, '', 'launch_error'
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        if len(out) > 65536:
+            return None, '', 'output_too_large'
+        return proc.returncode, nmd_windows.decode_command_output(out), None
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None, '', 'timeout'
+
+
 def _run(argv, timeout):
     """Fixed argv only; no inherited proxies, curlrc, credentials or shell."""
+    if sys.platform == 'win32':
+        return _run_windows(argv, timeout)
     env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -230,12 +272,15 @@ def sample_probe(config, stop_event=None):
             continue
         timeout = cfg['timeout_seconds']
         if p['type'] == 'http':
-            argv = ['/usr/bin/curl', '--disable', '--globoff', '--silent', '--head', '--output', '/dev/null',
-                    '--max-time', str(timeout), '--connect-timeout', str(timeout),
-                    '--max-redirs', '0', '--proto', '=http,https', '--write-out',
-                    '%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}']
-            argv += ['--proxy', p['proxy'], '--noproxy', ''] if p['path'] == 'proxy' else ['--proxy', '']
-            argv += ['--url', p['target']]
+            if nmd_platform.name() == 'windows':
+                argv = nmd_windows.http_probe_argv(p, timeout)
+            else:
+                argv = ['/usr/bin/curl', '--disable', '--globoff', '--silent', '--head', '--output', '/dev/null',
+                        '--max-time', str(timeout), '--connect-timeout', str(timeout),
+                        '--max-redirs', '0', '--proto', '=http,https', '--write-out',
+                        '%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}']
+                argv += ['--proxy', p['proxy'], '--noproxy', ''] if p['path'] == 'proxy' else ['--proxy', '']
+                argv += ['--url', p['target']]
         else:
             u = urlsplit('tcp://' + p['target'])
             argv = [sys.executable, '-I', '-c', _SOCKET_CODE, p['type'], u.hostname,
@@ -295,6 +340,124 @@ class _StateDirectory:
         return nmd_platform.database_path(self.fd)
 
 
+class _WindowsStateDirectory:
+    """Verified absolute directory. Windows has no dir_fd or /proc identity path.
+
+    Reparse points (symlinks and junctions) are rejected while walking. Privacy
+    is the user-profile ACL, not POSIX mode bits. A same-user process is outside
+    this boundary, the same limit the Unix walk already documents.
+    """
+    def __init__(self, path):
+        self.path = str(path)
+        self.fd = None
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    @property
+    def database_path(self):
+        return str(Path(self.path) / 'monitor.sqlite3')
+
+
+def _windows_reparse(path):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool((getattr(info, 'st_file_attributes', 0) or 0) & 0x400)
+
+
+def _directory_windows(path, create=False):
+    if isinstance(path, _WindowsStateDirectory):
+        return _WindowsStateDirectory(path.path)
+    text = os.fspath(path)
+    if '\x00' in text or '..' in Path(text).parts:
+        raise ValueError('unsafe_state_directory_component')
+    absolute = Path(os.path.abspath(text))
+    if not absolute.is_absolute() or '..' in absolute.parts:
+        raise ValueError('unsafe_state_directory_component')
+    current = Path(absolute.parts[0])
+    if _windows_reparse(current):
+        raise ValueError('symlink_or_invalid_state_directory')
+    for name in absolute.parts[1:]:
+        if name in ('.', '..') or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise ValueError('unsafe_state_directory_component')
+        child = current / name
+        if child.exists() or child.is_symlink():
+            if _windows_reparse(child) or not child.is_dir():
+                raise ValueError('symlink_or_invalid_state_directory')
+        elif create:
+            child.mkdir()
+            if _windows_reparse(child) or not child.is_dir():
+                raise ValueError('symlink_or_invalid_state_directory')
+        else:
+            raise FileNotFoundError(child)
+        current = child
+    return _WindowsStateDirectory(current)
+
+
+def _regular_windows(directory, name, create=False):
+    if name != os.path.basename(name) or name in ('.', '..'):
+        raise ValueError('unsafe_state_file')
+    path = Path(directory.path) / name
+    if _windows_reparse(path):
+        raise ValueError('unsafe_state_file')
+    flags = os.O_RDWR | (os.O_CREAT if create else os.O_RDONLY)
+    try:
+        fd = os.open(os.fspath(path), flags, 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('unsafe_state_file')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _windows_readonly_uri(path):
+    text = Path(path).as_posix()
+    if re.fullmatch(r'[A-Za-z]:/.*', text):
+        return 'file:///' + quote(text, safe='/:') + '?mode=ro'
+    return 'file:' + quote(text, safe='/') + '?mode=ro'
+
+
+@contextlib.contextmanager
+def _collector_lock_windows(state_dir):
+    import msvcrt
+    directory = _directory_windows(state_dir, True)
+    fd = _regular_windows(directory, 'collector.lock', create=True)
+    try:
+        if os.lseek(fd, 0, os.SEEK_END) < 1:
+            os.write(fd, b'\0')
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if getattr(exc, 'winerror', None) in (32, 33) or exc.errno in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                raise RuntimeError('collector_already_running') from None
+            raise
+        try:
+            yield directory
+        finally:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
 def _check_directory(fd, leaf=False):
     st = os.fstat(fd)
     mode = stat.S_IMODE(st.st_mode)
@@ -307,6 +470,10 @@ def _check_directory(fd, leaf=False):
 
 
 def _directory(path, create=False):
+    if isinstance(path, _WindowsStateDirectory):
+        return _WindowsStateDirectory(path.path)
+    if sys.platform == 'win32':
+        return _directory_windows(path, create)
     if isinstance(path, _StateDirectory):
         return _StateDirectory(os.dup(path.fd))
     # Do not resolve symlinks or normalize away '..' before validating components.
@@ -345,6 +512,8 @@ def _directory(path, create=False):
 
 
 def _regular(directory, name, create=False):
+    if isinstance(directory, _WindowsStateDirectory):
+        return _regular_windows(directory, name, create)
     flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     flags |= os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
     try:
@@ -378,6 +547,10 @@ def _check_database_files(directory):
 
 @contextlib.contextmanager
 def collector_lock(state_dir):
+    if sys.platform == 'win32':
+        with _collector_lock_windows(state_dir) as directory:
+            yield directory
+        return
     with _directory(state_dir, True) as directory:
         fd = _regular(directory, 'collector.lock', create=True)
         try:
@@ -484,7 +657,8 @@ class Store:
         now = cycle_end
         self.setmeta('last_sample_at', now)
         self.setmeta('interval_seconds', self.config['interval_seconds'])
-        self.setmeta('expected_cycle_seconds', max(self.config['interval_seconds'], (4 if nmd_platform.name() == 'macos' else 2) + sum(p.get('enabled', True) for p in self.config['probes']) * (self.config['timeout_seconds'] + 0.5)))
+        overhead = {'macos': 4, 'windows': 5}.get(nmd_platform.name(), 2)
+        self.setmeta('expected_cycle_seconds', max(self.config['interval_seconds'], overhead + sum(p.get('enabled', True) for p in self.config['probes']) * (self.config['timeout_seconds'] + 0.5)))
         cutoff = now - self.config['retention_hours'] * 3600
         n = self.config['max_samples']
         maximum = self.db.execute('SELECT COALESCE(MAX(id),0) FROM auto_events').fetchone()[0]
@@ -590,7 +764,10 @@ def read_snapshot(state_dir, limit=100):
         fd = _regular(directory, 'monitor.sqlite3')
         if fd is None: return result
         os.close(fd)
-        db = sqlite3.connect('file:' + quote(directory.database_path, safe='/') + '?mode=ro', uri=True)
+        if isinstance(directory, _WindowsStateDirectory):
+            db = sqlite3.connect(_windows_readonly_uri(directory.database_path), uri=True)
+        else:
+            db = sqlite3.connect('file:' + quote(directory.database_path, safe='/') + '?mode=ro', uri=True)
         db.row_factory = sqlite3.Row
         try:
             db.execute('PRAGMA query_only=ON')

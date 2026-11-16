@@ -368,9 +368,14 @@
     $('auto-actions').hidden = !canControl;
     text('sidebar-mode', canControl ? '观察与出口控制' : configManagementEnabled() ? '观察与配置编辑' : '只读观察模式');
     $('demo-notice').hidden = !demoMode;
-    const platformName = { macos: 'macOS', linux: 'Linux', unsupported: '未支持的平台' }[capabilities?.platform];
+    const platformName = { macos: 'macOS', linux: 'Linux', windows: 'Windows', unsupported: '未支持的平台' }[capabilities?.platform];
     const configHint = configManagementEnabled() ? '；监控配置可在「设置与帮助」页编辑。' : '。';
-    text('platform-capabilities', platformName ? `${platformName} · ${canControl ? '本机出口控制' : configManagementEnabled() ? '只读诊断与配置编辑' : '只读面板'}${capabilities.platform === 'macos' ? ` · systemd 服务、后台安装和网络管理不支持；不读取出口来源配置${configHint}` : ''}` : '平台能力未知。');
+    const platformNote = capabilities?.platform === 'macos'
+      ? ` · systemd 服务、后台安装和网络管理不支持；不读取出口来源配置${configHint}`
+      : capabilities?.platform === 'windows'
+        ? ` · 计划任务在登录后采集；不管理系统网络或出口来源${configHint}`
+        : '';
+    text('platform-capabilities', platformName ? `${platformName} · ${canControl ? '本机出口控制' : configManagementEnabled() ? '只读诊断与配置编辑' : '只读面板'}${platformNote}` : '平台能力未知。');
     $('config-card').hidden = !configManagementEnabled();
     $('config-unavailable').hidden = configManagementEnabled() || capabilities === null;
     if (configManagementEnabled() && !configState && !configLoading) loadConfig();

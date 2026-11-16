@@ -3,6 +3,8 @@
 家庭网络分流：国内和私网直连，其余经 Tailscale 内的 VPS SOCKS5 出海。
 Tailscale 登录、控制服务、DERP 和 MagicDNS 独立于 VPS 代理。
 
+Linux 作为服务器或网关，由 NMD 部署系统 mihomo，用 TUN 接管整机流量。macOS 与 Windows 上，NMD 的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期客户端仍在调研（具体软件调研中，待定）。分工和规划中的配置校验见 [跨平台分工](docs/platforms.md)。
+
 可选的[出口通道 Channel](docs/egress-sources.md)复用已有 source 注册表：默认添加 Tailnet 直连
 VPS 通道，也支持手工普通路径 SOCKS5 与（可选的）订阅通道，并重命名显示名称而不改变节点 ID。
 Channel 管理连接来源，Node 表示实际出口，Policy 只引用两个明确主备节点，可选任意通道
@@ -29,6 +31,23 @@ CLI、SQLite 历史、事件/空窗逻辑及只读 GUI 复用现有实现。macO
 真实本机采样需另行显式运行前台 `monitor run`；本次验证仅用 fixtures 与回环服务。
 使用方式、状态目录限制和实验边界见 [macOS 使用说明](docs/macos.md)。
 下文的安装、后台服务和网络管理流程仍仅针对 Linux；macOS CLI 会提前拒绝这些命令。
+
+## Windows 本机采集
+
+Windows 可以在当前用户下安装本机采集和诊断，不部署 mihomo、Tailscale 或 VPS，也不改系统网络。
+后台用当前用户的计划任务（登录期间运行），不是 Windows 服务。安装不启动任务，也不加登录触发；
+`enable` 只加登录触发，`start` / `stop` 另算。说明、路径和 Town 上的核对命令见
+[Windows 使用说明](docs/windows.md)。
+
+智能应用控制（Smart App Control）会拦截 uv 生成的 `python.exe` 跳板，包括
+`%USERPROFILE%\.local\bin\python.exe` 和 `uv venv` 建出的 `.venv\Scripts\python.exe`。
+安装脚本不会调用 `uv venv`。需要虚拟环境时，用已经能运行的 python：
+
+```powershell
+python -m venv --without-pip .venv
+```
+
+之后 `uv pip install`、`uv sync` 或 `uv run` 会复用这个环境。采集器只用标准库，安装本身不建虚拟环境。
 
 ## 安装范围与目录分工
 

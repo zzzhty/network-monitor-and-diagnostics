@@ -6,7 +6,11 @@ The privileged local-setup.sh remains the owner of systemd and /etc/mihomo.
 """
 import argparse
 from contextlib import contextmanager
-import fcntl
+import errno
+try:
+    import fcntl
+except ImportError:  # Windows lock uses msvcrt; Unix installs still flock.
+    fcntl = None
 import hashlib
 import json
 import os
@@ -35,9 +39,19 @@ class ManagerError(Exception):
     pass
 
 
+def _euid():
+    """POSIX effective uid. None on Windows, where those checks do not run."""
+    geteuid = getattr(os, "geteuid", None)
+    return None if geteuid is None else geteuid()
+
+
 def run(*args, cwd=None, capture=False):
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
     result = subprocess.run([str(a) for a in args], cwd=cwd, check=True,
-                            text=True, stdout=subprocess.PIPE if capture else None)
+                            text=True, stdout=subprocess.PIPE if capture else None, **kwargs)
     return result.stdout.strip() if capture else None
 
 
@@ -49,8 +63,14 @@ def setting(root, key, value=None):
     if value is not None:
         run("git", "config", "--file", root / ".git/config", "nmd." + key, str(value))
         return value
+    kwargs = {}
+    if sys.platform == "win32":
+        # Git stores the value as UTF-8. text=True alone follows the ANSI code
+        # page, so a profile path such as José is misread before UTF-8 mode.
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
     result = subprocess.run(["git", "config", "--file", str(root / ".git/config"),
-                             "--get", "nmd." + key], capture_output=True, text=True)
+                             "--get", "nmd." + key], capture_output=True, text=True, **kwargs)
     if result.returncode not in (0, 1):
         raise ManagerError(f"无法读取安装状态: {root}")
     return result.stdout.strip()
@@ -81,13 +101,16 @@ def trusted_system_checkout(root, ancestors=True):
 
 def managed(root):
     if not (root / ".git").is_dir() or setting(root, "home") != str(root):
+        if sys.platform == "win32":
+            raise ManagerError("当前是源码仓库。请先运行 install.ps1，再通过新终端里的 nmd 管理安装。")
         raise ManagerError("当前是源码仓库。请先运行 ./install.sh，再通过 PATH 中的 nmd 管理安装。")
     scope = scope_of(root)
     if scope == "system" and root.stat().st_uid != 0:
         raise ManagerError("系统安装代码必须由 root 拥有。")
     if scope == "system":
         trusted_system_checkout(root)
-    if root.stat().st_uid != os.geteuid():
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and root.stat().st_uid != geteuid():
         if scope == "system":
             raise ManagerError("系统安装管理需管理员显式运行 sudo /opt/nmd/nmd；个人安装不加 sudo。")
         raise ManagerError("请以个人安装目录的所属用户运行 nmd，不要在外层加 sudo。")
@@ -100,14 +123,33 @@ def clean(root):
         raise ManagerError("管理安装必须位于 main 分支；请先检查本地分支状态。")
 
 
-@contextmanager
-def lock(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
+def _lock_handle(handle):
+    if fcntl is not None:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ManagerError("另一个安装/更新/管理操作正在运行，请稍后重试。") from exc
+        return
+    import msvcrt
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() < 1:
+        handle.write("\0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in (32, 33) or exc.errno in (
+                errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+            raise ManagerError("另一个安装/更新/管理操作正在运行，请稍后重试。") from exc
+        raise
+
+
+@contextmanager
+def lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        _lock_handle(handle)
         yield
 
 
@@ -125,7 +167,89 @@ def migration_targets(migrate_from):
     return {old / "mihomoctl", old / "nmd"}
 
 
+def preflight_windows_links(root, bindir):
+    import nmd_windows
+    if nmd_windows.command_inside_checkout(root, bindir) or nmd_windows.command_dir_blocked(bindir):
+        raise ManagerError("命令目录必须在安装仓库之外，且不能放在 .local\\bin。智能应用控制会拦截那里的可执行文件。")
+    path = Path(bindir) / "nmd.cmd"
+    entry = Path(bindir) / "nmd-entry.ps1"
+    if not path.exists() and not entry.exists():
+        return
+    try:
+        text = entry.read_text(encoding="utf-8-sig", errors="replace") if entry.exists() else ""
+    except OSError as exc:
+        raise ManagerError(f"命令路径已被占用，未覆盖: {path}") from exc
+    if "Managed by NMD install_scope:" not in text or str(root) not in text:
+        raise ManagerError(f"命令路径已被占用，未覆盖: {path}")
+
+
+def _windows_user_path(value=None):
+    import winreg
+    access = winreg.KEY_READ | (winreg.KEY_SET_VALUE if value is not None else 0)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, access) as key:
+        if value is None:
+            try:
+                current, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                return ""
+            return current
+        winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, value)
+    import ctypes
+    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 2, 5000, None)
+    return value
+
+
+def install_windows_links(root, bindir, register_path=True):
+    import nmd_windows
+    preflight_windows_links(root, bindir)
+    bindir = Path(bindir)
+    try:
+        nmd_windows.require_interpreter(sys.executable)
+    except nmd_windows.InterpreterError as exc:
+        raise ManagerError(str(exc)) from exc
+    bindir.mkdir(parents=True, exist_ok=True)
+    path = bindir / "nmd.cmd"
+    path.write_bytes(nmd_windows.render_cmd().encode("ascii"))
+    entry = bindir / "nmd-entry.ps1"
+    entry.write_bytes(b"\xef\xbb\xbf" + nmd_windows.render_entry_ps1(sys.executable, root).encode("utf-8"))
+    if register_path:
+        current = _windows_user_path()
+        merged = nmd_windows.merge_user_path(current, bindir)
+        if merged is not None:
+            _windows_user_path(merged)
+            print(f"已写入用户 PATH: {bindir}。请打开新的终端后再运行 nmd。", flush=True)
+    setting(root, "binDir", bindir)
+    setting(root, "python", sys.executable)
+    print(f"命令入口: {path}", flush=True)
+
+
+def remove_windows_links(root, bindir):
+    import nmd_windows
+    path = Path(bindir) / "nmd.cmd"
+    entry = Path(bindir) / "nmd-entry.ps1"
+    owned = False
+    if entry.is_file():
+        text = entry.read_text(encoding="utf-8-sig", errors="replace")
+        owned = "Managed by NMD install_scope:" in text and str(root) in text
+        if owned:
+            entry.unlink()
+            if path.is_file():
+                path.unlink()
+    task = Path(bindir) / "nmd-monitor-task.ps1"
+    if task.is_file():
+        text = task.read_text(encoding="utf-8", errors="replace")
+        if str(root) in text and "Managed by NMD install_scope:" in text:
+            task.unlink()
+    if sys.platform == "win32":
+        current = _windows_user_path()
+        removed = nmd_windows.remove_user_path(current, bindir)
+        if removed is not None:
+            _windows_user_path(removed)
+
+
 def preflight_links(root, bindir, migrate_from=None):
+    if sys.platform == "win32":
+        return preflight_windows_links(root, bindir)
     allowed = {root / "nmd"} | migration_targets(migrate_from)
     path = bindir / "nmd"
     if path.exists() or path.is_symlink():
@@ -134,6 +258,8 @@ def preflight_links(root, bindir, migrate_from=None):
 
 
 def install_links(root, bindir, migrate_from=None, register_path=True):
+    if sys.platform == "win32":
+        return install_windows_links(root, bindir, register_path=register_path)
     preflight_links(root, bindir, migrate_from)
     bindir.mkdir(parents=True, exist_ok=True)
     path = bindir / "nmd"
@@ -164,6 +290,13 @@ def install_links(root, bindir, migrate_from=None, register_path=True):
 
 
 def validate_code(root):
+    if sys.platform == "win32":
+        for name in ("install.ps1", "nmd.ps1", "nmd.cmd", "scripts/nmd_windows.ps1"):
+            if not (root / name).is_file():
+                raise ManagerError(f"缺少 Windows 入口: {name}")
+        for path in (root / "scripts").glob("*.py"):
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        return
     for name in ("install.sh", "nmd", "local-setup.sh"):
         run("bash", "-n", root / name)
     for path in (root / "scripts").glob("*.py"):
@@ -200,13 +333,15 @@ def deploy(root, command="deploy"):
 
 def bootstrap(args):
     scope = "system" if args.system else "user"
+    if nmd_platform.name() == "windows" and scope == "system":
+        raise ManagerError("Windows 只支持当前用户安装，不支持 --system。网络部署与系统服务仍仅限 Linux。")
     if nmd_platform.name() == "macos" and (scope == "system" or not args.manager_only):
         # macOS owns the desktop shell and read-only diagnostics only; the monitor
         # unit and network deployment stay Linux-only.
         raise ManagerError("macOS 仅支持个人范围 --manager-only 安装；网络部署与采集服务仍仅限 Linux。")
     if scope == "user" and os.environ.get("SUDO_USER"):
         raise ManagerError("个人安装请去掉 sudo；sudo 不会选择系统模式。系统安装需显式 --system。")
-    if scope == "system" and os.geteuid() != 0:
+    if scope == "system" and _euid() != 0:
         raise ManagerError("--system 需要管理员显式以 root 运行安装器。")
     defaults = install_scope.paths(scope)
     args.home = args.home or defaults["home"]
@@ -296,6 +431,20 @@ def update(root, check_only):
 
 
 def monitor_install(root):
+    if nmd_platform.name() == "windows":
+        python = Path(sys.executable)
+        import nmd_windows
+        try:
+            nmd_windows.require_interpreter(python)
+        except nmd_windows.InterpreterError as exc:
+            raise ManagerError(str(exc)) from exc
+        install_scope.install_windows_monitor(
+            root, Path(setting(root, "configDir")), Path(setting(root, "stateDir")),
+            Path(setting(root, "binDir")), python)
+        setting(root, "python", python)
+        setting(root, "monitorInstalled", "true")
+        print("已登记计划任务；未启动，也未设置登录时运行。需要时再执行 nmd monitor enable 或 nmd monitor start。", flush=True)
+        return
     install_scope.install_monitor(root, scope_of(root),
                                   Path(setting(root, "configDir")), Path(setting(root, "stateDir")))
     setting(root, "monitorInstalled", "true")
@@ -457,7 +606,7 @@ def _desktop_check(path, key, receipt):
     info = path.stat()
     owned = receipt["files"].get(key) if receipt else None
     if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-            or info.st_uid != os.geteuid() or info.st_mode & 0o022
+            or info.st_uid != _euid() or info.st_mode & 0o022
             or not owned or owned["size"] != info.st_size
             or _desktop_fingerprint(path) != owned):
         raise ManagerError(f"desktop_file_not_owned:文件不属于此安装或已被修改;未覆盖/删除: {path}")
@@ -641,6 +790,11 @@ def _desktop_status(root, paths):
 
 
 def monitor_uninstall(root):
+    if nmd_platform.name() == "windows":
+        install_scope.windows_task(root, Path(setting(root, "binDir")), "uninstall")
+        setting(root, "monitorInstalled", "false")
+        print("已删除计划任务；保留配置、日志与历史。", flush=True)
+        return
     install_scope.uninstall_monitor(root, scope_of(root),
                                     Path(setting(root, "configDir")), Path(setting(root, "stateDir")))
     setting(root, "monitorInstalled", "false")
@@ -650,13 +804,13 @@ def adopt(root, scope):
     # An explicit receipt repair only; never move a checkout or change ownership.
     if not (root / ".git").is_dir() or setting(root, "home") != str(root):
         raise ManagerError("adopt 只适用于路径未变化的旧管理安装；不能直接 mv 安装目录。")
-    if root.stat().st_uid != os.geteuid():
+    if root.stat().st_uid != _euid():
         raise ManagerError("必须由安装所属用户执行 adopt。")
     old = setting(root, "scope")
     if old and old != scope:
         raise ManagerError("adopt 不能切换 scope；请卸载旧 monitor 后在新路径显式安装。")
     defaults = install_scope.paths(scope)
-    if scope == "system" and (os.geteuid() != 0 or root != defaults["home"]):
+    if scope == "system" and (_euid() != 0 or root != defaults["home"]):
         raise ManagerError("系统 adopt 要求 root-owned /opt/nmd；旧个人目录不能直接改为系统模式。")
     if scope == "system":
         trusted_system_checkout(root)
@@ -684,7 +838,32 @@ def main(argv=None):
     command = argv[0] if argv else "help"
     platform = nmd_platform.name()
     service_actions = {"install", "uninstall", "start", "stop", "restart", "enable", "disable", "logs", "service-status"}
-    if platform != "linux":
+    if platform == "windows":
+        rejected = set(SERVICE_COMMANDS) | set(MUTATING_COMMANDS) | {
+            "apply", "refresh", "install-cli", "adopt", "desktop", "source", "channel"}
+        if command in rejected:
+            raise ManagerError(
+                "此命令仅支持 Linux。Windows 只运行本机采集和诊断；"
+                "网络部署、出口来源、systemd 和桌面壳安装不在此平台。")
+        if command in {"help", "--help", "-h"}:
+            print("NMD Windows：本机采集与诊断（不接管流量）\n"
+                  "  demo [--once] [--port PORT]  临时合成数据演示\n"
+                  "  monitor config-check --config FILE\n"
+                  "  monitor run --config FILE [--state-dir DIR] [--once]  前台采集\n"
+                  "  monitor status [--state-dir DIR]\n"
+                  "  monitor install    登记当前用户的计划任务，不启动、不设登录触发\n"
+                  "  monitor enable     登录时启动；不立即采集\n"
+                  "  monitor disable    取消登录触发；不停止正在运行的采集\n"
+                  "  monitor start|stop|restart|service-status|logs|uninstall\n"
+                  "  gui [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
+                  "  machine capabilities | machine status\n"
+                  "  bootstrap          当前用户安装（不要加 --system）\n"
+                  "  update [--check]   快进更新代码，不部署网络、不重启任务\n"
+                  "  install / uninstall\n"
+                  "Linux 的 mihomo、Tailscale、VPS 与 systemd 在 Windows 不支持。\n"
+                  "计划任务在登录后运行，不等同于开机即采集。详见 docs/windows.md。")
+            return
+    if platform not in ("linux", "windows"):
         allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
         if platform == "macos":
             # User-level shell lifecycle and managed-install code updates only;
@@ -752,6 +931,13 @@ def main(argv=None):
                 monitor_install(ROOT)
             elif argv[1] == "uninstall":
                 monitor_uninstall(ROOT)
+            elif nmd_platform.name() == "windows":
+                if argv[1] == "logs":
+                    install_scope.windows_logs(Path(setting(ROOT, "stateDir")) / "monitor.log")
+                else:
+                    install_scope.windows_task(
+                        ROOT, Path(setting(ROOT, "binDir")),
+                        "status" if argv[1] == "service-status" else argv[1])
             else:
                 install_scope.check_monitor(ROOT, scope_of(ROOT), Path(setting(ROOT, "configDir")))
                 install_scope.service(scope_of(ROOT), "status" if argv[1] == "service-status" else argv[1])
@@ -785,8 +971,13 @@ def main(argv=None):
                         account = pwd.getpwnam("nmd-monitor")
                     except KeyError:
                         raise ManagerError("系统 monitor 尚未安装；管理员先运行 nmd monitor install。")
-                    if os.geteuid() != account.pw_uid:
+                    if _euid() != account.pw_uid:
                         raise ManagerError("系统监控数据仅限 nmd-monitor UID；GUI/读取请由管理员以该身份运行，或使用个人模式。不会放宽权限。")
+            elif (platform == "windows" and command != "demo"
+                    and (ROOT / ".git").is_dir() and setting(ROOT, "home") == str(ROOT)):
+                kwargs = {"state_dir": Path(setting(ROOT, "stateDir")),
+                          "config_file": Path(setting(ROOT, "configDir")) / "monitor.json",
+                          "sources_dir": None}
             elif (platform == "macos" and command == "gui"
                     and (ROOT / ".git").is_dir() and setting(ROOT, "home") == str(ROOT)):
                 # Manager-only install: the dashboard edits the recorded config
@@ -836,10 +1027,14 @@ def main(argv=None):
                 monitor_install(ROOT)
             else:
                 monitor_uninstall(ROOT)
-                link = Path(setting(ROOT, "binDir")) / "nmd"
-                if link.is_symlink() and link_target(link) == ROOT / "nmd":
-                    link.unlink()
-                print("已卸载 monitor 和所属命令链接；保留代码、配置与历史，不影响 mihomo/tailscaled。")
+                if nmd_platform.name() == "windows":
+                    remove_windows_links(ROOT, Path(setting(ROOT, "binDir")))
+                    print("已卸载计划任务和 nmd.cmd；保留代码、配置与历史。")
+                else:
+                    link = Path(setting(ROOT, "binDir")) / "nmd"
+                    if link.is_symlink() and link_target(link) == ROOT / "nmd":
+                        link.unlink()
+                    print("已卸载 monitor 和所属命令链接；保留代码、配置与历史，不影响 mihomo/tailscaled。")
     elif command in ("apply", "refresh"):
         with lock(ROOT / ".git" / "nmd.lock"):
             deploy(ROOT, "apply")

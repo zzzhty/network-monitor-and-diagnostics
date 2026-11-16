@@ -6,11 +6,17 @@ from pathlib import Path
 import stat
 import sys
 
+import nmd_windows
+
 
 def name():
     if sys.platform.startswith('linux'):
         return 'linux'
-    return 'macos' if sys.platform == 'darwin' else 'unsupported'
+    if sys.platform == 'darwin':
+        return 'macos'
+    if sys.platform == 'win32':
+        return 'windows'
+    return 'unsupported'
 
 
 def state_parts(parts):
@@ -143,6 +149,34 @@ def _macos_sample(run):
     return local
 
 
+def _windows_sample(run):
+    """One bounded PowerShell query for adapter status and IPv4 prefixes.
+
+    Enum names from Get-NetAdapter stay in English. Destination prefixes are
+    hashed; gateway addresses are not retained. A failure stays unknown.
+    """
+    local = _empty_local('windows')
+    code, output, error = run(nmd_windows.sample_argv(), 5)
+    if code != 0 or error:
+        reason = error or 'interface_query_unavailable'
+        local['interface_observation_error'] = reason
+        local['route_observation_error'] = error or 'route_query_unavailable'
+        return local
+    parsed = nmd_windows.parse_local_sample(output)
+    if parsed['states'] and not parsed['foreign']:
+        local.update(interfaces=sorted(parsed['states']), interface_states=parsed['states'],
+                     status='observed', error=None)
+    else:
+        local['interface_observation_error'] = 'invalid_interface_output'
+    if parsed['recognized'] and not parsed['foreign']:
+        local['route_fingerprint'] = nmd_windows.route_fingerprint(parsed['routes'])
+        local['ipv4_default_routes'] = sum(item == '0.0.0.0/0' for item in parsed['routes'])
+        local.update(status='observed', error=None)
+    else:
+        local['route_observation_error'] = 'invalid_route_output'
+    return local
+
+
 def sample_local(run):
     """Read a bounded, fixed set of passive OS metadata, never tool configs.
 
@@ -154,6 +188,8 @@ def sample_local(run):
         return _linux_sample(run)
     if platform == 'macos':
         return _macos_sample(run)
+    if platform == 'windows':
+        return _windows_sample(run)
     result = _empty_local(platform)
     result.update(error='unsupported_platform', interface_observation_error='unsupported_platform',
                   route_observation_error='unsupported_platform')
@@ -162,15 +198,25 @@ def sample_local(run):
 
 def capabilities():
     platform = name()
+    if platform == 'macos':
+        limitations = ['systemd_services_unsupported', 'background_service_unsupported',
+                       'network_management_unsupported', 'egress_sources_disabled']
+    elif platform == 'windows':
+        limitations = ['systemd_services_unsupported', 'network_management_unsupported',
+                       'egress_sources_disabled']
+    elif platform == 'unsupported':
+        limitations = ['unsupported_platform']
+    else:
+        limitations = []
     return dict(schema_version=1, component='nmd-observability', read_only_gui=platform != 'linux',
                 local_egress_control=platform == 'linux',
                 commands=['monitor run', 'monitor status', 'monitor config-check', 'gui', 'demo'],
-                platform=platform, supported_platforms=['linux', 'macos'],
+                platform=platform, supported_platforms=['linux', 'macos', 'windows'],
                 network_mutations=False, native_desktop=False,
-                local_observations=dict(interfaces=platform in ('linux', 'macos'),
-                                        ipv4_routes=platform in ('linux', 'macos'),
+                local_observations=dict(interfaces=platform in ('linux', 'macos', 'windows'),
+                                        ipv4_routes=platform in ('linux', 'macos', 'windows'),
                                         systemd_services=platform == 'linux'),
-                background_service=platform == 'linux',
-                limitations=(['systemd_services_unsupported', 'background_service_unsupported',
-                              'network_management_unsupported', 'egress_sources_disabled'] if platform == 'macos'
-                             else ['unsupported_platform'] if platform == 'unsupported' else []))
+                background_service=platform in ('linux', 'windows'),
+                background_mechanism=('systemd' if platform == 'linux'
+                                      else 'scheduled_task' if platform == 'windows' else None),
+                limitations=limitations)

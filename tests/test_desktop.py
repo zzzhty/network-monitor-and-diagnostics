@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import manager
 
-SCRIPTS = ("manager.py", "install_scope.py", "egress_sources.py", "nmd_platform.py")
+SCRIPTS = ("manager.py", "install_scope.py", "egress_sources.py", "nmd_platform.py", "nmd_windows.py")
 
 
 class DesktopFixture(unittest.TestCase):

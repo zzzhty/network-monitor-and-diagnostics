@@ -3,14 +3,22 @@
 System installation is deliberately explicit: its caller must already be root.
 Installing a unit does not enable/start it and never enables user lingering.
 """
-import grp
 import json
 import os
 from pathlib import Path
-import pwd
 import stat
 import subprocess
+import sys
 import tempfile
+
+try:
+    import grp
+    import pwd
+except ImportError:  # Windows has no POSIX account modules; system scope stays Linux-only.
+    grp = None
+    pwd = None
+
+import nmd_windows
 
 UNIT_NAME = "nmd-monitor.service"
 SERVICE_USER = "nmd-monitor"
@@ -33,8 +41,13 @@ def paths(scope, home=None):
 
     An explicit home isolates all user paths from the process's XDG variables.
     Relative XDG values are ignored, as required by the XDG specification.
+    Windows user paths live under LocalAppData and AppData, never ~/.local/bin.
     """
     _scope(scope)
+    if sys.platform == "win32":
+        if scope != "user":
+            raise ScopeError("Windows 只支持当前用户安装；系统范围仍仅限 Linux。")
+        return nmd_windows.paths_from_env(home)
     if scope == "system":
         result = dict(home=Path("/opt/nmd"), bin_dir=Path("/usr/local/bin"),
                       config_dir=Path("/etc/nmd"), state_dir=Path("/var/lib/nmd-monitor"),
@@ -76,7 +89,8 @@ def _plain_path(path):
 
 
 def _require_root(scope):
-    if scope == "system" and os.geteuid() != 0:
+    geteuid = getattr(os, "geteuid", None)
+    if scope == "system" and (geteuid is None or geteuid() != 0):
         raise ScopeError("system 范围操作需要 root；请显式使用 sudo nmd。")
 
 
@@ -187,6 +201,8 @@ def _validate_system_code(root):
 
 
 def _ensure_system_account():
+    if grp is None or pwd is None:
+        raise ScopeError("系统账户仅支持 Linux。")
     try:
         account = pwd.getpwnam(SERVICE_USER)
     except KeyError:
@@ -322,3 +338,94 @@ def uninstall_monitor(root, scope, config_dir, state_dir):
     unit.unlink()
     _systemctl(scope, "daemon-reload")
     return True
+
+
+def _write_exact(path, data):
+    """Write bytes unchanged. Text mode on Windows would turn CRLF into CRCRLF."""
+    path = _plain_path(path)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _ensure_dir(path):
+    path = _plain_path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def run_powershell(script):
+    import base64
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    completed = subprocess.run(
+        [nmd_windows.powershell_exe(), "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+        check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise ScopeError(detail or "计划任务命令失败。")
+    if completed.stdout.strip():
+        print(completed.stdout.strip(), flush=True)
+    return completed
+
+
+def install_windows_monitor(root, config_dir, state_dir, bin_dir, python, runner=None):
+    """Register the current user's scheduled task. Does not start it or add a logon trigger."""
+    python = nmd_windows.require_interpreter(python)
+    if nmd_windows.command_inside_checkout(root, bin_dir) or nmd_windows.command_dir_blocked(bin_dir):
+        raise ScopeError("命令目录必须在安装仓库之外，且不能放在 .local\\bin。")
+    root = _plain_path(root)
+    config_dir = _ensure_dir(config_dir)
+    state_dir = _ensure_dir(state_dir)
+    bin_dir = _ensure_dir(bin_dir)
+    config_file = config_dir / "monitor.json"
+    _plain_path(config_file)
+    from nmd_monitor import load_config
+    if config_file.exists() or config_file.is_symlink():
+        if config_file.is_symlink() or not config_file.is_file():
+            raise ScopeError(f"配置文件不是普通文件，未修改: {config_file}")
+        load_config(config_file)
+    else:
+        template = root / "examples/monitor-local.json"
+        load_config(template)
+        _atomic_write(config_file, template.read_text(encoding="utf-8"), 0o600)
+    task_script = bin_dir / "nmd-monitor-task.ps1"
+    observability = root / "scripts" / "observability.py"
+    if not observability.is_file():
+        raise ScopeError("缺少监控代码: observability.py")
+    body = nmd_windows.render_task_script(
+        python, observability, config_file, state_dir, state_dir / "monitor.log", root)
+    _write_exact(task_script, b"\xef\xbb\xbf" + body.encode("utf-8"))
+    script = nmd_windows.task_powershell("install", root, task_script, root)
+    if runner is None:
+        run_powershell(script)
+    else:
+        runner(script)
+    return task_script
+
+
+def windows_task(root, bin_dir, action, runner=None):
+    task_script = Path(bin_dir) / "nmd-monitor-task.ps1"
+    if action != "status" and not task_script.is_file():
+        raise ScopeError("监控任务尚未安装；请先运行 nmd monitor install。")
+    script = nmd_windows.task_powershell(action, root, task_script, root)
+    if runner is None:
+        run_powershell(script)
+    else:
+        runner(script)
+    return script
+
+
+def windows_logs(log_path):
+    text = nmd_windows.tail_log(log_path)
+    print(text or "尚无采集日志。", flush=True)

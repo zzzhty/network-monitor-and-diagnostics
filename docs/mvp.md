@@ -5,11 +5,12 @@
 CLI 和 GUI 相互独立：关闭 GUI 不会停止监控；mihomo 停止时仍可收集本机信息。
 当前 GUI 以本机浏览器界面为主；`apps/desktop/src-tauri` 提供实验性 Tauri 桌面壳
 （窗口、托盘、自动切换系统通知，见 [desktop.md](desktop.md)），逻辑仍唯一由
-Python 拥有。Windows 适配器与桌面打包属于后续工作，本版不宣称跨平台网络管理已经完成。
+Python 拥有。Windows 本机采集与诊断见 [windows.md](windows.md)：用户级计划任务，不管理系统网络。桌面壳的本机安装仍是 Linux 与 macOS。本版不宣称跨平台网络管理已经完成。
 
 macOS 源码诊断、状态存储及只读面板已加入实验支持，见 [macOS 使用说明](macos.md)。
-Linux 与 macOS 的本机信息通过 `scripts/nmd_platform.py` 隔离，采集周期、SQLite、事件、
-空窗与 HTTP API 继续共用。下述 systemd 与网络管理部分仅适用于 Linux。
+Linux、macOS 与 Windows 的本机信息通过 `scripts/nmd_platform.py` 隔离，采集周期、SQLite、事件、
+空窗与 HTTP API 继续共用。Windows 用当前用户的计划任务代替 systemd，见 [windows.md](windows.md)。
+下述 systemd 与网络管理部分仅适用于 Linux。
 `./nmd demo` 提供自动清理的临时合成数据演示，始终显示模拟标识，不运行真实采集。
 
 ## 能力边界

@@ -1,5 +1,9 @@
 # NMD macOS 实验性只读诊断
 
+macOS 是桌面机。NMD 在这里的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期客户端仍在调研（具体软件调研中，待定）。
+NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。
+平台分工见 [跨平台分工](platforms.md)。
+
 开发位置：`~/Projects/network-monitor-and-diagnostics`，分支 `feat/macos-support`。
 需要机器上已有的 Python 3.9+ 与 Bash；诊断、SQLite 和 HTTP 使用 Python 标准库。
 不要求安装 PyYAML、Node 或其他运行时；来源管理的既有可选依赖只用于 Linux 功能。
@@ -34,6 +38,10 @@ macOS 面板唯一的写能力是「设置与帮助」页的监控配置编辑�
 严格校验后原子写入（新建目录 0700、文件 0600）。保存不启动、重启或探测任何东西，
 改动在下次显式 `nmd monitor run --config` 时生效；Linux 的监控配置仍由 nmd CLI 与
 systemd 安装管理，面板不提供编辑。
+
+## Clash Verge Rev 配置校验（规划）
+
+与 Clash Verge Rev 共同使用时，NMD 只做监控（monitor）和诊断（diagnostics），流量由 Clash Verge Rev 管理。后续以只读方式校验它的配置，确认当前方案能跑通，并把结果和时间戳记在 NMD 自己的状态里。不调用 external-controller，不修改它的配置。设计和验收标准见 [跨平台分工](platforms.md)。本 PR 不实现校验器。
 
 ## 能力与边界
 

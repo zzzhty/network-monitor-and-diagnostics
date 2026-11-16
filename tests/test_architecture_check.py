@@ -114,11 +114,11 @@ class ArchitectureCheckTests(unittest.TestCase):
             root = Path(tmp)
             (root / "web").mkdir()
             for source in (ROOT / "web").glob("*.html"):
-                (root / "web" / source.name).write_text(source.read_text(), encoding="utf-8")
+                (root / "web" / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
             for source in (ROOT / "web").glob("*.css"):
-                (root / "web" / source.name).write_text(source.read_text(), encoding="utf-8")
+                (root / "web" / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
             css = root / "web" / "style.css"
-            css.write_text(css.read_text() + "\n.nav span{opacity:.6}\n", encoding="utf-8")
+            css.write_text(css.read_text(encoding="utf-8") + "\n.nav span{opacity:.6}\n", encoding="utf-8")
             caught = theme_errors(arch.check(root, EMPTY))
             nav = [item for item in caught if "button.nav" in item.violation and ">span|4.50" in item.violation]
             self.assertEqual(len(nav), 4)
@@ -202,6 +202,57 @@ class ArchitectureCheckTests(unittest.TestCase):
             caught = list_errors(arch.check(root, stale))
             self.assertEqual(len(caught), 1)
             self.assertIn("no longer an omission", caught[0].violation)
+
+    def test_windows_job_must_run_test_windows_on_windows_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, ".github/workflows/offline-tests.yml", "jobs:\n  windows-tests:\n    runs-on: ubuntu-latest\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "windows-job"]
+            self.assertEqual(len(caught), 1)
+            self.assertIn("windows-latest", caught[0].violation)
+            write(
+                root,
+                ".github/workflows/offline-tests.yml",
+                "jobs:\n  windows-tests:\n    runs-on: windows-latest\n    steps:\n"
+                "      - run: python -m unittest test_windows test_architecture_check -v\n",
+            )
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "windows-job"], [])
+
+    def test_platform_docs_keep_the_cross_platform_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
+            write(root, "README.md", "Linux gateway only.\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
+            self.assertGreaterEqual(len(caught), 1)
+            phrase = "具体软件调研中，待定"
+            role = "Clash Verge Rev monitor diagnostics " + phrase
+            write(root, "README.md", role + "\n[分工](docs/platforms.md)\n")
+            section = role + "\nClash Verge Rev 配置校验（规划）\nexternal-controller\n[分工](platforms.md)\n"
+            write(root, "docs/macos.md", section)
+            write(root, "docs/windows.md", section)
+            write(
+                root,
+                "docs/platforms.md",
+                section + "systemd LaunchAgent 计划任务 需按实际 Verge/mihomo 版本核对\n",
+            )
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"], [])
+            write(root, "docs/platforms.md", section + "systemd LaunchAgent 计划任务\n")
+            dropped = [item for item in arch.check(root, EMPTY) if item.rule == "platform-docs"]
+            self.assertEqual(len(dropped), 1)
+            self.assertIn("需按实际 Verge/mihomo 版本核对", dropped[0].violation)
+
+    def test_windows_python_rejects_uv_venv_and_keeps_the_stdlib_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "scripts/nmd_windows.ps1", "python -m venv --without-pip .venv\n.local\n")
+            write(root, "install.ps1", ". .\\scripts\\nmd_windows.ps1\n")
+            write(root, "nmd.ps1", ". .\\scripts\\nmd_windows.ps1\n")
+            self.assertEqual([item for item in arch.check(root, EMPTY) if item.rule == "windows-python"], [])
+            write(root, "install.ps1", ". .\\scripts\\nmd_windows.ps1\nuv venv .venv\n")
+            caught = [item for item in arch.check(root, EMPTY) if item.rule == "windows-python"]
+            self.assertEqual(len(caught), 1)
+            self.assertIn("uv venv", caught[0].violation)
 
     def test_unittest_discover_covers_new_modules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
