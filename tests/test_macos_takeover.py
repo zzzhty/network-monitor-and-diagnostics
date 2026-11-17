@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -840,6 +841,19 @@ class ContractPins(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def record(self, table, **overrides):
+        for record, _ in run_takeover(table, **overrides):
+            return record
+
+    def write_snapshot(self, state, **kwargs):
+        return RollbackTests.write_snapshot(self, state, **kwargs)
+
+    def _identity(self, lstart, work, args=None):
+        return RollbackTests._identity(self, lstart, work, args)
+
+    def _ps_runner(self, text, table=None):
+        return RollbackTests._ps_runner(self, text, table)
+
     def test_parse_requires_inputs_and_valid_minutes(self):
         example = str(ROOT / "examples/macos-mihomo-takeover.inputs.example.json")
         with self.assertRaisesRegex(mod.TakeoverError, "inputs_required"):
@@ -875,6 +889,306 @@ class CLITests(unittest.TestCase):
                 with self.subTest(argv=argv):
                     with self.assertRaisesRegex(ValueError, "command_not_allowlisted"):
                         macos_prepare.execute(argv, 2)
+
+    def test_help_and_invalid_options_do_not_escalate(self):
+        for argv in (
+            ["takeover", "--help"],
+            ["rollback", "-h"],
+            ["accept", "--help"],
+            ["takeover", "--inputs", "x", "--help"],
+            ["accept", "--inputs", "x", "--state-dir", "y", "-h"],
+        ):
+            with patch.object(mod.os, "execv", side_effect=AssertionError("execv")), \
+                    patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")), \
+                    patch.object(mod, "takeover", side_effect=AssertionError("takeover")):
+                self.assertEqual(mod.main(argv), 0, argv)
+        for argv in (
+            ["takeover", "--bogus"],
+            ["accept", "--inputs", "x"],
+            ["rollback", "--nope"],
+            ["takeover", "--inputs", "x", "--minutes"],
+            ["accept", "--inputs", "x", "--state-dir", "y", "--minutes", "10"],
+        ):
+            with patch.object(mod.os, "execv", side_effect=AssertionError("execv")), \
+                    patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")), \
+                    patch.object(mod, "takeover", side_effect=AssertionError("takeover")):
+                self.assertEqual(mod.main(argv), 2, argv)
+
+    def test_non_root_reexec_uses_absolute_sudo(self):
+        with patch.object(mod.os, "geteuid", return_value=1000), \
+                patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")), \
+                patch.object(mod.os, "execv", side_effect=SystemExit(0)) as invoked:
+            with self.assertRaises(SystemExit):
+                mod.main(["rollback"])
+        self.assertEqual(invoked.call_args.args[0], "/usr/bin/sudo")
+        self.assertEqual(invoked.call_args.args[1][0], "/usr/bin/sudo")
+        self.assertNotIn("sudo", invoked.call_args.args[1][1:])
+
+    def test_daemon_help_and_invalid_do_not_escalate(self):
+        import nmd_daemon
+        for argv, expected in ((["takeover-start", "--help"], 0),
+                               (["takeover-start", "--bogus"], 2),
+                               (["supervise", "--bogus"], 2)):
+            with patch.object(nmd_daemon.os, "execv", side_effect=AssertionError("execv")), \
+                    patch.object(nmd_daemon.os, "execvp", side_effect=AssertionError("execvp")), \
+                    patch.object(mod.os, "execv", side_effect=AssertionError("execv")), \
+                    patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")):
+                code = (nmd_daemon.cli_daemon(argv) if argv[0] != "supervise"
+                        else nmd_daemon.main(argv))
+            self.assertEqual(code, expected, argv)
+
+    def _ready_arm(self, state, pin, deadline):
+        return {"ready": True, "pid": 1, "pgid": 2, "pin": pin}
+
+    def test_accept_refuses_unknown_preflight_before_any_mutation(self):
+        def runner(argv, timeout):
+            if tuple(argv) == ("/usr/sbin/scutil", "--dns"):
+                return 1, "", "scutil_failed"
+            return Table().runner(argv, timeout)
+
+        def arm(*_args):
+            raise AssertionError("watchdog armed before a known preflight")
+
+        table = Table()
+        record = self.record(table, runner=runner, external_rollback=True, arm_watchdog=arm)
+        self.assertEqual(record["result"], "preflight_unknown")
+        self.assertEqual(record["mutations"], [])
+        self.assertFalse(any(item[0] == TS or "networksetup" in item[0] for item in table.mutations))
+
+    def test_watchdog_not_ready_changes_nothing(self):
+        def arm(*_args):
+            return {"ready": None, "reason": "ready_unknown"}
+
+        table = Table()
+        record = self.record(table, external_rollback=True, arm_watchdog=arm)
+        self.assertEqual(record["result"], "watchdog_not_ready")
+        self.assertEqual(record["mutations"], [])
+        self.assertFalse(any(item[0] == TS for item in table.mutations))
+        self.assertFalse(record["guarantees_restore_if_watchdog_dies"])
+
+    def test_engaged_pin_blocks_the_controller_before_cutover(self):
+        def arm(state, pin, _deadline):
+            mod._mark_engaged(state, pin)
+            return {"ready": True, "pid": 1, "pgid": 2, "pin": pin}
+
+        table = Table()
+        record = self.record(table, external_rollback=True, arm_watchdog=arm)
+        self.assertIn("rollback_already_engaged", record["result"])
+        self.assertNotIn([TS, "set", "--exit-node="], table.mutations)
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+
+    def test_external_stop_still_restores(self):
+        table = Table(dns_dirty_window=(1, 21))
+        handlers = {}
+
+        def fake_signal(sig, handler):
+            handlers[sig] = handler
+            return None
+
+        def sleeping(seconds):
+            table.clock += seconds
+            if signal.SIGINT in handlers:
+                handlers.pop(signal.SIGINT)()
+
+        with patch.object(mod.signal, "signal", side_effect=fake_signal):
+            record = self.record(table, sleep=sleeping, external_rollback=True,
+                                 arm_watchdog=self._ready_arm)
+        self.assertEqual(record["result"], "stopped")
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertIn("watchdog_ready", record["steps"])
+        self.assertFalse(record["guarantees_restore_if_watchdog_dies"])
+
+    def test_external_partial_dns_failure_continues(self):
+        table = Table(services=(("Wi-Fi", ["192.0.2.53"]), ("Ethernet", ["192.0.2.54"])),
+                      fail_mutations=(((0, "/usr/sbin/networksetup"), (2, "Wi-Fi")),))
+
+        def arm(state, pin, deadline):
+            table.service_dns["Wi-Fi"] = []
+            table.service_dns["Ethernet"] = []
+            return self._ready_arm(state, pin, deadline)
+
+        record = self.record(table, external_rollback=True, arm_watchdog=arm)
+        self.assertEqual(record["rollback"]["result"], "rollback_incomplete")
+        self.assertIn("Wi-Fi:failed", record["rollback"]["steps"])
+        self.assertIn("Ethernet:restored", record["rollback"]["steps"])
+
+    def test_accept_config_disables_geo_auto_update(self):
+        generated = run_takeover(
+            Table(), external_rollback=True, geo_auto_update=False,
+            arm_watchdog=lambda *_args: {"ready": False})
+        record, state = next(generated)
+        text = (state / "takeover" / "config.yaml").read_text(encoding="utf-8")
+        self.assertIn("geo-auto-update: false", text)
+        self.assertEqual(record["result"], "watchdog_not_ready")
+        normal = macos_prepare.render_config(PROFILE, INPUTS)
+        self.assertIn("geo-auto-update: true", normal)
+
+    def test_production_state_and_daemon_socket_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            with patch.object(mod, "_production_state_paths", return_value={path.as_posix()}):
+                with self.assertRaisesRegex(mod.TakeoverError, "production_state_forbidden"):
+                    mod.assert_acceptance_state(path)
+        table = Table()
+        with patch.object(mod, "_daemon_conflict", return_value=True):
+            with self.assertRaisesRegex(mod.TakeoverError, "daemon_conflict"):
+                self.record(table, external_rollback=True)
+        self.assertEqual(table.mutations, [])
+
+    def test_a_live_watchdog_blocks_another_accept_in_the_same_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            document = {"ready": True, "pid": os.getpid(), "pgid": 9, "euid": 0,
+                        "pin": "pre-start-20260101T000000Z.json",
+                        "deadline_unix": int(time.time()) + 120}
+            (state / mod.READY_FILE).write_text(json.dumps(document), encoding="utf-8")
+            table = Table()
+            options = dict(
+                inputs=INPUTS, profile=PROFILE, minutes=1, mihomo_path=MIHOMO,
+                state_dir=tmp, runner=table.runner, mutator=table.mutator,
+                spawner=table.spawner, tcp=table.tcp, exists=lambda path: path == TS,
+                sleep=table.sleep, now=lambda: table.clock, external_rollback=True,
+                arm_watchdog=lambda *_args: (_ for _ in ()).throw(AssertionError("armed")))
+            with self.assertRaisesRegex(mod.TakeoverError, "watchdog_conflict"):
+                mod.takeover(**options)
+            self.assertEqual(table.mutations, [])
+            with patch.object(mod, "_pid_alive", return_value=False):
+                record = mod.takeover(**dict(options, arm_watchdog=lambda *_args: {"ready": False}))
+            self.assertEqual(record["result"], "watchdog_not_ready")
+            self.assertFalse(any(item[0] == TS for item in table.mutations))
+
+    def test_confirm_ready_rejects_unknown_and_shared_group(self):
+        document = {"ready": True, "pid": 7, "pgid": 8, "euid": 0,
+                    "pin": "pre-start-20260101T000000Z.json", "deadline_unix": 50}
+        probe = lambda pid: {"alive": True, "pgid": 8, "uid": 0}
+        ok = mod.confirm_ready(document, expected_pin=document["pin"], expected_deadline=50,
+                               child_pid=7, parent_pgid=3, probe=probe)
+        self.assertTrue(ok["ready"])
+        shared = mod.confirm_ready(document, expected_pin=document["pin"], expected_deadline=50,
+                                   child_pid=7, parent_pgid=8, probe=probe)
+        self.assertEqual(shared["reason"], "not_independent")
+        unknown = mod.confirm_ready(document, expected_pin=document["pin"], expected_deadline=50,
+                                    child_pid=7, parent_pgid=3,
+                                    probe=lambda pid: {"alive": None, "pgid": 8, "uid": 0})
+        self.assertEqual(unknown["reason"], "ready_unknown")
+        mismatch = dict(document, pin="pre-start-20260101T000001Z.json")
+        self.assertEqual(mod.confirm_ready(
+            document, expected_pin=mismatch["pin"], expected_deadline=50,
+            child_pid=7, parent_pgid=3, probe=probe)["reason"], "ready_unknown")
+
+    def test_handshake_timeout_and_planted_ready_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pin = "pre-start-20260101T000000Z.json"
+
+            class Child:
+                pid = 4321
+
+                def poll(self):
+                    return None
+
+                def wait(self, timeout=None):
+                    return 0
+
+            calls = {"n": 0}
+
+            def now():
+                calls["n"] += 1
+                return 0 if calls["n"] < 3 else 100
+
+            result = mod.arm_external_watchdog(
+                state, pin, 99, spawn=lambda *_args: Child(), probe=lambda pid: {"alive": True},
+                sleep=lambda _seconds: None, now=now)
+            self.assertEqual(result["reason"], "watchdog_handshake_timeout")
+            ready = state / mod.READY_FILE
+            ready.symlink_to("planted")
+            result = mod.arm_external_watchdog(
+                state, pin, 99, spawn=lambda *_args: (_ for _ in ()).throw(AssertionError("spawn")),
+                now=lambda: 0)
+            self.assertEqual(result["reason"], "ready_unknown")
+
+    def test_watch_uses_the_original_pin_after_parent_death_and_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            name = next(state.glob("pre-start-*.json")).name
+            mod.write_pin(state, name)
+            table = Table()
+            table.exit_node_cleared = True
+            clock = {"now": 0}
+
+            def rollback_fn(state_dir, snapshot_name=None):
+                return mod.rollback(state_dir, snapshot_name=snapshot_name, runner=table.runner,
+                                    mutator=table.mutator, sleep=lambda _seconds: None,
+                                    now=lambda: 0.0, tailscale_path=TS)
+
+            result = mod.run_rollback_watch(
+                state, pin=name, deadline_unix=10 ** 12, parent_pid=1,
+                now=lambda: clock["now"], sleep=lambda _seconds: None,
+                alive=lambda _pid: False, rollback_fn=rollback_fn)
+            self.assertEqual(result["trigger"], "parent_dead")
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            before = len(table.mutations)
+            again = rollback_fn(state, snapshot_name=name)
+            self.assertEqual(again["result"], "rollback_restored")
+            self.assertEqual(len(table.mutations), before)
+
+            clock["now"] = 0
+
+            def later(_seconds):
+                clock["now"] = 100
+
+            calls = []
+
+            def counting(state_dir, snapshot_name=None):
+                calls.append(snapshot_name)
+                return {"result": "rollback_restored"}
+
+            result = mod.run_rollback_watch(
+                state, pin=name, deadline_unix=50, parent_pid=1,
+                now=lambda: clock["now"], sleep=later, alive=lambda _pid: True,
+                rollback_fn=counting)
+            self.assertEqual(calls, [name])
+            self.assertEqual(result["trigger"], "deadline")
+
+    def test_watch_does_not_signal_a_mismatched_mihomo(self):
+        lstart = "Tue Nov 17 18:09:00 2026"
+        work = "/tmp/nmd-owned-work"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, services=(("Wi-Fi", []),))
+            name = next(state.glob("pre-start-*.json")).name
+            mod.write_pin(state, name)
+            mod.write_owner(state, 4242, MIHOMO, work, runner=self._ps_runner(self._identity(lstart, work)))
+            other = self._identity("Wed Nov 18 18:09:00 2026", work)
+
+            def rollback_fn(state_dir, snapshot_name=None):
+                return mod.rollback(state_dir, snapshot_name=snapshot_name,
+                                    runner=self._ps_runner(other), mutator=Table().mutator,
+                                    sleep=lambda _seconds: None, now=lambda: 0.0,
+                                    tailscale_path=TS)
+
+            with patch.object(mod.os, "getpgid", side_effect=AssertionError("pgid")), \
+                    patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
+                result = mod.run_rollback_watch(
+                    state, pin=name, deadline_unix=10 ** 12, parent_pid=1,
+                    now=lambda: 0, sleep=lambda _seconds: None, alive=lambda _pid: False,
+                    rollback_fn=rollback_fn)
+            self.assertIn("owner_identity_mismatch", result["steps"])
+
+    def test_engaged_marker_for_another_snapshot_does_not_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            current = "pre-start-20260101T000000Z.json"
+            other = "pre-start-20260101T000001Z.json"
+            mod._mark_engaged(state, other)
+            self.assertFalse(mod._mutation_blocked(state, current))
+            mod._mark_engaged(state, current)
+            self.assertTrue(mod._mutation_blocked(state, current))
+            (state / mod.ENGAGED_FILE).unlink()
+            (state / mod.ENGAGED_FILE).symlink_to(current)
+            self.assertTrue(mod._mutation_blocked(state, current))
 
     def test_unknown_subcommand_and_help_exit_codes(self):
         script = str(ROOT / "scripts/macos_takeover.py")

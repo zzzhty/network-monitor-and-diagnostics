@@ -322,7 +322,23 @@ sudo nmd macos takeover --inputs /path/to/inputs.json --minutes 10 \
 sudo nmd macos rollback --state-dir DIR
 ```
 
-控制器代码没有在实机运行：上面的顺序有离线测试逐路径覆盖（含停止、到期、三个故障周期、就绪超时、进程早退、前置失败与各类回退），真实机器上的首次运行仍按上文的实机验收边界对待。
+`--help` 和 `-h` 在参数校验和提权之前处理。`takeover --help`、`rollback -h`、`accept --help` 以及带了其它参数的 `--help` 都只打印帮助。认不出的选项同样直接退出，不会被当成一次接管。
+
+## 两分钟验收
+
+`nmd macos accept` 是固定 2 分钟的短时入口。它不改变上面默认 10 分钟、最长 8 小时的 takeover，不加载、不安装 launchd，不改 `on_boot`，也不停止已经在跑的 run-user。`--state-dir` 必须指向这次的私有目录，不能是 `~/.local/state/nmd-monitor`。普通用户可以先准备 inputs 和这个目录；sudo 之后核对所有者、权限、祖先符号链接和路径，不从 PATH 找 sudo 或解释器。geodata 只复制普通文件。这次生成的配置把 `geo-auto-update` 写成 false，避免这两分钟里自动联网更新；其它生成路径和示例配置仍是 true。
+
+任何网络变更之前，一个已经是 root、且不在控制器进程组里的 deadline 进程必须写好 ready，并且 ready 里的 pin 就是变更前钉死的快照。watchdog 起不来、握手失败、或 ready 不是明确的 true，就零网络变更退出。控制器被杀掉后，这个进程仍按最初的 pin 调用现有 rollback。回退一开始先记下 engaged；控制器若还想继续清 exit node 或启动 mihomo，会在变更前停住。完成前用现有 rollback 核对恢复。身份对不上的 mihomo 不发信号。重复 rollback 仍是幂等。独立 watchdog 自己也死掉时，恢复没有保证，`guarantees_restore_if_watchdog_and_sampler_die` 保持 false。若 `/var/run/nmd-daemon.sock` 已经存在或无法判断，验收在改网络前失败，不停止旧进程。
+
+验证：读私有 state 里的 `rollback-watch-ready.json`、`rollback-pin.json`、`rollback-watch-result.json` 和 `takeover-*.json`。这些文件不包含 inputs。失败：进程非 0；握手没完成时没有 tailscale 或 networksetup 变更。取消：Ctrl-C，控制器回退，watchdog 发现父进程消失后再做一次幂等回退。回退：`nmd macos rollback --state-dir DIR`。清理：只删除这次的私有 state 目录。
+
+```bash
+sudo ./nmd macos accept --inputs /PATH/TO/inputs.json \
+  --state-dir /PATH/TO/private-accept-state \
+  --geodata-dir /PATH/TO/isolated-geodata-copy
+```
+
+控制器代码没有在实机运行：上面的顺序有离线测试逐路径覆盖（含停止、到期、三个故障周期、就绪超时、进程早退、前置失败与各类回退），两分钟入口另有握手前零变更、控制器消失、deadline、取消、部分失败、重复回退、身份不符和 ready 未知的离线注入。真实机器上的首次运行仍按上文的实机验收边界对待。
 
 ## 回退约束
 

@@ -48,7 +48,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MINUTES = 10
 MIN_MINUTES = 1
 MAX_MINUTES = 480  # 过夜最长 8 小时，到期不续期。
+ACCEPT_MINUTES = 2  # 短时验收固定 2 分钟，不续期，也不能拉长成常驻。
 CHECK_INTERVAL_SECONDS = 20
+WATCHDOG_HANDSHAKE_SECONDS = 5
 CRITICAL_THRESHOLD = 3  # 连续 3 次关键故障才回退。
 READY_TIMEOUT_SECONDS = 60
 READY_POLL_SECONDS = 2
@@ -76,21 +78,32 @@ _IP_TOKEN = re.compile(
 _SNAPSHOT_NAME = re.compile(r"^pre-start-\d{8}T\d{6}Z\.json$")
 OWNER_FILE = "owned-mihomo.json"
 PIN_FILE = "rollback-pin.json"
+ENGAGED_FILE = "rollback-engaged"
+READY_FILE = "rollback-watch-ready.json"
+WATCH_RESULT_FILE = "rollback-watch-result.json"
+DAEMON_SOCKET = "/var/run/nmd-daemon.sock"
 GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
 GEODATA_MAX_BYTES = 64 * 1024 * 1024
 
 HELP = """\
-usage: sudo python3 scripts/macos_takeover.py takeover --inputs INPUTS.json \
+usage: nmd macos accept --inputs INPUTS.json --state-dir DIR \
+      [--profile PROFILE.json] [--mihomo PATH] [--geodata-dir DIR]
+       nmd macos takeover --inputs INPUTS.json \
       [--profile PROFILE.json] [--minutes N] [--mihomo PATH] [--state-dir DIR] \
       [--geodata-dir DIR]
-       sudo python3 scripts/macos_takeover.py rollback [--state-dir DIR]
+       nmd macos rollback [--state-dir DIR]
 
-Foreground takeover of macOS egress with an absolute deadline (default
-10 minutes, 8 hours at most, never renewed). STOP or the deadline rolls back
-idempotently from the snapshot pinned before the cutover, or the newest
-regular pre-start file when nothing was pinned. The recorded mihomo is
-signalled only when its pid, start time, command line, and session id still
-match; system proxy and bypass are never changed. Run it under sudo.
+`accept` is the two-minute acceptance run. Before any network change it
+starts an independent root process group that already holds the pre-change
+pin. If that watchdog does not become ready, nothing is changed. STOP or the
+absolute deadline rolls back through the existing rollback. The watchdog
+still rolls back from that same pin if the controller is killed. It does not
+install launchd, change on_boot, or stop an existing daemon. If the watchdog
+process itself also dies, restore is not guaranteed.
+
+`takeover` is the longer foreground session (default 10 minutes, 8 hours at
+most, never renewed). `rollback` restores the pinned snapshot. --help and -h
+print this text and do not escalate. System proxy and bypass are never changed.
 """
 
 
@@ -1027,6 +1040,7 @@ def rollback(state_dir, *, runner=None, mutator=None, sleep=None, now=None,
     snapshot = _load_snapshot(chosen)
     tailscale = tailscale_path or first_tailscale()
     with RollbackLock(state):
+        _mark_engaged(state, chosen.name)
         steps = [stop_owned_mihomo(state, runner=runner)]
         clean = scutil_has_no_198_18(runner=runner, sleep=sleep, now=now)
         steps.append("scutil_198_18_clear" if clean else "scutil_198_18_leftover")
@@ -1039,6 +1053,383 @@ def rollback(state_dir, *, runner=None, mutator=None, sleep=None, now=None,
                                          runner=runner, mutator=mutator))
     result = "rollback_incomplete" if _rollback_incomplete(steps) else "rollback_restored"
     return {"result": result, "steps": steps, "snapshot": chosen.name}
+
+
+def _mark_engaged(state_dir, snapshot_name):
+    """Remember that this pin is being restored, before any restore mutation."""
+    macos_prepare._atomic_private_write(
+        Path(state_dir), ENGAGED_FILE, (snapshot_name + "\n").encode("ascii"))
+
+
+def _mutation_blocked(state_dir, snapshot_name):
+    """True when this run must not start or change anything else.
+
+    A marker for this pin, or an unreadable marker, blocks. A marker that
+    names an older snapshot does not block a later run in the same directory.
+    """
+    path = Path(state_dir) / ENGAGED_FILE
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return True
+    try:
+        text = _read_regular(path, 200).decode("utf-8").strip()
+    except (TakeoverError, UnicodeDecodeError):
+        return True
+    if text == snapshot_name or not _SNAPSHOT_NAME.fullmatch(text):
+        return True
+    return False
+
+
+def _production_state_paths():
+    found = set()
+    homes = [Path.home()]
+    account = _sudo_user_home()
+    if account is not None:
+        homes.append(Path(account.pw_dir))
+    for home in homes:
+        try:
+            found.add(_absolute_lexical(home / ".local/state/nmd-monitor").as_posix())
+        except TakeoverError:
+            continue
+    return found
+
+
+def assert_acceptance_state(path):
+    """Private state for this run. The root 0700 production directory is refused."""
+    path = assert_private_ancestors(Path(path))
+    if path.as_posix() in _production_state_paths():
+        raise TakeoverError("production_state_forbidden")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return path
+    except OSError as exc:
+        raise TakeoverError("state_dir_unusable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise TakeoverError("state_dir_symlink")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise TakeoverError("state_dir_writable")
+    allowed = {0, os.geteuid()}
+    account = _sudo_user_home()
+    if account is not None:
+        allowed.add(account.pw_uid)
+    if info.st_uid not in allowed:
+        raise TakeoverError("state_owner_untrusted")
+    return path
+
+
+def _watchdog_still_running(state_dir, now=None):
+    """True when a previous acceptance watchdog may still roll this directory back."""
+    document = _read_ready_document(Path(state_dir) / READY_FILE)
+    if not isinstance(document, dict) or document.get("ready") is not True:
+        return False
+    pid = document.get("pid")
+    deadline = document.get("deadline_unix")
+    if type(pid) is not int or isinstance(pid, bool) or type(deadline) is not int or isinstance(deadline, bool):
+        return True
+    if (now or time.time)() >= deadline:
+        return False
+    return _pid_alive(pid) is not False
+
+
+def _daemon_conflict(path=DAEMON_SOCKET):
+    """True when a daemon socket is present or cannot be classified.
+
+    Presence is enough. This does not connect, and it does not stop the
+    existing run-user daemon.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def confirm_ready(document, *, expected_pin, expected_deadline, child_pid,
+                  parent_pgid, probe):
+    """The watchdog is ready only when every field is confirmed.
+
+    A missing field, a mismatched pin, or a probe that cannot prove the
+    child is an independent root process group is not ready.
+    """
+    if not isinstance(document, dict) or document.get("ready") is not True:
+        return {"ready": False, "reason": "ready_unknown"}
+    if document.get("pin") != expected_pin or document.get("deadline_unix") != expected_deadline:
+        return {"ready": False, "reason": "ready_unknown"}
+    if document.get("pid") != child_pid or document.get("euid") != 0:
+        return {"ready": False, "reason": "ready_unknown"}
+    pgid = document.get("pgid")
+    if type(pgid) is not int or isinstance(pgid, bool) or pgid == parent_pgid:
+        return {"ready": False, "reason": "not_independent"}
+    try:
+        probed = probe(child_pid)
+    except (OSError, ValueError, TypeError):
+        probed = None
+    if not isinstance(probed, dict) or probed.get("alive") is not True:
+        return {"ready": False, "reason": "ready_unknown"}
+    if probed.get("pgid") != pgid or probed.get("uid") != 0:
+        return {"ready": False, "reason": "ready_unknown"}
+    return {"ready": True, "pid": child_pid, "pgid": pgid, "pin": expected_pin}
+
+
+def _read_ready_document(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"ready": False}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return {"ready": False}
+    try:
+        data = json.loads(_read_regular(path, 4096).decode("utf-8"))
+    except (TakeoverError, UnicodeDecodeError, ValueError):
+        return {"ready": False}
+    return data if isinstance(data, dict) else {"ready": False}
+
+
+def _probe_child(pid):
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return {"alive": False}
+    except OSError:
+        return {"alive": None}
+    return {"alive": True, "pgid": pgid, "uid": os.geteuid()}
+
+
+def _stop_child(child):
+    pid = getattr(child, "pid", None)
+    if not isinstance(pid, int):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(pid, signal.SIGTERM)
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        with contextlib.suppress(Exception):
+            wait(timeout=2)
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def run_rollback_watch(state_dir, *, pin, deadline_unix, parent_pid, now=None,
+                       sleep=None, alive=None, rollback_fn=None):
+    """Child entry: hold the pin, then call the existing rollback.
+
+    Ready is written only after the pin and snapshot both load. The loop
+    then waits for the deadline or for the controller process to disappear.
+    This process dying too is not covered; the caller must not claim it is.
+    """
+    state = assert_acceptance_state(state_dir)
+    now = now or time.time
+    sleep = sleep or time.sleep
+    alive = alive or _pid_alive
+    rollback_fn = rollback_fn or rollback
+    reason = "pin_unreadable"
+    ready = False
+    try:
+        loaded = read_pin(state)
+        if loaded == pin:
+            _load_snapshot(_select_snapshot(state, pin))
+            ready = True
+            reason = "ready"
+        else:
+            reason = "pin_mismatch"
+    except TakeoverError:
+        ready = False
+    document = {"schema_version": SCHEMA_VERSION, "ready": ready, "reason": reason,
+                "pid": os.getpid(), "pgid": os.getpgrp(), "euid": os.geteuid(),
+                "pin": pin, "deadline_unix": deadline_unix, "parent_pid": parent_pid}
+    macos_prepare._atomic_private_write(
+        state, READY_FILE,
+        json.dumps(document, sort_keys=True).encode("utf-8") + b"\n")
+    if not ready:
+        return {"ready": False, "reason": reason}
+    trigger = "deadline"
+    while now() < deadline_unix:
+        if not alive(parent_pid):
+            trigger = "parent_dead"
+            break
+        sleep(0.2)
+    result = rollback_fn(state, snapshot_name=pin)
+    if isinstance(result, dict):
+        result = dict(result)
+        result["trigger"] = trigger
+        result["guarantees_restore_if_watchdog_dies"] = False
+    macos_prepare._atomic_private_write(
+        state, WATCH_RESULT_FILE,
+        json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
+    return result
+
+
+def arm_external_watchdog(state_dir, pin, deadline_unix, *, spawn=None, probe=None,
+                          sleep=None, now=None):
+    """Start the watchdog and accept it only after the ready file is confirmed."""
+    state_dir = Path(state_dir)
+    ready_path = state_dir / READY_FILE
+    try:
+        info = ready_path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError:
+        return {"ready": False, "reason": "ready_unknown"}
+    if info is not None and (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
+        return {"ready": False, "reason": "ready_unknown"}
+    if info is not None:
+        with contextlib.suppress(OSError):
+            ready_path.unlink()
+    child = spawn(state_dir, pin, deadline_unix) if spawn is not None else _spawn_watch(
+        state_dir, pin, deadline_unix)
+    if child is None or not isinstance(getattr(child, "pid", None), int):
+        return {"ready": False, "reason": "watchdog_not_started"}
+    sleep = sleep or time.sleep
+    now = now or time.monotonic
+    stop_at = now() + WATCHDOG_HANDSHAKE_SECONDS
+    document = None
+    while now() < stop_at:
+        if child.poll() is not None:
+            return {"ready": False, "reason": "watchdog_exited", "pid": child.pid}
+        document = _read_ready_document(ready_path)
+        if document is not None:
+            break
+        sleep(0.05)
+    else:
+        _stop_child(child)
+        return {"ready": False, "reason": "watchdog_handshake_timeout", "pid": child.pid}
+    confirmed = confirm_ready(
+        document, expected_pin=pin, expected_deadline=deadline_unix,
+        child_pid=child.pid, parent_pgid=os.getpgrp(), probe=probe or _probe_child)
+    if confirmed.get("ready") is not True:
+        _stop_child(child)
+    return confirmed
+
+
+def _owner_allowed(uid):
+    allowed = {0, os.geteuid()}
+    account = _sudo_user_home()
+    if account is not None:
+        allowed.add(account.pw_uid)
+    return uid in allowed
+
+
+def _trusted_regular(path, *, root_only):
+    """A regular file whose ancestors are safe. Symlinks are handled by the caller."""
+    path = assert_private_ancestors(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise TakeoverError("untrusted_exec_path") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise TakeoverError("untrusted_exec_path")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise TakeoverError("untrusted_exec_path")
+    if root_only:
+        if info.st_uid != 0:
+            raise TakeoverError("untrusted_exec_path")
+    elif not _owner_allowed(info.st_uid):
+        raise TakeoverError("untrusted_exec_path")
+    return path
+
+
+def _lexical_join(base, raw):
+    """One symlink target, without touching the filesystem."""
+    if raw.startswith("/"):
+        parts = []
+        for name in Path(raw).parts:
+            if name in ("", ".", "/"):
+                continue
+            if name == "..":
+                if not parts:
+                    raise TakeoverError("untrusted_exec_path")
+                parts.pop()
+                continue
+            parts.append(name)
+        return Path("/" + "/".join(parts))
+    current = Path(base)
+    for name in Path(raw).parts:
+        if name in ("", "."):
+            continue
+        if name == "..":
+            if current == Path("/"):
+                raise TakeoverError("untrusted_exec_path")
+            current = current.parent
+            continue
+        current = current / name
+    return current
+
+
+def _trusted_interpreter():
+    """The interpreter already running, or its one direct regular target."""
+    path = Path(sys.executable)
+    if not path.is_absolute():
+        raise TakeoverError("untrusted_exec_path")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise TakeoverError("untrusted_exec_path") from exc
+    if stat.S_ISLNK(info.st_mode):
+        if info.st_uid not in (0, os.geteuid()):
+            raise TakeoverError("untrusted_exec_path")
+        try:
+            raw = os.readlink(path)
+        except OSError as exc:
+            raise TakeoverError("untrusted_exec_path") from exc
+        path = _lexical_join(path.parent, raw)
+    return _trusted_regular(path, root_only=False)
+
+
+def _trusted_script(path):
+    return _trusted_regular(Path(path), root_only=False)
+
+
+def _trusted_sudo():
+    return _trusted_regular(Path("/usr/bin/sudo"), root_only=True)
+
+
+def reexec_root(script_path, script_argv):
+    """Replace this process with absolute sudo. PATH is not searched."""
+    sudo = _trusted_sudo()
+    python = _trusted_interpreter()
+    script = _trusted_script(script_path)
+    try:
+        os.execv(str(sudo), [str(sudo), "--", str(python), str(script), *list(script_argv)])
+    except OSError as exc:
+        raise TakeoverError("untrusted_exec_path") from exc
+
+
+def _spawn_watch(state_dir, pin, deadline_unix):
+    python = _trusted_interpreter()
+    script = _trusted_script(Path(__file__).resolve())
+    argv = [str(python), str(script), "rollback-watch",
+            "--state-dir", str(state_dir), "--pin", pin,
+            "--deadline", str(int(deadline_unix)), "--parent", str(os.getpid())]
+    log = open(Path(state_dir) / "rollback-watch.log", "ab")
+    try:
+        return subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"})
+    finally:
+        log.close()
 
 
 # --- takeover ----------------------------------------------------------------
@@ -1084,7 +1475,8 @@ def _write_heartbeat(path):
 def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
              mihomo_path=None, state_dir=None, runner=None, mutator=None,
              spawner=None, tcp=None, exists=None, sleep=None, now=None,
-             geodata_dir=None):
+             geodata_dir=None, external_rollback=False, geo_auto_update=True,
+             arm_watchdog=None):
     """Drive one bounded run: preflight, cutover, watchdog, rollback, record.
 
     Every exit path after the cutover begins goes through the finally block:
@@ -1104,25 +1496,40 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             return execute_mutating(argv, mihomo_path=mihomo)
     state_dir = Path(state_dir if state_dir is not None
                      else macos_prepare.default_state_dir())
-    state_dir = _absolute_lexical(state_dir)
-    if state_dir.is_symlink():
-        raise TakeoverError("state_dir_symlink")
-    assert_private_ancestors(state_dir)
+    if external_rollback:
+        state_dir = assert_acceptance_state(state_dir)
+        if _daemon_conflict():
+            raise TakeoverError("daemon_conflict")
+        if _watchdog_still_running(state_dir):
+            raise TakeoverError("watchdog_conflict")
+    else:
+        state_dir = _absolute_lexical(state_dir)
+        if state_dir.is_symlink():
+            raise TakeoverError("state_dir_symlink")
+        assert_private_ancestors(state_dir)
     geodata_source = resolve_geodata_dir(geodata_dir)
     record = {"schema_version": SCHEMA_VERSION, "kind": "macos_takeover_run",
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
               "minutes": minutes, "mutations": [], "steps": [],
               "config_real": not (inputs["server"] == macos_coexist.PLACEHOLDER_SOCKS_HOST)}
 
+    pin_holder = [None]
+
     def mutate(argv):
-        mutator(argv)
+        if external_rollback:
+            with RollbackLock(state_dir):
+                if _mutation_blocked(state_dir, pin_holder[0]):
+                    raise TakeoverError("rollback_already_engaged")
+                mutator(argv)
+        else:
+            mutator(argv)
         record["mutations"].append(list(argv))
 
     def step(name):
         record["steps"].append(name)
 
     # 1. Config generation + self-contained mihomo -t, before any network change.
-    text = macos_prepare.render_config(profile, inputs)
+    text = macos_prepare.render_config(profile, inputs, geo_auto_update=geo_auto_update)
     config_dir = ensure_workdir(state_dir / "takeover")
     config_path = config_dir / "config.yaml"
     macos_prepare._atomic_private_write(config_dir, "config.yaml", text.encode())
@@ -1155,13 +1562,37 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     ready = summary if isinstance(summary, dict) else {}
     record["snapshot"] = str(snapshot_path) if snapshot_path else None
     snapshot_name = Path(record["snapshot"]).name if record.get("snapshot") else None
+    if external_rollback and (snapshot_name is None
+                              or ready.get("has_198_18") is not False
+                              or ready.get("mihomo_running") is not False):
+        unknown = (snapshot_name is None or ready.get("has_198_18") is None
+                   or ready.get("mihomo_running") is None)
+        record["result"] = "preflight_unknown" if unknown else "preflight_failed"
+        record["preflight"] = {key: ready.get(key)
+                               for key in ("has_198_18", "mihomo_running")}
+        return record
     if ready.get("has_198_18") is True or ready.get("mihomo_running") is True:
         record["result"] = "preflight_failed"
         record["preflight"] = {key: ready.get(key)
                                for key in ("has_198_18", "mihomo_running")}
         return record
     write_pin(state_dir, snapshot_name)
+    pin_holder[0] = snapshot_name
     step("snapshot_taken")
+    if external_rollback:
+        deadline_unix = int(time.time()) + minutes * 60
+        record["guarantees_restore_if_watchdog_dies"] = False
+        if arm_watchdog is None:
+            armed = arm_external_watchdog(state_dir, snapshot_name, deadline_unix)
+        else:
+            armed = arm_watchdog(state_dir, snapshot_name, deadline_unix)
+        record["watchdog"] = {key: armed.get(key)
+                              for key in ("ready", "reason", "pid", "pgid", "pin")
+                              if isinstance(armed, dict) and key in armed}
+        if not isinstance(armed, dict) or armed.get("ready") is not True:
+            record["result"] = "watchdog_not_ready"
+            return record
+        step("watchdog_ready")
 
     tailscale = first_tailscale(exists)
     stop_requested = []
@@ -1201,6 +1632,8 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         step("exit_node_cleared")
         if not config_is_direct_regular(config_dir, config_path):
             raise TakeoverError("config_not_confined")
+        if external_rollback and _mutation_blocked(state_dir, snapshot_name):
+            raise TakeoverError("rollback_already_engaged")
         process.start(spawner=spawner)
         write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
         step("mihomo_started")
@@ -1208,6 +1641,9 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         deadline = now() + minutes * 60
         ready_by = now() + READY_TIMEOUT_SECONDS
         while now() < ready_by:
+            if external_rollback and _mutation_blocked(state_dir, snapshot_name):
+                record["result"] = "rollback_already_engaged"
+                return record
             _, dns_text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
             parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
             if parsed["has_198_18"] is True:
@@ -1229,6 +1665,9 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         checks = _watch_checks(inputs, runner=runner, tcp=tcp, exists=exists)
         failures = 0
         while True:
+            if external_rollback and _mutation_blocked(state_dir, snapshot_name):
+                record["result"] = "rollback_already_engaged"
+                return record
             _write_heartbeat(state_dir / "watchdog-heartbeat")
             cycle_failed = False
             for name, critical, check in checks:
@@ -1264,19 +1703,105 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
 
 
 
+_COMMANDS = ("accept", "takeover", "rollback", "rollback-watch")
+_FLAG_VALUES = {
+    "accept": ("--inputs", "--profile", "--mihomo", "--state-dir", "--geodata-dir"),
+    "takeover": ("--inputs", "--profile", "--minutes", "--mihomo", "--state-dir", "--geodata-dir"),
+    "rollback": ("--state-dir",),
+    "rollback-watch": ("--state-dir", "--pin", "--deadline", "--parent"),
+}
+
+
+def _wants_help(argv):
+    return any(arg in ("-h", "--help") for arg in argv)
+
+
+def _syntax(argv):
+    """Flag shape only. This does not read inputs and does not escalate."""
+    if not argv or argv[0] not in _COMMANDS:
+        raise TakeoverError("invalid_arguments")
+    allowed = _FLAG_VALUES[argv[0]]
+    seen = set()
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag not in allowed or index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+            raise TakeoverError("invalid_arguments")
+        if flag in seen:
+            raise TakeoverError("invalid_arguments")
+        seen.add(flag)
+        index += 2
+    if argv[0] in ("accept", "takeover") and "--inputs" not in seen:
+        raise TakeoverError("inputs_required")
+    if argv[0] == "accept" and "--state-dir" not in seen:
+        raise TakeoverError("state_dir_required")
+    if argv[0] == "rollback-watch" and seen != set(allowed):
+        raise TakeoverError("invalid_arguments")
+    return seen
+
+
+def _load_trusted_json(value):
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return macos_prepare._load_json(_trusted_regular(path, root_only=False))
+
+
+def _accept(options):
+    if options.get("profile") is None:
+        options["profile"] = _load_trusted_json(
+            REPO_ROOT / "examples/macos-mihomo-coexist.experiment.json")
+    options["minutes"] = ACCEPT_MINUTES
+    record = takeover(external_rollback=True, geo_auto_update=False, **{
+        key: options[key] for key in (
+            "inputs", "profile", "minutes", "mihomo_path", "state_dir", "geodata_dir")})
+    return record
+
+
+def _watch_cli(argv):
+    values = {}
+    index = 1
+    while index < len(argv):
+        values[argv[index]] = argv[index + 1]
+        index += 2
+    if not re.fullmatch(r"\d+", values["--deadline"]) or not re.fullmatch(r"\d+", values["--parent"]):
+        raise TakeoverError("invalid_arguments")
+    if not _SNAPSHOT_NAME.fullmatch(values["--pin"]):
+        raise TakeoverError("invalid_snapshot_name")
+    result = run_rollback_watch(
+        values["--state-dir"], pin=values["--pin"],
+        deadline_unix=int(values["--deadline"]), parent_pid=int(values["--parent"]))
+    print(json.dumps({"result": result.get("result") if isinstance(result, dict) else None,
+                      "trigger": result.get("trigger") if isinstance(result, dict) else None,
+                      "guarantees_restore_if_watchdog_dies": False},
+                     ensure_ascii=False))
+    return 0 if isinstance(result, dict) and result.get("result") == "rollback_restored" else 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv in ([], ["help"], ["-h"], ["--help"]):
+    if not argv or argv == ["help"] or _wants_help(argv):
         stream = sys.stdout if argv else sys.stderr
         stream.write(HELP)
         return 0 if argv else 2
-    if argv[0] not in ("takeover", "rollback"):
+    if argv[0] not in _COMMANDS:
         sys.stderr.write(HELP)
         return 2
-    if os.geteuid() != 0:
-        # 显式 sudo 前台：非 root 时把自己原样交还给 sudo 重跑。
-        os.execvp("sudo", ["sudo", "--", sys.executable, str(Path(__file__).resolve()), *argv])
     try:
+        _syntax(argv)
+    except TakeoverError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        try:
+            reexec_root(Path(__file__).resolve(), argv)
+        except TakeoverError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+        return 2
+    try:
+        if argv[0] == "rollback-watch":
+            return _watch_cli(argv)
         if argv[0] == "rollback":
             state_dir = None
             rest = argv[1:]
@@ -1287,19 +1812,25 @@ def main(argv=None):
                 return 2
             result = rollback(state_dir if state_dir is not None
                               else macos_prepare.default_state_dir())
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(json.dumps({"result": result["result"], "snapshot": result.get("snapshot")},
+                             ensure_ascii=False))
             return 0 if result["result"] == "rollback_restored" else 1
         options, rest = _parse_takeover_args(argv[1:])
         if rest:
             sys.stderr.write(HELP)
             return 2
-        record = takeover(**options)
+        record = _accept(options) if argv[0] == "accept" else takeover(**options)
     except TakeoverError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
-    print(json.dumps({"result": record.get("result"),
-                      "rollback": record.get("rollback", {}).get("result"),
-                      "snapshot": record.get("snapshot")}, ensure_ascii=False, indent=2))
+    rollback_result = (record.get("rollback") or {}).get("result")
+    summary = {"result": record.get("result"), "rollback": rollback_result,
+               "snapshot": record.get("snapshot")}
+    if argv[0] == "accept":
+        summary["guarantees_restore_if_watchdog_dies"] = False
+    print(json.dumps(summary, ensure_ascii=False))
+    if argv[0] == "accept":
+        return 0 if record.get("result") in ("stopped", "deadline_reached") and rollback_result == "rollback_restored" else 1
     return 0 if record.get("result") in ("stopped", "deadline_reached") else 1
 
 
@@ -1318,9 +1849,9 @@ def _parse_takeover_args(rest):
         else:
             raise TakeoverError("invalid_arguments")
         if flag == "--inputs":
-            values["inputs"] = macos_prepare._load_json(value)
+            values["inputs"] = _load_trusted_json(value)
         elif flag == "--profile":
-            values["profile"] = macos_prepare._load_json(value)
+            values["profile"] = _load_trusted_json(value)
         elif flag == "--minutes":
             if not re.fullmatch(r"\d+", value):
                 raise TakeoverError("invalid_minutes")

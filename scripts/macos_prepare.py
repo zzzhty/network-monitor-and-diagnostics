@@ -167,8 +167,13 @@ def build_rules(profile):
         guardrail_rules() + rules, profile["egress"]["group"])
 
 
-def build_mihomo_document(profile, inputs):
-    """The mihomo document with a fixed key order; deterministic by construction."""
+def build_mihomo_document(profile, inputs, *, geo_auto_update=True):
+    """The mihomo document with a fixed key order; deterministic by construction.
+
+    The short acceptance run turns geo auto-update off so a copied geodata
+    directory is not refreshed from the network during those two minutes.
+    Every other caller keeps the previous default.
+    """
     dns_mode = profile["dns_mode"]["selected"]
     return {
         "mode": "rule",
@@ -176,7 +181,7 @@ def build_mihomo_document(profile, inputs):
         "ipv6": False,
         "tcp-concurrent": True,
         "unified-delay": True,
-        "geo-auto-update": True,
+        "geo-auto-update": bool(geo_auto_update),
         "geo-update-interval": 72,
         "tun": {
             "enable": True,
@@ -314,13 +319,13 @@ def dump_yaml(document):
     return "\n".join(lines) + "\n"
 
 
-def render_config(profile, inputs):
+def render_config(profile, inputs, *, geo_auto_update=True):
     """Validate the whole chain, then return header + YAML text."""
     errors = macos_coexist.validate_experiment_profile(profile)
     if errors:
         raise ValueError("invalid_experiment_profile: " + "; ".join(errors))
     normalized = validate_inputs(inputs)
-    document = build_mihomo_document(profile, normalized)
+    document = build_mihomo_document(profile, normalized, geo_auto_update=geo_auto_update)
     errors = validate_document(document, profile["egress"]["group"])
     if errors:
         raise ValueError("invalid_document: " + "; ".join(errors))
