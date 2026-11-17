@@ -252,6 +252,26 @@ class SupervisorTests(unittest.TestCase):
                          {"error": "not_authorized"})
         self.assertEqual(sup.dispatch({"cmd": "nonsense"}, 0), {"error": "invalid_command"})
 
+    def test_takeover_stop_cli_relay_matches_the_panel_action(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        sup = make_supervisor(self.state, table)
+        # Start as the root peer would (uid 0); the socket below only carries
+        # the stop relay, which any admin-group peer may send — like the panel.
+        self.assertEqual(sup.dispatch({"cmd": "takeover.start"}, 0)["result"],
+                         "takeover_active")
+        server = d.DaemonIPCServer(
+            self.state / "cli.sock", sup.dispatch, group=None).bind()
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        thread = threading.Thread(target=server.serve_forever, args=(stop,), daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        time.sleep(0.05)
+        table.dns_dirty_window = (1, 1)
+        reply = d.DaemonIPCClient(self.state / "cli.sock").stop_takeover()
+        self.assertEqual(reply["result"], "rollback_restored")
+        self.assertEqual(reply["reason"], "manual_stop")
+
     def test_boot_policy_takes_over_on_a_true_boot_with_fresh_snapshot(self):
         table = Table(dns_dirty_window=(1, 10 ** 9))
         sup = make_supervisor(self.state, table, on_boot=True)

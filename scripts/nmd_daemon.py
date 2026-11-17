@@ -886,11 +886,19 @@ def cli_daemon(argv):
     """`nmd macos daemon install|uninstall|start|stop|status|takeover-start`."""
     import manager
     if not argv or argv[0] not in ("install", "uninstall", "start", "stop",
-                                   "status", "takeover-start"):
+                                   "status", "takeover-start", "takeover-stop"):
         sys.stderr.write(HELP)
         return 2
     action = argv[0]
     root = manager.ROOT
+    if action == "takeover-stop":
+        # Same trust as the panel button: any admin-group peer may stop.
+        try:
+            reply = DaemonIPCClient(SOCKET_PATH).stop_takeover()
+        except DaemonError as exc:
+            reply = {"error": str(exc)}
+        print(json.dumps(reply, ensure_ascii=False, indent=2))
+        return 0 if "error" not in reply else 1
     if action == "takeover-start":
         if os.geteuid() != 0:
             os.execvp("sudo", ["sudo", "--", sys.executable,

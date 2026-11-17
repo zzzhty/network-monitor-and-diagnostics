@@ -879,7 +879,7 @@ def main(argv=None):
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
                   "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
                   "                         见 docs/macos-mihomo-tailscale.md\n"
-                  "  macos daemon install/uninstall/start/stop/status/takeover-start\n"
+                  "  macos daemon install/uninstall/start/stop/status/takeover-start/takeover-stop\n"
                   "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管\n"
                   "Linux 网络管理、apply 与 systemd 生命周期在 macOS 不支持。")
             return
