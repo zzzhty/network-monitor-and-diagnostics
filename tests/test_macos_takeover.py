@@ -7,6 +7,7 @@ an exit node, never starts mihomo, and never writes network state.
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -72,6 +73,11 @@ class Table:
             if self.ps_mihomo:
                 body += "  456 /usr/local/bin/mihomo\n"
             return 0, body, None
+        # The fake child is not a real session. Identity probes must not
+        # raise, and they must not look like a confirmed mihomo.
+        if (len(argv) == 5 and argv[0:2] == ("/bin/ps", "-p")
+                and argv[3:] == ("-o", "lstart=,args=")):
+            return 1, "", None
         if argv == ("/usr/sbin/networksetup", "-listallnetworkservices"):
             return 0, ("An asterisk (*) denotes that a network service is disabled.\n"
                        + "\n".join(self.service_dns) + "\n"), None
@@ -540,49 +546,120 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual([item for item in table.mutations if item[0] == TS], [])
             self.assertIn("Wi-Fi:restored", result["steps"])
 
-    def test_rollback_signals_only_the_recorded_mihomo_leader(self):
+    def _identity(self, lstart, work, args=None):
+        command = args if args is not None else f"{MIHOMO} -d {work} -f {work}/config.yaml"
+        return f"{lstart} {command}\n"
+
+    def _ps_runner(self, text, table=None):
+        table = table or Table()
+
+        def runner(argv, timeout):
+            argv = tuple(argv)
+            if (len(argv) == 5 and argv[0:2] == ("/bin/ps", "-p")
+                    and argv[3:] == ("-o", "lstart=,args=")):
+                return 0, text, None
+            return table.runner(argv, timeout)
+
+        return runner
+
+    def test_rollback_signals_only_the_confirmed_mihomo_leader(self):
+        lstart = "Tue Nov 17 18:09:00 2026"
+        work = "/tmp/nmd-owned-work"
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
             self.write_snapshot(state, services=(("Wi-Fi", []),))
-            mod.write_owner(state, 4242, MIHOMO)
+            line = self._identity(lstart, work)
+            mod.write_owner(state, 4242, MIHOMO, work, runner=self._ps_runner(line))
+            owner = json.loads((state / mod.OWNER_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(owner["lstart"], lstart)
+            self.assertIn(f"-d {work}", owner["args"])
             killed = []
 
-            def runner(argv, timeout):
-                if tuple(argv) == ("/bin/ps", "-axo", "pid=,comm="):
-                    return 0, "    1 /sbin/launchd\n 4242 /usr/local/bin/mihomo\n 7777 /bin/bash\n", None
-                return Table().runner(argv, timeout)
-
             with patch.object(mod.os, "getpgid", return_value=4242), \
-                    patch.object(mod.os, "killpg", side_effect=lambda pgid, sig: killed.append(pgid)):
-                result = mod.rollback(state, runner=runner, mutator=Table().mutator,
+                    patch.object(mod.os, "killpg", side_effect=lambda pgid, sig: killed.append((pgid, sig))):
+                result = mod.rollback(state, runner=self._ps_runner(line), mutator=Table().mutator,
                                       sleep=lambda _seconds: None, now=lambda: 0.0,
                                       tailscale_path=TS)
             self.assertEqual(result["result"], "rollback_restored")
             self.assertIn("owner_signalled", result["steps"])
-            self.assertEqual(set(killed), {4242})
+            self.assertEqual({item[0] for item in killed}, {4242})
 
             killed.clear()
-            mod.write_owner(state, 4242, MIHOMO)
-
-            def other(argv, timeout):
-                if tuple(argv) == ("/bin/ps", "-axo", "pid=,comm="):
-                    return 0, " 4242 /usr/bin/python3\n", None
-                return Table().runner(argv, timeout)
-
+            gone = self._ps_runner("")
+            # ps with an empty body is "not running"; a different comm used to
+            # be enough to skip the signal, and it still must not signal.
             with patch.object(mod.os, "getpgid", side_effect=AssertionError("pgid")), \
                     patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
-                result = mod.rollback(state, runner=other, mutator=Table().mutator,
+                result = mod.rollback(state, runner=gone, mutator=Table().mutator,
                                       sleep=lambda _seconds: None, now=lambda: 0.0,
                                       tailscale_path=TS)
             self.assertIn("owner_not_running", result["steps"])
 
-            mod.write_owner(state, 4242, MIHOMO)
             with patch.object(mod.os, "getpgid", return_value=1), \
                     patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
-                result = mod.rollback(state, runner=runner, mutator=Table().mutator,
+                result = mod.rollback(state, runner=self._ps_runner(line), mutator=Table().mutator,
                                       sleep=lambda _seconds: None, now=lambda: 0.0,
                                       tailscale_path=TS)
             self.assertIn("owner_not_session_leader", result["steps"])
+
+    def test_reused_pid_with_the_same_comm_is_not_signalled(self):
+        lstart = "Tue Nov 17 18:09:00 2026"
+        work = "/tmp/nmd-owned-work"
+        reused = self._identity(
+            "Wed Nov 18 01:02:03 2026", "/tmp/other-mihomo",
+            f"{MIHOMO} -d /tmp/other-mihomo -f /tmp/other-mihomo/config.yaml")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, services=(("Wi-Fi", []),))
+            mod.write_owner(state, 4242, MIHOMO, work,
+                            runner=self._ps_runner(self._identity(lstart, work)))
+            table = Table(dns_dirty_window=(0, 10 ** 9))
+            with patch.object(mod.os, "getpgid", side_effect=AssertionError("pgid")), \
+                    patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
+                result = mod.rollback(state, runner=self._ps_runner(reused, table),
+                                      mutator=table.mutator, sleep=table.sleep,
+                                      now=lambda: table.clock, tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_blocked_dirty_dns")
+            self.assertIn("owner_identity_mismatch", result["steps"])
+            self.assertEqual(table.mutations, [])
+
+    def test_owner_recorded_without_a_start_time_is_not_signalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, services=(("Wi-Fi", []),))
+            (state / mod.OWNER_FILE).write_text(json.dumps(
+                {"schema_version": 1, "pid": 4242, "mihomo": MIHOMO}), encoding="utf-8")
+            with patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
+                result = mod.rollback(state, runner=Table().runner, mutator=Table().mutator,
+                                      sleep=lambda _seconds: None, now=lambda: 0.0,
+                                      tailscale_path=TS)
+            self.assertIn("owner_unconfirmed", result["steps"])
+            self.assertEqual(result["result"], "rollback_restored")
+
+    def test_dead_controller_restores_the_pinned_snapshot_and_keeps_user_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            outside = Path(tempfile.mkdtemp())
+            self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+            kept = state / "user-kept.txt"
+            kept.write_text("keep-me", encoding="utf-8")
+            outside_file = outside / "user-mihomo.yaml"
+            outside_file.write_text("do-not-touch", encoding="utf-8")
+            pinned = self.write_snapshot(state, services=(("Wi-Fi", ["192.0.2.53"]),))
+            original = pinned.read_bytes()
+            mod.write_pin(state, pinned.name)
+            table = Table(services=(("Wi-Fi", []),))
+            table.exit_node_cleared = True
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertEqual(result["snapshot"], pinned.name)
+            self.assertEqual(pinned.read_bytes(), original)
+            self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
+            self.assertEqual((state / mod.PIN_FILE).read_text(encoding="utf-8").find(pinned.name) > 0, True)
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "do-not-touch")
+            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
 
 
 class WorkdirTests(unittest.TestCase):
@@ -649,6 +726,95 @@ class WorkdirTests(unittest.TestCase):
                              now=lambda: 0.0)
             self.assertEqual(list(real.iterdir()), [])
 
+    def test_symlink_ancestor_and_shared_parent_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real"
+            real.mkdir()
+            link = base / "link"
+            link.symlink_to(real, target_is_directory=True)
+            state = link / "state"
+            state.mkdir(mode=0o700)
+            with self.assertRaisesRegex(mod.TakeoverError, "unsafe_path_symlink"):
+                mod.takeover(inputs=INPUTS, profile=PROFILE, minutes=1, mihomo_path=MIHOMO,
+                             state_dir=state, runner=Table().runner, mutator=Table().mutator,
+                             spawner=Table().spawner, tcp=Table().tcp,
+                             exists=lambda path: path == TS, sleep=lambda _s: None,
+                             now=lambda: 0.0)
+            self.assertEqual([path.name for path in real.iterdir()], ["state"])
+            self.assertEqual(list((real / "state").iterdir()), [])
+            mod.assert_private_ancestors(base / "not-created-yet")
+            base.chmod(0o777)
+            nested = base / "nested"
+            nested.mkdir(mode=0o700)
+            with self.assertRaisesRegex(mod.TakeoverError, "unsafe_path_parent"):
+                mod.rollback(nested, runner=Table().runner, mutator=Table().mutator,
+                             sleep=lambda _s: None, now=lambda: 0.0, tailscale_path=TS)
+            with self.assertRaisesRegex(mod.TakeoverError, "unsafe_path_parent"):
+                mod.assert_private_ancestors(base / "not-created-yet")
+
+    def test_ps_identity_accepts_ctime_and_rejects_a_prefix_work_dir(self):
+        parsed = mod._parse_ps_identity(
+            "Tue Nov  4 18:09:00 2026 /usr/local/bin/mihomo -d /tmp/work -f /tmp/work/config.yaml\n")
+        self.assertEqual(parsed[0], "Tue Nov  4 18:09:00 2026")
+        self.assertFalse(mod._command_matches(MIHOMO, "/tmp/work",
+                                              [MIHOMO, "-d", "/tmp/work-evil", "-f", "/tmp/work-evil/c.yaml"]))
+        self.assertTrue(mod._command_matches(MIHOMO, "/tmp/work", parsed[1]))
+        self.assertIsNone(mod._parse_ps_identity("mihomo\n"))
+        self.assertIsNone(mod._parse_ps_identity(""))
+
+    def test_root_does_not_stage_var_root_geodata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root_home = base / "var-root"
+            user_home = base / "user"
+            root_geo = root_home / ".config" / "mihomo"
+            user_geo = user_home / ".config" / "mihomo"
+            for directory in (root_home, root_home / ".config", root_geo,
+                              user_home, user_home / ".config", user_geo):
+                directory.mkdir(mode=0o700)
+            (root_geo / "geosite.dat").write_bytes(b"root-secret")
+            (user_geo / "geosite.dat").write_bytes(b"user-secret")
+            account = type("Account", (), {"pw_uid": os.getuid(), "pw_dir": str(user_home),
+                                           "pw_name": "alice"})()
+            target = base / "work"
+            target.mkdir(mode=0o700)
+            with patch.object(mod.os, "geteuid", return_value=0), \
+                    patch.dict(mod.os.environ, {"SUDO_USER": "alice", "HOME": str(root_home)}), \
+                    patch("pwd.getpwnam", return_value=account):
+                source = mod.default_geodata_dir()
+                staged, _missing = mod.stage_geodata(target, source)
+            self.assertEqual(source, user_geo)
+            self.assertEqual((target / "geosite.dat").read_bytes(), b"user-secret")
+            self.assertIn("geosite.dat", staged)
+            with patch.object(mod.os, "geteuid", return_value=0), \
+                    patch.dict(mod.os.environ, {"SUDO_USER": "", "HOME": str(root_home)}, clear=False):
+                self.assertIsNone(mod.default_geodata_dir())
+            staged, missing = mod.stage_geodata(target, None)
+            self.assertEqual(staged, [])
+            self.assertIn("geosite.dat", missing)
+            self.assertIsNone(mod.geodata_dir_for_uid(0))
+            self.assertIsNone(mod.geodata_dir_for_uid(True))
+
+    def test_explicit_geodata_symlink_fails_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real"
+            real.mkdir(mode=0o700)
+            link = base / "linked"
+            link.symlink_to(real, target_is_directory=True)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            with self.assertRaisesRegex(mod.TakeoverError, "unsafe_path_symlink"):
+                mod.takeover(inputs=INPUTS, profile=PROFILE, minutes=1, mihomo_path=MIHOMO,
+                             state_dir=state, geodata_dir=link, runner=Table().runner,
+                             mutator=Table().mutator, spawner=Table().spawner, tcp=Table().tcp,
+                             exists=lambda path: path == TS, sleep=lambda _s: None,
+                             now=lambda: 0.0)
+            self.assertEqual(list(state.iterdir()), [])
+            with self.assertRaisesRegex(mod.TakeoverError, "invalid_geodata_dir"):
+                mod.resolve_geodata_dir("relative/geodata")
+
 
 class ContractPins(unittest.TestCase):
     def test_deadline_and_watchdog_constants(self):
@@ -686,7 +852,29 @@ class CLITests(unittest.TestCase):
             ["--inputs", example, "--minutes", "10"])
         self.assertEqual(rest, [])
         self.assertEqual(values["minutes"], 10)
+        self.assertIsNone(values["geodata_dir"])
         self.assertEqual(values["inputs"], macos_prepare.PLACEHOLDER_INPUTS)
+        values, rest = mod._parse_takeover_args(
+            ["--inputs", example, "--geodata-dir", "/tmp/nmd-geodata"])
+        self.assertEqual(values["geodata_dir"], "/tmp/nmd-geodata")
+        self.assertEqual(rest, [])
+
+    def test_process_identity_ps_is_allowlisted_only_for_a_numeric_pid(self):
+        with patch.object(macos_readonly, "bounded_run", return_value=(0, b"ok\n", None)) as run:
+            code, text, error = macos_prepare.execute(
+                ["/bin/ps", "-p", "4242", "-o", "lstart=,args="], 2)
+        self.assertEqual((code, text, error), (0, "ok\n", None))
+        self.assertEqual(run.call_args.args[0], ["/bin/ps", "-p", "4242", "-o", "lstart=,args="])
+        with patch.object(macos_readonly.subprocess, "Popen", side_effect=AssertionError("spawn")):
+            for argv in (
+                ["/bin/ps", "-p", "4242;rm", "-o", "lstart=,args="],
+                ["/bin/ps", "-p", "01", "-o", "lstart=,args="],
+                ["/bin/ps", "-axo", "pid=,args="],
+                ["/bin/ps", "-p", "1", "-o", "lstart=,args="],
+            ):
+                with self.subTest(argv=argv):
+                    with self.assertRaisesRegex(ValueError, "command_not_allowlisted"):
+                        macos_prepare.execute(argv, 2)
 
     def test_unknown_subcommand_and_help_exit_codes(self):
         script = str(ROOT / "scripts/macos_takeover.py")

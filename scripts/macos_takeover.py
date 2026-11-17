@@ -10,9 +10,11 @@ lives inside the absolute ``-d`` work directory staged for that run.
 The controller runs in the foreground under an absolute deadline (default
 10 minutes, at most 8 hours, never renewed); STOP or the deadline rolls the
 machine back idempotently from the snapshot taken before the cutover. Only
-the mihomo process group this run recorded is ever signalled. A standalone
-``rollback`` uses that record too, so a second process can unwind a dead
-controller without scanning for arbitrary mihomo processes.
+the mihomo process group this run recorded is ever signalled, and only after
+its start time and command line still match that record. A standalone
+``rollback`` uses the pinned snapshot too, so a second process can unwind a
+dead controller without scanning for arbitrary mihomo processes and without
+deleting files already in the state directory.
 
 The rollback contract implemented here is the one recorded in
 docs/macos-mihomo-tailscale.md: snapshot first, stop our process, confirm
@@ -79,15 +81,16 @@ GEODATA_MAX_BYTES = 64 * 1024 * 1024
 
 HELP = """\
 usage: sudo python3 scripts/macos_takeover.py takeover --inputs INPUTS.json \
-      [--profile PROFILE.json] [--minutes N] [--mihomo PATH] [--state-dir DIR]
+      [--profile PROFILE.json] [--minutes N] [--mihomo PATH] [--state-dir DIR] \
+      [--geodata-dir DIR]
        sudo python3 scripts/macos_takeover.py rollback [--state-dir DIR]
 
 Foreground takeover of macOS egress with an absolute deadline (default
 10 minutes, 8 hours at most, never renewed). STOP or the deadline rolls back
 idempotently from the snapshot pinned before the cutover, or the newest
-regular pre-start file when nothing was pinned. Only the recorded mihomo
-session leader is signalled; system proxy and bypass are never changed.
-Run it under sudo.
+regular pre-start file when nothing was pinned. The recorded mihomo is
+signalled only when its pid, start time, command line, and session id still
+match; system proxy and bypass are never changed. Run it under sudo.
 """
 
 
@@ -261,6 +264,193 @@ def first_tailscale(exists=None):
     raise TakeoverError("tailscale_missing")
 
 
+# --- path trust --------------------------------------------------------------
+
+# macOS ships /tmp, /var and /etc as root-owned symlinks into /private.
+# Any other symlink on a config or state path is an attacker-controlled
+# redirect. The walk uses lstat and never Path.resolve().
+_SYSTEM_ALIAS = {
+    "/tmp": "/private/tmp",
+    "/var": "/private/var",
+    "/etc": "/private/etc",
+}
+_STICKY_TEMPS = frozenset({
+    "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp",
+})
+_LSTART = re.compile(
+    r"^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$")
+_PS_IDENTITY = re.compile(
+    r"^([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})\s+(\S.*\S|\S)\s*$")
+_ACCOUNT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+
+
+def _absolute_lexical(path):
+    """Absolute path with ``..`` rejected. Symlinks stay as written."""
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if ".." in path.parts or "." in path.parts[1:]:
+        raise TakeoverError("unsafe_path_component")
+    return path
+
+
+def _trusted_system_alias(path, info):
+    expected = _SYSTEM_ALIAS.get(path.as_posix())
+    if expected is None or info.st_uid != 0:
+        return False
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return False
+    return os.path.normpath("/" + target.lstrip("/")) == expected
+
+
+def _ancestor_writable_ok(path, info):
+    """Group/world write is allowed only on the four sticky temp directories."""
+    mode = stat.S_IMODE(info.st_mode)
+    if not mode & 0o022:
+        return True
+    if path.as_posix() not in _STICKY_TEMPS:
+        return False
+    return info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+
+
+def assert_private_ancestors(path):
+    """Refuse a symlink or a replaceable parent above ``path``.
+
+    Missing tail components are fine: the caller may still be about to
+    create them. A leaf that exists must be a private directory or a
+    private regular file. This does not close a swap that happens after
+    the walk returns.
+    """
+    path = _absolute_lexical(path)
+    try:
+        root_info = os.lstat("/")
+    except OSError as exc:
+        raise TakeoverError("path_unusable") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise TakeoverError("unsafe_path_component")
+    if not _ancestor_writable_ok(Path("/"), root_info):
+        raise TakeoverError("unsafe_path_parent")
+    current = Path("/")
+    parts = path.parts[1:]
+    if not parts:
+        raise TakeoverError("unsafe_path_component")
+    for index, name in enumerate(parts):
+        if name in ("", ".", ".."):
+            raise TakeoverError("unsafe_path_component")
+        current = current / name
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return path
+        except OSError as exc:
+            raise TakeoverError("path_unusable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            if not _trusted_system_alias(current, info):
+                raise TakeoverError("unsafe_path_symlink")
+            continue
+        last = index == len(parts) - 1
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            if last and mode & 0o022:
+                raise TakeoverError("unsafe_path_parent")
+            if not last and not _ancestor_writable_ok(current, info):
+                raise TakeoverError("unsafe_path_parent")
+            continue
+        if last and stat.S_ISREG(info.st_mode):
+            if mode & 0o022:
+                raise TakeoverError("unsafe_path_parent")
+            return path
+        raise TakeoverError("unsafe_path_component")
+    return path
+
+
+def _private_directory(path):
+    """A real directory with no group/world write, under trusted ancestors."""
+    path = assert_private_ancestors(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise TakeoverError("invalid_geodata_dir") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise TakeoverError("invalid_geodata_dir")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise TakeoverError("invalid_geodata_dir")
+    return path, info
+
+
+def _safe_mihomo_config_dir(home, owner_uid):
+    """``~/.config/mihomo`` only when that exact directory is privately owned."""
+    home = Path(home)
+    if not home.is_absolute() or ".." in home.parts:
+        return None
+    source = home / ".config" / "mihomo"
+    try:
+        path, info = _private_directory(source)
+    except TakeoverError:
+        return None
+    if info.st_uid != owner_uid:
+        return None
+    return path
+
+
+def _sudo_user_home():
+    """Home from the account that invoked sudo, never from root's HOME."""
+    import pwd
+    name = os.environ.get("SUDO_USER", "")
+    if not _ACCOUNT_NAME.fullmatch(name) or name == "root":
+        return None
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    if account.pw_uid == 0:
+        return None
+    return account
+
+
+def default_geodata_dir():
+    """Geodata directory for this process, or None when that home is not safe.
+
+    ``sudo`` on macOS sets HOME to ``/var/root``. Reading that directory
+    makes a normal user's config look missing. A root foreground run uses
+    ``SUDO_USER``'s home; without that account it stages nothing.
+    """
+    if os.geteuid() == 0:
+        account = _sudo_user_home()
+        if account is None:
+            return None
+        return _safe_mihomo_config_dir(account.pw_dir, account.pw_uid)
+    return _safe_mihomo_config_dir(Path.home(), os.geteuid())
+
+
+def geodata_dir_for_uid(uid):
+    """Geodata for a non-root account. launchd has no SUDO_USER, so the
+    daemon uses the config file's owner. uid 0 stages nothing.
+    """
+    import pwd
+    if type(uid) is not int or isinstance(uid, bool) or uid <= 0:
+        return None
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError:
+        return None
+    if account.pw_uid == 0:
+        return None
+    return _safe_mihomo_config_dir(account.pw_dir, account.pw_uid)
+
+
+def resolve_geodata_dir(override):
+    """Explicit directory, or the safe default. An explicit unsafe path errors."""
+    if override is None:
+        return default_geodata_dir()
+    path = Path(override)
+    if not path.is_absolute():
+        raise TakeoverError("invalid_geodata_dir")
+    return _private_directory(path)[0]
+
+
 # --- self-contained mihomo work dir ------------------------------------------
 
 
@@ -269,9 +459,10 @@ def ensure_workdir(path):
 
     ``mkdir`` on an existing path is a no-op, and ``exists()`` follows a
     symlink, so a work directory that is already a link would otherwise
-    receive the config. The leaf is checked after creation.
+    receive the config. Ancestors are checked before the create; the leaf
+    is checked again after it.
     """
-    path = Path(path)
+    path = assert_private_ancestors(path)
     macos_prepare._create_private_parents(path)
     try:
         info = path.lstat()
@@ -302,12 +493,21 @@ def config_is_direct_regular(work_dir, config_path):
 def stage_geodata(target_dir, source_dir=None):
     """Copy regular geodata next to the config. Symlinks are never followed.
 
+    ``source_dir is None`` stages nothing. Callers that want the account
+    default pass ``resolve_geodata_dir(None)``; this function does not
+    guess ``Path.home()``, because under sudo that is ``/var/root``.
     Missing files are reported. Nothing is downloaded here. A symlink already
     sitting in the work directory is removed rather than treated as staged,
-    so a later ``mihomo -d`` cannot write through it.
+    so a later ``mihomo -d`` cannot write through it. An unsafe source
+    reports every file missing and copies nothing.
     """
-    source_dir = Path(source_dir) if source_dir is not None else Path.home() / ".config/mihomo"
     target_dir = Path(target_dir)
+    if source_dir is None:
+        return [], list(GEODATA_FILES)
+    try:
+        source_dir = _private_directory(source_dir)[0]
+    except TakeoverError:
+        return [], list(GEODATA_FILES)
     staged, missing = [], []
     for name in GEODATA_FILES:
         target = target_dir / name
@@ -646,14 +846,76 @@ def read_pin(state_dir):
     return name
 
 
-def write_owner(state_dir, pid, mihomo):
-    """Record the one process group rollback is allowed to signal."""
+def _parse_ps_identity(text):
+    """``lstart`` plus argv tokens from ``ps -o lstart=,args=`` under LC_ALL=C."""
+    if not isinstance(text, str):
+        return None
+    line = text.strip().splitlines()
+    if len(line) != 1:
+        return None
+    match = _PS_IDENTITY.fullmatch(line[0].strip())
+    if match is None or not _LSTART.fullmatch(match.group(1)):
+        return None
+    tokens = match.group(2).split()
+    if not tokens:
+        return None
+    return match.group(1), tokens
+
+
+def _probe_process(pid, runner):
+    """The live start time and argv, or None when ps cannot show that pid."""
+    try:
+        code, text = read_state(
+            ["/bin/ps", "-p", str(pid), "-o", "lstart=,args="], runner=runner)
+    except (TakeoverError, ValueError, OSError):
+        return "unconfirmed"
+    if code not in (0, 1):
+        return "unconfirmed"
+    parsed = _parse_ps_identity(text) if code == 0 else None
+    if parsed is None:
+        return None if not str(text or "").strip() else "unconfirmed"
+    return parsed
+
+
+def _command_matches(mihomo, work_dir, tokens):
+    """True when argv0 is this mihomo and ``-d`` is exactly the work directory."""
+    if not tokens or not isinstance(mihomo, str) or not isinstance(work_dir, str):
+        return False
+    if any(token != token.strip() or not token for token in (mihomo, work_dir)):
+        return False
+    argv0 = tokens[0]
+    base = argv0.rsplit("/", 1)[-1]
+    recorded = mihomo.rsplit("/", 1)[-1]
+    if argv0 != mihomo and not (base == "mihomo" and recorded == "mihomo"):
+        return False
+    return any(tokens[index] == "-d" and tokens[index + 1] == work_dir
+               for index in range(len(tokens) - 1))
+
+
+def write_owner(state_dir, pid, mihomo, work_dir, *, runner=None):
+    """Record the one process group rollback is allowed to signal.
+
+    The pid alone is not an identity: it is stored together with the ps
+    start time and the exact argv ps reported, and only when that argv is
+    this mihomo and this work directory. A probe that misses the process
+    still writes the file, without those fields, so a later rollback
+    refuses to signal.
+    """
     if type(pid) is not int or isinstance(pid, bool) or pid <= 1:
         return
-    if not isinstance(mihomo, str) or not mihomo:
+    if not isinstance(mihomo, str) or not mihomo.startswith("/"):
+        return
+    if not isinstance(work_dir, str) or not work_dir.startswith("/") or ".." in Path(work_dir).parts:
         return
     payload = {"schema_version": SCHEMA_VERSION, "pid": pid, "mihomo": mihomo,
+               "work_dir": work_dir,
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())}
+    probed = _probe_process(pid, runner)
+    if isinstance(probed, tuple):
+        lstart, tokens = probed
+        if _command_matches(mihomo, work_dir, tokens):
+            payload["lstart"] = lstart
+            payload["args"] = " ".join(tokens)
     directory = Path(state_dir)
     macos_prepare._create_private_parents(directory)
     macos_prepare._atomic_private_write(
@@ -678,33 +940,54 @@ def _read_owner(state_dir):
     return data if isinstance(data, dict) else "untrusted"
 
 
-def stop_owned_mihomo(state_dir, runner=None):
-    """Signal the recorded session leader when ps still says it is mihomo.
+def _owner_confirmed(owner):
+    if not isinstance(owner, dict):
+        return False
+    lstart = owner.get("lstart")
+    args = owner.get("args")
+    work = owner.get("work_dir")
+    mihomo = owner.get("mihomo")
+    if not isinstance(lstart, str) or _LSTART.fullmatch(lstart) is None:
+        return False
+    if not isinstance(args, str) or not args or len(args) > 4096:
+        return False
+    if not isinstance(work, str) or not work.startswith("/"):
+        return False
+    if not isinstance(mihomo, str) or not mihomo.startswith("/"):
+        return False
+    return True
 
-    Any other pid, a reused pid that is no longer a session leader, or a
-    comm that is not ``mihomo`` is left alone. This is what lets a second
-    process roll back after the controller itself is gone.
+
+def stop_owned_mihomo(state_dir, runner=None):
+    """Signal the recorded session leader only when the same process is still there.
+
+    pid plus the comm name is not enough: a recycled pid can belong to
+    another mihomo that is also a session leader. The start time and the
+    full argv captured at launch both have to match, and ``-d`` has to be
+    this run's work directory. A dead controller uses this to roll back.
+    A mismatch does not signal. A pid that is already gone is
+    ``owner_not_running`` and the restore continues.
     """
     owner = _read_owner(state_dir)
     if owner is None:
         return "no_owner"
     if owner == "untrusted":
         return "owner_untrusted"
-    pid = owner.get("pid")
+    pid = owner.get("pid") if isinstance(owner, dict) else None
     if type(pid) is not int or isinstance(pid, bool) or pid <= 1:
         return "owner_invalid"
-    try:
-        _, text = read_state(["/bin/ps", "-axo", "pid=,comm="], runner=runner)
-    except TakeoverError:
+    if not _owner_confirmed(owner):
         return "owner_unconfirmed"
-    comm = None
-    for line in text.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) == 2 and parts[0] == str(pid):
-            comm = parts[1].strip().rsplit("/", 1)[-1]
-            break
-    if comm != "mihomo":
+    probed = _probe_process(pid, runner)
+    if probed == "unconfirmed":
+        return "owner_unconfirmed"
+    if probed is None:
         return "owner_not_running"
+    lstart, tokens = probed
+    if lstart != owner["lstart"] or " ".join(tokens) != owner["args"]:
+        return "owner_identity_mismatch"
+    if not _command_matches(owner["mihomo"], owner["work_dir"], tokens):
+        return "owner_identity_mismatch"
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
@@ -730,11 +1013,14 @@ def rollback(state_dir, *, runner=None, mutator=None, sleep=None, now=None,
 
     The recorded mihomo is signalled first so native DNS can leave before
     the exit node is put back. Idempotent: a second call that finds the
-    live values already match the snapshot does not mutate.
+    live values already match the snapshot does not mutate. Nothing in the
+    state directory is deleted: the pinned snapshot, the pin, and any
+    pre-existing file stay where they are.
     """
-    state = Path(state_dir)
+    state = _absolute_lexical(state_dir)
     if state.is_symlink():
         raise TakeoverError("state_dir_symlink")
+    assert_private_ancestors(state)
     if snapshot_name is None:
         snapshot_name = read_pin(state)
     chosen = _select_snapshot(state, snapshot_name)
@@ -818,8 +1104,11 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             return execute_mutating(argv, mihomo_path=mihomo)
     state_dir = Path(state_dir if state_dir is not None
                      else macos_prepare.default_state_dir())
+    state_dir = _absolute_lexical(state_dir)
     if state_dir.is_symlink():
         raise TakeoverError("state_dir_symlink")
+    assert_private_ancestors(state_dir)
+    geodata_source = resolve_geodata_dir(geodata_dir)
     record = {"schema_version": SCHEMA_VERSION, "kind": "macos_takeover_run",
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
               "minutes": minutes, "mutations": [], "steps": [],
@@ -837,7 +1126,7 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     config_dir = ensure_workdir(state_dir / "takeover")
     config_path = config_dir / "config.yaml"
     macos_prepare._atomic_private_write(config_dir, "config.yaml", text.encode())
-    staged, missing = stage_geodata(config_dir, geodata_dir)
+    staged, missing = stage_geodata(config_dir, geodata_source)
     record["geodata_staged"] = staged
     record["geodata_missing"] = missing
     step("config_written")
@@ -913,7 +1202,7 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         if not config_is_direct_regular(config_dir, config_path):
             raise TakeoverError("config_not_confined")
         process.start(spawner=spawner)
-        write_owner(state_dir, process.pid, mihomo)
+        write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
         step("mihomo_started")
 
         deadline = now() + minutes * 60
@@ -1016,11 +1305,12 @@ def main(argv=None):
 
 def _parse_takeover_args(rest):
     values = {"inputs": None, "profile": None, "minutes": DEFAULT_MINUTES,
-              "mihomo_path": None, "state_dir": None}
+              "mihomo_path": None, "state_dir": None, "geodata_dir": None}
     index = 0
     while index < len(rest):
         flag, value = rest[index], None
-        if flag in ("--inputs", "--profile", "--minutes", "--mihomo", "--state-dir"):
+        if flag in ("--inputs", "--profile", "--minutes", "--mihomo",
+                    "--state-dir", "--geodata-dir"):
             if index + 1 >= len(rest):
                 raise TakeoverError("invalid_arguments")
             value = rest[index + 1]
@@ -1037,6 +1327,8 @@ def _parse_takeover_args(rest):
             values["minutes"] = int(value)
         elif flag == "--mihomo":
             values["mihomo_path"] = value
+        elif flag == "--geodata-dir":
+            values["geodata_dir"] = value
         else:
             values["state_dir"] = value
     if values["inputs"] is None:

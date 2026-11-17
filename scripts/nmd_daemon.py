@@ -149,14 +149,7 @@ def load_daemon_config(path, *, expected_uid=None):
             raise DaemonError("config_group_or_world_writable")
         if expected_uid is not None and info.st_uid != expected_uid:
             raise DaemonError("config_owner_changed")
-        try:
-            parent_info = path.parent.lstat()
-        except OSError as exc:
-            raise DaemonError("config_unreadable") from exc
-        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
-            raise DaemonError("config_not_regular")
-        if stat.S_IMODE(parent_info.st_mode) & 0o022:
-            raise DaemonError("config_group_or_world_writable")
+        _require_trusted_path(path)
         data = os.read(fd, 65537)
     finally:
         os.close(fd)
@@ -178,8 +171,19 @@ def write_daemon_config(path, value):
     return path
 
 
+def _require_trusted_path(path):
+    """Reject a symlink or a replaceable ancestor. The leaf may be the file."""
+    try:
+        macos_takeover.assert_private_ancestors(path)
+    except macos_takeover.TakeoverError as exc:
+        if str(exc) == "unsafe_path_parent":
+            raise DaemonError("config_group_or_world_writable") from exc
+        raise DaemonError("config_not_regular") from exc
+
+
 def check_private_config(path, *, expected_uid=None):
     """The root supervisor re-checks this user-owned file before trusting it."""
+    _require_trusted_path(path)
     info = os.lstat(path)
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise DaemonError("config_group_or_world_writable")
@@ -450,8 +454,16 @@ class RootSupervisor:
         self.config = validate_daemon_config(config)
         takeover = self.config["takeover"]
         state_dir = Path(state_dir)
+        if not state_dir.is_absolute():
+            state_dir = Path.cwd() / state_dir
         if state_dir.is_symlink():
             raise DaemonError("state_dir_symlink")
+        try:
+            macos_takeover.assert_private_ancestors(state_dir)
+        except macos_takeover.TakeoverError as exc:
+            if str(exc) == "unsafe_path_symlink":
+                raise DaemonError("state_dir_symlink") from exc
+            raise DaemonError("unsafe_state_dir") from exc
         self.state_dir = state_dir
         self.runner = runner or macos_prepare.execute
         self.sleep = sleep or time.sleep
@@ -666,7 +678,9 @@ class RootSupervisor:
                 macos_takeover.launch_argv(self.mihomo, config_dir, config_path),
                 str(config_dir / "mihomo.log"))
             process.start(spawner=self.spawner)
-            macos_takeover.write_owner(self.state_dir, process.pid, self.mihomo)
+            macos_takeover.write_owner(
+                self.state_dir, process.pid, self.mihomo, str(config_dir),
+                runner=self.runner)
             ready_by = self.now() + macos_takeover.READY_TIMEOUT_SECONDS
             while self.now() < ready_by:
                 if self._cancel.is_set():
@@ -1364,9 +1378,16 @@ def main(argv=None):
         check_private_config(config_path)
         state_dir = Path(state_dir if config["takeover"]["state_dir"] is None
                          else config["takeover"]["state_dir"])
+        # launchd does not set SUDO_USER, and sudo's HOME is /var/root.
+        # The account that owns the config is the one whose geodata we copy.
+        try:
+            owner_uid = os.lstat(config_path).st_uid
+        except OSError as exc:
+            raise DaemonError("config_unreadable") from exc
         stopped = threading.Event()
         _install_signal_stop(stopped)
-        RootSupervisor(config, state_dir).run(stopped)
+        RootSupervisor(config, state_dir,
+                       geodata_dir=macos_takeover.geodata_dir_for_uid(owner_uid)).run(stopped)
         return 0
     if argv[0] == "run-user":
         config_path = None

@@ -298,8 +298,11 @@ launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端�
 **`nmd update` 只更新磁盘代码，launchd 里的 root 管理器仍在跑旧代码**——更新后
 需 `nmd macos daemon stop && nmd macos daemon start` 重载（update 会在安装了
 守护时提示）。daemon 代码没有在实机运行。另一终端的
-`sudo nmd macos rollback` 不拿管理器的锁：它读 pin，只向记录下来的 mihomo
-会话组长发信号，再按快照恢复。管理器进程没了、或者 198.18 一直清不掉时，
+`sudo nmd macos rollback` 不拿管理器的锁：它读 pin，只在 `owned-mihomo.json`
+里的 pid、`ps` 的启动时间、完整 argv（含精确的 `-d` 工作目录）和会话组
+长身份同时对得上时才发信号，再按这份原始快照恢复。pid 被同名进程复用、
+或启动时没记下启动时间时，不发信号。回退不删除 state 目录里已有的文件，
+也不删除 pin 和快照。管理器进程没了、身份对不上、或者 198.18 一直清不掉时，
 这次回退仍可能停在 `rollback_blocked_dirty_dns`；`ROLLBACK_POLICY` 里
 `guarantees_restore_if_watchdog_and_sampler_die` 仍是 false。
 
@@ -307,11 +310,16 @@ launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端�
 
 `scripts/macos_takeover.py` 把上面的实验落成仓库内的 sudo 前台控制器，经 `sudo nmd macos takeover|rollback` 或直接 `sudo python3 scripts/macos_takeover.py …` 调用（非 root 自动把自身交还 sudo 重跑）。变更面是封闭集合，逐一在 `mutating_allowlisted` 里把关后才执行：`tailscale set` 仅限 `--exit-node=<token>`（空值表示清除；token 只允许字母、数字和 `:_./+-`）/`--exit-node-allow-lan-access=true|false`/`--accept-dns=true|false`，`networksetup -setdnsservers`，以及 mihomo 的 `-d <工作目录> -t -f <该目录下的配置>` 校验和 `-d <工作目录> -f <该目录下的配置>` 启动。配置必须是工作目录的直接子文件，不能是符号链接。系统代理与 bypass 永不触碰。
 
-一次 takeover 的顺序：生成配置并写入私有 state 目录 → 按上面的 argv 做 `mihomo -t`（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 把快照文件名写入 `rollback-pin.json` → 清 exit node → 启动自有进程组并记下 pid → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；TCP 成功不是应用成功；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过。独立 `rollback` 先读 pin（没有 pin 才用最新的普通 `pre-start-*.json`，跳过符号链接），再只向 `owned-mihomo.json` 里那个 pid 发信号——`ps` 的 comm 必须仍是 `mihomo`，且它必须是会话组长。然后确认 scutil 无 198.18，再恢复 exit node、allow-lan（`=true`/`=false`）、accept-dns 和每块网卡 DNS。198.18 还在时报 `rollback_blocked_dirty_dns` 并且不恢复 exit node。快照里没有可读 prefs 时不动 exit node。某一块网卡失败不会跳过后面的网卡，结果是 `rollback_incomplete`。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
+state 目录、mihomo 工作目录和 daemon 配置在写入或读取前按路径分量 `lstat`，不 `resolve` 整条路径。除了 root 拥有、且目标正好是 `/private/tmp`、`/private/var`、`/private/etc` 的 `/tmp`、`/var`、`/etc` 之外，任何祖先符号链接都拒绝。组或其他人可写只允许出现在 `/tmp`、`/private/tmp`、`/var/tmp`、`/private/var/tmp` 这四个 sticky 目录上；叶子目录本身有组/其他写位也拒绝。这挡的是替换父目录，挡不住检查返回之后的替换。
+
+geodata 只从显式 `--geodata-dir`，或从当前账户的 `~/.config/mihomo` 复制普通文件。`sudo` 把 HOME 设成 `/var/root`，所以 euid 0 时不用 `Path.home()`：前台用 `SUDO_USER` 的家目录，launchd 没有这个变量，就用 daemon 配置文件所有者的家目录。uid 0、目录是符号链接、祖先不安全、或缺账户时不复制任何文件，校验失败即零网络变更。显式传入的目录如果不安全，在任何变更之前直接报错。
+
+一次 takeover 的顺序：确认 state 与 geodata 路径 → 生成配置并写入私有 state 目录 → 按上面的 argv 做 `mihomo -t`（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 把快照文件名写入 `rollback-pin.json` → 清 exit node → 启动自有进程组，并用 `ps -p <pid> -o lstart=,args=` 记下启动时间和完整 argv → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；TCP 成功不是应用成功；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过。独立 `rollback` 先读 pin（没有 pin 才用最新的普通 `pre-start-*.json`，跳过符号链接），再只在启动时间、完整 argv 和 `-d` 工作目录都与记录一致、且该 pid 仍是会话组长时发信号。对不上就不发信号。然后确认 scutil 无 198.18，再恢复 exit node、allow-lan（`=true`/`=false`）、accept-dns 和每块网卡 DNS。198.18 还在时报 `rollback_blocked_dirty_dns` 并且不恢复 exit node。快照里没有可读 prefs 时不动 exit node。某一块网卡失败不会跳过后面的网卡，结果是 `rollback_incomplete`。回退不删除 state 目录里的已有文件、pin 或快照。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
 
 ```bash
-sudo nmd macos takeover --inputs /path/to/inputs.json --minutes 10
-sudo nmd macos rollback            # 手动幂等回退：有 pin 用 pin，否则用最新普通快照
+sudo nmd macos takeover --inputs /path/to/inputs.json --minutes 10 \
+  --state-dir DIR --geodata-dir DIR
+sudo nmd macos rollback --state-dir DIR
 ```
 
 控制器代码没有在实机运行：上面的顺序有离线测试逐路径覆盖（含停止、到期、三个故障周期、就绪超时、进程早退、前置失败与各类回退），真实机器上的首次运行仍按上文的实机验收边界对待。

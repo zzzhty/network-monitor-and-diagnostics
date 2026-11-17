@@ -376,6 +376,15 @@ def _limit_for(key):
             return _TAILSCALE_STATUS_LIMIT
         if key[1:] == ("debug", "prefs"):
             return _PREFS_LIMIT
+    # One process's start time and argv. The pid is a canonical integer, so
+    # this cannot become ``ps`` with a free-form selector.
+    if (len(key) == 5 and key[0:2] == ("/bin/ps", "-p")
+            and key[3:] == ("-o", "lstart=,args=")):
+        pid_text = key[2]
+        if pid_text.isdigit():
+            pid = int(pid_text)
+            if 1 < pid <= 2 ** 31 - 1 and str(pid) == pid_text:
+                return _FIXED_LIMIT
     return None
 
 

@@ -118,6 +118,17 @@ class ConfigTests(unittest.TestCase):
             os.chmod(base, 0o777)
             with self.assertRaisesRegex(d.DaemonError, "config_group_or_world_writable"):
                 d.load_daemon_config(real)
+            os.chmod(base, 0o755)
+            real_dir = base / "real"
+            real_dir.mkdir(mode=0o755)
+            moved = real_dir / "daemon.json"
+            real.replace(moved)
+            link = base / "via"
+            link.symlink_to(real_dir, target_is_directory=True)
+            with self.assertRaisesRegex(d.DaemonError, "config_not_regular"):
+                d.load_daemon_config(link / "daemon.json")
+            self.assertEqual(d.load_daemon_config(moved)["schema_version"], 1)
+            self.assertIn("schema_version", moved.read_text(encoding="utf-8"))
 
 
 class IPCTests(unittest.TestCase):
@@ -507,6 +518,23 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
         self.assertFalse(sup.status()["takeover_active"])
         self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_state_dir_ancestor_symlink_and_shared_parent_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real"
+            real.mkdir()
+            link = base / "link"
+            link.symlink_to(real, target_is_directory=True)
+            state = link / "state"
+            state.mkdir(mode=0o700)
+            with self.assertRaisesRegex(d.DaemonError, "state_dir_symlink"):
+                make_supervisor(state, Table())
+            base.chmod(0o777)
+            nested = base / "nested"
+            nested.mkdir(mode=0o700)
+            with self.assertRaisesRegex(d.DaemonError, "unsafe_state_dir"):
+                make_supervisor(nested, Table())
 
     def test_state_dir_symlink_is_rejected(self):
         real = self.state / "real"
