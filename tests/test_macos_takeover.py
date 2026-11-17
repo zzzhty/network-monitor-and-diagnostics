@@ -1132,8 +1132,11 @@ class CLITests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.dict(os.environ, {"SUDO_USER": account.pw_name}, clear=False), \
+                patch.object(mod, "_trusted_interpreter", return_value=Path("/usr/bin/python3")), \
+                patch.object(mod, "_trusted_script", return_value=Path("/usr/bin/nmd-script")), \
                 patch.object(mod.subprocess, "Popen", side_effect=popen):
             mod._spawn_watch(Path(tmp), "pre-start-20260101T000000Z.json", 50)
+        self.assertEqual(captured["argv"][:2], ["/usr/bin/python3", "/usr/bin/nmd-script"])
         self.assertEqual(captured["env"]["SUDO_USER"], account.pw_name)
         self.assertEqual(captured["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
         self.assertNotIn("HOME", captured["env"])
