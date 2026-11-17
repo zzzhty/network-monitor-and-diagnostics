@@ -136,11 +136,11 @@ Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 st
 | 顺序 | 模块任务 | 状态 |
 | --- | --- | --- |
 | 1 | `scripts/macos_coexist.py` 的规则、探针、代理和 status 白名单 | 本 PR。不改网络 |
-| 2 | 只读适配：把完整 stdout 交给 `normalize_tailscale_status` | 未开始。不在解析前按输出上限切片 |
-| 3 | 显式打开的 macOS 采样字段，默认关闭 | 未开始 |
+| 2 | 只读适配：把完整 stdout 交给 `normalize_tailscale_status` | 已由 `scripts/macos_readonly.py` 接入。不在解析前按输出上限切片 |
+| 3 | 显式打开的 macOS 采样字段，默认关闭 | 已接入。`macos_readonly.enabled` 默认为 false |
 | 4 | 切网或回退控制器 | 不在产品里。隔离目录的启动器不是本仓库 |
 
-现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
+现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。Tailscale status 另有一条有界读取，上限是解析器的 1 MiB；超过上限或读到一半时丢掉正文，不解析前缀。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
 
 `normalize_tailscale_status` 的契约：
 
@@ -149,7 +149,7 @@ Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 st
 - 输出只有 `availability`、`reason`、`backend_state`、`self_online`、`peer_summary`、`peer_count`、`peers_online`。没有主机名、地址、公钥或原文。
 - `unavailable` 是命令失败、超限、截断或 JSON 无效。`unknown` 是 JSON 有效但 BackendState 或 Self.Online 缺失。`offline` 是字段齐了但不是 Running 且 Online。`healthy` 只表示 BackendState 为 Running 且 Self.Online 为 true。peer 缺失时 peer 摘要是 unknown，不会把节点说成 offline，也不会把缺字段说成 healthy。
 
-权限和平台：这些函数没有系统权限，也不区分之后由谁调用。Linux Home 的 `config.yaml` 与 Windows 范围不变。将来的只读命令如果要执行，只能在用户自己的会话里显式运行，并且不能写入路由、DNS、代理或 Tailscale。本 PR 没有这种命令。
+权限和平台：上面的纯函数没有系统权限，也不自己执行命令。Linux Home 的 `config.yaml` 与 Windows 范围不变。只读命令在 `scripts/macos_readonly.py`，由下面的采集接入在 macOS 上显式执行。它不写入路由、DNS、代理或 Tailscale，也不使用 sudo。
 
 离线命令是真实的，示例输出也来自这条命令，不是一次实机采集：
 
@@ -178,6 +178,46 @@ JSON
 
 示例输入里的 `HostName` 不会出现在输出里。没有 `restore` 或 `cutover` 子命令。
 
+## 只读采集接入
+
+这一步把 Tailscale、路由、DNS、系统代理和可选 VPS 端口接进现有采集器。它依赖 PR #4（`cursor/macos-mihomo-tailscale-coexist-2919`）。合并顺序是先合并 PR #4，再合并本变更。本变更不合并 PR #4。
+
+入口有两个，都只读：
+
+- 采集器：`monitor.json` 的 `macos_readonly.enabled` 为 true 时，`nmd monitor run` 的本地样本带 `macos_readonly`。缺省是 false，不跑这些命令。示例见 `examples/monitor-local.json`。
+- 显式命令：`python3 scripts/macos_readonly.py observe`。在 Linux 或 Windows 上打印 `not_applicable`，不调用 macOS 命令。`--config` 只取其中的 `vps`；命令本身就是一次显式读取，不看 `enabled`。
+
+离线开发可以在没有 macOS 的环境运行。这里的 `observe` 得到 `not_applicable`，这不是健康：
+
+```bash
+python3 scripts/macos_readonly.py observe
+python3 -m unittest test_macos_readonly test_macos_coexist -v
+python3 scripts/check_architecture.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+真实 Mac 上的只读验收这次没有跑。不要把 Linux 测试当成实机通过，也不要使用 sudo：
+
+1. 不要执行会改路由、DNS、代理或 Tailscale 的命令。
+2. 在自己的 `monitor.json` 里把 `macos_readonly.enabled` 设为 true。VPS 只填写已经在用的地址和端口；端口不能是 22。不写 `vps` 就不会做 TCP，也不会扫描 tailnet。
+3. 运行 `python3 scripts/macos_readonly.py observe --config <monitor.json>`。
+4. 看字段：`tailscale.availability` 只有完整 JSON 解析成功才可能是 healthy；`routes.default_interfaces` 来自路由表，不是写死的接口名；`dns` 只留布尔，不回显解析器地址；关闭的代理即使保存着 127.0.0.1:7897 也没有 `dead_proxy`；`vps_tcp.status` 为 ok 时 `business_stable` 仍是 false，也不表示 tailnet、路由、DNS 或应用正常。
+5. 再看一次系统代理和路由，确认这次命令没有改它们。已启用但端口不通只留下警告，不会自动关闭，也不会改 bypass。
+6. `real_machine_verified` 和 `overnight_23s_root_cause_fixed` 在代码里固定为 false。
+
+样本字段 `macos_readonly` 的契约：
+
+- `status`：`not_applicable`（不是 macOS）、`not_enabled`（macOS 但未打开）、`observed`（读完了，不是健康）、`partial`、`unavailable`。
+- `report_is_health` 恒为 false。`actions` 恒为空。`mutates_network` 和 `uses_sudo` 恒为 false。
+- `tailscale` 只保留 PR #4 的白名单。超限、截断、命令失败、非法文本是 `unavailable`；缺字段是 `unknown`。不会把 2000 字节前缀解析成 healthy。
+- `routes.interface_discovery` 为 `dynamic`。没有配置 VPS 时 `tailnet_route_status` 是 `not_configured`。
+- `system_proxy.disabled_saved_address_is_fault` 为 false。`bypass_reset` 和 `auto_disable` 为 false。
+- `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
+
+第二阶段仍未实现，这里只留清单：配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启。
+
+Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Windows 仍只做原来的检查，不把这套 macOS 命令搬过去。此次新代码没有在实机运行。过夜 23 秒窗口的根因未定。
+
 ## 回退约束
 
 本仓库没有实验启动器，这次也不把风险网络控制器做进产品。下面只是以后若有独立实验工具时必须满足的清单；`implemented_in_this_repository` 为 false，校验函数不会快照、启动或回退。
@@ -199,7 +239,7 @@ JSON
 这些还没有完成，也不阻塞把上面的纯函数当作下一步的开发基线：
 
 1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
-2. 把 status 解析接进只读采集，并保留同秒两次 restore 的幂等风险；仓库实现尚未验证。
+2. 只读采集的实机验收还没有做。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
 3. 睡眠唤醒。
 4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
 5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。

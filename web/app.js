@@ -360,6 +360,10 @@
     }
     config.max_samples = Math.trunc(config.max_samples);
     config.probes = Array.from($('config-probe-list').querySelectorAll('.probe-row')).map(probeRowConfig);
+    const readonlyConfig = configState && configState.config && configState.config.macos_readonly;
+    if (readonlyConfig && typeof readonlyConfig === 'object' && !Array.isArray(readonlyConfig)) {
+      config.macos_readonly = readonlyConfig;
+    }
     return config;
   }
   function render() {
@@ -488,7 +492,7 @@
       head.append(make('h2', sample.id), badge(recent(sample) ? sample.status : 'unknown', recent(sample) ? statusName(sample.status) : `当前未知 · 历史${statusName(sample.status)}`));
       const total = sample.timings?.total;
       card.append(head, details([['路径 / 类型', `${pathName(sample.path)} / ${sample.type || '未知'}`], ['观测时间', date(sample.observed_at)], ['总耗时', finite(total) && total >= 0 ? `${(total * 1000).toFixed(1)} ms` : '未提供']]));
-      card.append(make('pre', JSON.stringify({ error: sample.error ?? null, http_status: sample.http_status ?? null, timings_seconds: sample.timings || {}, ...(sample.type === 'passive' ? { synthetic: sample.synthetic ?? false, platform: sample.platform, interfaces: sample.interfaces, interface_states: sample.interface_states, interface_observation_error: sample.interface_observation_error, route_observation_error: sample.route_observation_error, services: sample.services, service_observation_error: sample.service_observation_error, ipv4_default_routes: sample.ipv4_default_routes, route_fingerprint: sample.route_fingerprint } : {}) }, null, 2), 'evidence'));
+      card.append(make('pre', JSON.stringify({ error: sample.error ?? null, http_status: sample.http_status ?? null, timings_seconds: sample.timings || {}, ...(sample.type === 'passive' ? { synthetic: sample.synthetic ?? false, platform: sample.platform, interfaces: sample.interfaces, interface_states: sample.interface_states, interface_observation_error: sample.interface_observation_error, route_observation_error: sample.route_observation_error, services: sample.services, service_observation_error: sample.service_observation_error, ipv4_default_routes: sample.ipv4_default_routes, route_fingerprint: sample.route_fingerprint, macos_readonly: sample.macos_readonly ?? null } : {}) }, null, 2), 'evidence'));
       $('probe-list').append(card);
     }
     $('incident-list').replaceChildren();

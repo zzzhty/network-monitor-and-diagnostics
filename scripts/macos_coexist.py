@@ -136,8 +136,8 @@ USER_ISOLATED_SHORT_TEST = {
 # Later macOS work starts at the pure checks. Nothing here turns a network on.
 DEVELOPMENT_STEPS = (
     {"id": "pure-checks", "status": "in_this_pr", "mutates_network": False},
-    {"id": "read-only-status-adapter", "status": "not_started", "mutates_network": False},
-    {"id": "opt-in-macos-sample", "status": "not_started", "mutates_network": False},
+    {"id": "read-only-status-adapter", "status": "wired", "mutates_network": False},
+    {"id": "opt-in-macos-sample", "status": "wired", "mutates_network": False},
     {"id": "cutover-controller", "status": "not_in_product", "mutates_network": True},
 )
 

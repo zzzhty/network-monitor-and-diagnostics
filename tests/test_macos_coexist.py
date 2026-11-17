@@ -187,6 +187,9 @@ class ProfileTests(unittest.TestCase):
             if path.name == "macos_coexist.py":
                 continue
             source = path.read_text(encoding="utf-8")
+            if path.name == "macos_readonly.py":
+                self.assertIn("import macos_coexist", source)
+                continue
             self.assertNotIn("import macos_coexist", source)
             self.assertNotIn("macos_coexist.", source)
 
@@ -544,8 +547,13 @@ class TailscaleStatusTests(unittest.TestCase):
                                  check=False, capture_output=True, text=True)
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("no cutover or restore command", unknown.stdout)
+        self.assertEqual(
+            [step["status"] for step in m.DEVELOPMENT_STEPS],
+            ["in_this_pr", "wired", "wired", "not_in_product"],
+        )
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "cutover-controller")
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "not_in_product")
+        self.assertTrue(all(step["mutates_network"] is False for step in m.DEVELOPMENT_STEPS[:-1]))
 
 
 class ProbeBatchTests(unittest.TestCase):
