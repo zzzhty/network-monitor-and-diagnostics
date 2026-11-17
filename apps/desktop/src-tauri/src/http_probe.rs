@@ -99,11 +99,11 @@ mod tests {
 
     #[test]
     fn malformed_and_oversized_responses_are_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // cargo test runs in parallel. Binding 127.0.0.1:0 and dropping it
+        // lets another test reuse that ephemeral port, so the connect is
+        // accepted and the read fails. Port 1 stays closed here.
         assert_eq!(
-            get(port, "/", Duration::from_millis(300)).unwrap_err(),
+            get(1, "/", Duration::from_millis(300)).unwrap_err(),
             "connect_failed"
         );
         let raw = b"garbage without headers";
