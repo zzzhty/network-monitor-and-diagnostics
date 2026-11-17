@@ -376,7 +376,11 @@ def bootstrap(args):
         with lock(root / ".git" / "nmd.lock"):
             install_links(root, bindir, scope == "user" and not args.no_path)
             if args.manager_only:
-                print("管理安装已就绪；运行 nmd monitor install 安装采集服务。网络配置仅由 nmd apply 显式应用。", flush=True)
+                if nmd_platform.name() == "macos":
+                    print("管理安装已就绪；可选：nmd macos daemon install 安装常驻守护，"
+                          "或 nmd desktop install 安装桌面壳。不部署网络。", flush=True)
+                else:
+                    print("管理安装已就绪；运行 nmd monitor install 安装采集服务。网络配置仅由 nmd apply 显式应用。", flush=True)
             else:
                 monitor_install(root)
 
@@ -860,8 +864,8 @@ def main(argv=None):
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
                                "（「设置与帮助」页可编辑监控配置）、模拟 demo、"
-                               "管理安装（bootstrap --manager-only）、代码更新与用户级桌面壳，"
-                               "不管理网络或后台服务。")
+                               "管理安装（bootstrap --manager-only）、代码更新、用户级桌面壳"
+                               "与常驻守护（nmd macos daemon）；不管理网络部署或 systemd。")
         if command in {"help", "--help", "-h"}:
             print("NMD macOS：只读诊断（不接管流量）与用户级桌面壳\n"
                   "  demo [--once] [--port PORT]  临时合成数据演示，不采集本机、不读取来源配置\n"
@@ -875,6 +879,8 @@ def main(argv=None):
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
                   "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
                   "                         见 docs/macos-mihomo-tailscale.md\n"
+                  "  macos daemon install/uninstall/start/stop/status/takeover-start\n"
+                  "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管\n"
                   "Linux 网络管理、apply 与 systemd 生命周期在 macOS 不支持。")
             return
         if command == "version":
@@ -947,6 +953,9 @@ def main(argv=None):
         if platform != "macos":
             print(f"未知命令: {command}", file=sys.stderr)
             raise SystemExit(2)
+        if argv[1:2] == ["daemon"]:
+            from nmd_daemon import cli_daemon
+            raise SystemExit(cli_daemon(argv[2:]))
         from macos_takeover import main as takeover_cli
         raise SystemExit(takeover_cli(argv[1:]))
     if command in {"monitor", "gui", "machine", "demo"}:

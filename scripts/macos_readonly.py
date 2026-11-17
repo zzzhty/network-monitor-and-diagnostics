@@ -91,14 +91,13 @@ _PUBLIC_ERRORS = {
     "command_failed",
     "truncated",
 }
-PHASE_2_NOT_IMPLEMENTED = (
-    "boot_autostart",
-)
+PHASE_2_NOT_IMPLEMENTED = ()
 
 HELP = """\
 usage: python3 scripts/macos_readonly.py observe [--config MONITOR.json]
 
-Read-only macOS diagnostics. There is no cutover, restore, or autostart command.
+Read-only macOS diagnostics. There is no cutover or restore command in this
+module; autostart belongs to the daemon (nmd macos daemon install).
 On Linux and Windows the report status is not_applicable.
 """
 

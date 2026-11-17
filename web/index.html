@@ -33,6 +33,13 @@
       <div class="section-heading"><h2>访问路径</h2><span class="muted">两条路径分别观测</span></div>
       <div id="paths" class="paths"></div>
       <article class="card gaps"><h2>出口来源</h2><p id="egress-active" class="muted">当前出口未知</p><div id="egress-sources"></div><p class="muted">显示控制器所报选择，不证明网络或 AI 业务可用。Linux 节点切换、单节点测速与自动故障切换在「出口节点」页进行；添加/重命名通道只保存配置；订阅可用「更新订阅」按钮显式刷新，部署通过 nmd apply 显式执行；macOS 与模拟演示仅只读，不读取来源配置。</p></article>
+      <article class="card gaps" id="daemon-card" hidden>
+        <h2>常驻守护</h2>
+        <p id="daemon-state" class="metric">未知</p>
+        <p id="daemon-detail" class="muted">—</p>
+        <button id="daemon-stop" type="button" hidden>停止接管</button>
+        <p class="muted">面板只能停止接管（幂等回退到直连并按快照恢复）；启动接管需 sudo nmd macos daemon takeover-start，开机策略在 daemon.json 配置。守护由 root 管理器监督，健康故障会自动回退。</p>
+      </article>
       <article class="card gaps"><h2>监控空窗与数据完整性</h2><div id="gaps"></div></article>
     </section>
     <section id="probes" class="page" aria-label="探测明细" hidden><div class="section-heading"><h2>最近探测结果</h2><span class="muted">耗时单位：毫秒</span></div><div id="probe-list" class="list"></div></section>

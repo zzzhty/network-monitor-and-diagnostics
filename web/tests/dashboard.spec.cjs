@@ -45,7 +45,10 @@ const assertChannelFields = async (page, kind) => {
 };
 let mode = 'empty', requests = [], posts = [], snapshot, refreshHold = 0;
 let diagnoseView = null;
-let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, config_management: false, read_only_gui: false };
+let capabilityView = { schema_version: 1, platform: 'linux', network_mutations: false, native_desktop: false, local_egress_control: true, channel_management: true, config_management: false, daemon: false, read_only_gui: false };
+let daemonView = { schema_version: 1, label: 'io.github.zzzhty.nmd-daemon', takeover_active: true,
+  phase: 'active', result: null, boot_id: 1, on_boot: false,
+  started_at: '2026-11-18T00:00:00+00:00', failures: 0, mihomo_pid: 42 };
 let sourceView = { schema_version: 1, sources: [], nodes: [], active: null, controller: 'not_queried', selection_mode: 'manual' };
 let configView = { schema_version: 1, config_path: '/tmp/nmd-fixture/monitor.json', exists: false,
   config: { schema_version: 1, interval_seconds: 30, timeout_seconds: 5, retention_hours: 168, max_samples: 100000, probes: [] } };
@@ -97,6 +100,13 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ node: body.node, delay_ms: 87 }));
       }
+      if (req.url === '/api/daemon/takeover/stop') {
+        if (!capabilityView.daemon) { res.writeHead(405); return res.end('{"error":"read_only"}'); }
+        if (!body || Object.keys(body).length !== 0) { res.writeHead(400); return res.end('{"error":"invalid_body"}'); }
+        daemonView = { ...daemonView, takeover_active: false, phase: 'rolled_back', result: 'manual_stop', mihomo_pid: null };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ result: 'stop_requested', daemon: daemonView }));
+      }
       if (req.url === '/api/egress/diagnose') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(diagnoseView));
@@ -137,6 +147,11 @@ const server = http.createServer((req, res) => {
   if (req.url === '/api/capabilities') {
     res.setHeader('Content-Type', 'application/json');
     return res.end(JSON.stringify(capabilityView));
+  }
+  if (req.url === '/api/daemon/status') {
+    if (!capabilityView.daemon) { res.writeHead(404); return res.end('{"error":"not_found"}'); }
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(JSON.stringify(daemonView));
   }
   if (req.url === '/api/sources') {
     if (!sourceView) { res.writeHead(503); return res.end('unavailable'); }
@@ -491,6 +506,24 @@ const server = http.createServer((req, res) => {
     await refresh();
     assert.equal(await page.locator('#config-card').isVisible(), false);
     assert.equal(await page.locator('#config-unavailable').isVisible(), true);
+    // Daemon mode: the card appears, the panel can stop (never start) a takeover.
+    capabilityView.daemon = true;
+    await refresh();
+    assert.equal(await page.locator('#daemon-card').isVisible(), true);
+    assert.equal(await page.locator('#daemon-state').textContent(), '接管中');
+    assert.match(await page.locator('#daemon-detail').textContent(), /开机策略：保持直连/);
+    assert.equal(await page.locator('#daemon-stop').isVisible(), true);
+    const daemonPostsBefore = posts.length;
+    await page.locator('#daemon-stop').click();
+    await page.waitForFunction(() => document.querySelector('#daemon-state').textContent().includes('直连'));
+    assert.deepEqual(posts.slice(daemonPostsBefore).map(([url]) => url), ['/api/daemon/takeover/stop']);
+    assert.deepEqual(JSON.parse(posts.at(-1)[1]), {});
+    assert.equal(await page.locator('#daemon-stop').isVisible(), false);
+    assert.match(await page.locator('#daemon-detail').textContent(), /上次结果：manual_stop/);
+    capabilityView.daemon = false;
+    daemonView = { ...daemonView, takeover_active: true, phase: 'active', result: null };
+    await refresh();
+    assert.equal(await page.locator('#daemon-card').isVisible(), false);
     capabilityView.platform = 'linux';
     capabilityView.local_egress_control = true;
     capabilityView.channel_management = true;
@@ -534,8 +567,8 @@ const server = http.createServer((req, res) => {
     const before = requests.filter(r => r[1] === '/api/snapshot').length;
     await page.waitForTimeout(5200);
     assert.ok(requests.filter(r => r[1] === '/api/snapshot').length > before, 'visible page polls');
-    const readable = ['/', '/app.js', '/style.css', '/logo.png', '/api/snapshot', '/api/sources', '/api/capabilities', '/api/config', '/favicon.ico'];
-    const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh', '/api/config'];
+    const readable = ['/', '/app.js', '/style.css', '/logo.png', '/api/snapshot', '/api/sources', '/api/capabilities', '/api/config', '/api/daemon/status', '/favicon.ico'];
+    const writable = ['/api/egress/select', '/api/egress/delay', '/api/egress/diagnose', '/api/auto', '/api/channels', '/api/channels/rename', '/api/channels/refresh', '/api/config', '/api/daemon/takeover/stop'];
     assert.ok(requests.every(([method, url]) => (method === 'GET' && readable.includes(url)) || (method === 'POST' && writable.includes(url))), 'only intended same-origin requests');
     // Render only the bundled error page. Never launch the desktop binary,
     // invoke a custom URL handler, read real configuration, or start a sidecar.

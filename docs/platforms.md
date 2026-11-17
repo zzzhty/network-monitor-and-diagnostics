@@ -7,9 +7,9 @@ NMD 按机器角色分工，不在每台电脑上重复做一遍网关。
 | 角色 | 服务器 / 网关 | 桌面机 | 桌面机 |
 | 谁管流量 | NMD 部署并管理系统 mihomo，TUN 接管整机 | 与 Clash Verge Rev 共同使用时，由 Clash Verge Rev 管理 | 与 Clash Verge Rev 共同使用时，由 Clash Verge Rev 管理 |
 | NMD 在这里做什么 | 部署、分流、监控、自动修复 | 监控（monitor）和诊断（diagnostics） | 监控（monitor）和诊断（diagnostics） |
-| 后台 | systemd：系统 mihomo，以及独立的 monitor 单元 | 没有采集服务。可选 LaunchAgent 只启动桌面壳 | 当前用户的计划任务 `\NMD\Monitor`，登录期间运行 |
+| 后台 | systemd：系统 mihomo，以及独立的 monitor 单元 | 可选常驻守护（root supervisor + 用户 daemon，`nmd macos daemon install`，默认关）；桌面壳 LaunchAgent 仍可选 | 当前用户的计划任务 `\NMD\Monitor`，登录期间运行 |
 
-macOS 和 Windows 上，NMD 的默认定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期用哪一款客户端仍在调研（具体软件调研中，待定）。macOS 另有一条实验路径：`sudo nmd macos takeover` 以 sudo 前台方式自行运行 mihomo 接管整机出口，带绝对截止时间与幂等回退，见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md)——仅显式运行，不安装任何常驻组件；Windows 无此路径。除此之外 NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
+macOS 和 Windows 上，NMD 的默认定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期用哪一款客户端仍在调研（具体软件调研中，待定）。macOS 另有两条实验路径：`sudo nmd macos takeover` 以 sudo 前台方式自行运行 mihomo 接管整机出口（绝对截止、幂等回退、无常驻），以及 `nmd macos daemon install` 安装 Paseo 式常驻守护（root 管理器监督接管、无绝对截止、健康驱动回退与 panic 恢复、面板归属 daemon）——两者见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md)，均默认关闭、显式启用；Windows 无此路径。除此之外 NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
 
 ## 为什么这样分
 
@@ -17,7 +17,7 @@ macOS 和 Windows 上，NMD 的默认定位是监控（monitor）和诊断（dia
 
 Linux 有 nftables、fwmark 和 systemd-resolved，NMD 才能做可校验、可回滚的部署。本仓库的模板让 Tailscale 的 5210–5270 规则先于 mihomo 的 9000 规则；带标记的 tailscaled 传输走主路由表，mihomo 使用自己的路由表。这些是 Linux 策略路由，不是桌面 TUN 的开关。细节和依据在 [runbook.md](../runbook.md) 的「避免 Tailscale 与 VPS 循环依赖」。
 
-桌面系统的 TUN 驱动、权限和登录自启交给外部客户端。NMD 再部署一套 mihomo TUN，会和那个客户端、Tailscale 抢同一条默认路由。具体用哪一个客户端还在调研。与 Clash Verge Rev 共同使用时，NMD 只做监控和诊断，用来验证当前方案能否在它上面跑通。桌面机的后台是：macOS 用可选的用户级 LaunchAgent 启动桌面壳，不安装采集服务；Windows 用当前用户的计划任务采集，任务只在该用户登录后运行。
+桌面系统的 TUN 驱动、权限和登录自启交给外部客户端。NMD 再部署一套 mihomo TUN，会和那个客户端、Tailscale 抢同一条默认路由。具体用哪一个客户端还在调研。与 Clash Verge Rev 共同使用时，NMD 只做监控和诊断，用来验证当前方案能否在它上面跑通。桌面机的后台是：macOS 默认只有可选的用户级 LaunchAgent 启动桌面壳，显式安装的常驻守护（`nmd macos daemon install`）会补上采集监督、面板服务与受监督的接管；Windows 用当前用户的计划任务采集，任务只在该用户登录后运行。
 
 ## Linux
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Optional local diagnostic CLI and dashboard with local egress control, independent of deployment."""
 import argparse
+import contextlib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # GUI subscription refresh reuses the CLI --confirm path; deployment stays CLI-only.
 NODE_ID = re.compile(r"nmd-[a-z][a-z0-9-]{0,31}-[a-f0-9]{20}")
 POST_ROUTES = {"/api/egress/select", "/api/egress/delay", "/api/egress/diagnose", "/api/auto",
-               "/api/channels", "/api/channels/rename", "/api/channels/refresh", "/api/config"}
+               "/api/channels", "/api/channels/rename", "/api/channels/refresh", "/api/config",
+               "/api/daemon/takeover/stop"}
 MAX_BODY_BYTES = 4096
 # A full 16-probe config stays well under this; load_config caps the file at 64 KiB.
 MAX_CONFIG_BODY_BYTES = 16384
@@ -43,7 +45,8 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, state_dir, sources_dir=None, config_path=None):
+    def __init__(self, port, state_dir, sources_dir=None, config_path=None,
+                 daemon_client=None):
         self.state_dir = Path(state_dir)
         self.sources_dir = (Path(sources_dir) if sources_dir is not None
                             and nmd_platform.name() == "linux" else None)
@@ -51,6 +54,11 @@ class DashboardServer(ThreadingHTTPServer):
         # Nothing is spawned, probed or deployed on save. Linux keeps CLI/systemd.
         self.config_path = (Path(config_path) if config_path is not None
                             and nmd_platform.name() in ("macos", "windows") else None)
+        # Daemon mode (Phase C): the dashboard lives inside the user daemon and
+        # relays exactly one privileged action over the bridge — stopping the
+        # takeover. Starting one stays on the sudo CLI.
+        self.daemon_client = daemon_client
+        self.on_config_saved = None
         # Never offer a wildcard or user-supplied bind address in this MVP.
         super().__init__(("127.0.0.1", port), DashboardHandler)
 
@@ -60,6 +68,11 @@ class DashboardServer(ThreadingHTTPServer):
         config_enabled = self.config_path is not None
         value.update(local_egress_control=enabled, channel_management=enabled,
                      config_management=config_enabled, read_only_gui=not (enabled or config_enabled))
+        if self.daemon_client is not None:
+            daemon_view = self.daemon_client.status_cached()
+            value.update(daemon=True, daemon_available="error" not in daemon_view,
+                         takeover_active=bool(daemon_view.get("takeover_active")),
+                         daemon_boot_policy=daemon_view.get("on_boot"))
         return value
 
     def read_config_status(self):
@@ -166,6 +179,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.json_response(200, {"schema_version": 1, "config_path": str(self.server.config_path),
                                          "exists": status["exists"], "config": status["config"]})
+        elif path == "/api/daemon/status":
+            if self.server.daemon_client is None:
+                self.json_response(404, {"error": "not_found"})
+                return
+            view = self.server.daemon_client.status_cached()
+            if "error" in view:
+                self.json_response(503, {"schema_version": 1, "error": "daemon_unavailable"})
+            else:
+                self.json_response(200, view)
         elif path in {"/", "/app.js", "/style.css", "/logo.png"}:
             name, mime = {
                 "/": ("index.html", "text/html; charset=utf-8"),
@@ -250,7 +272,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.json_response(503, {"schema_version": 1, "error": "sources_unavailable"})
 
     def _config_post(self, body):
-        """The only non-Linux write: strictly the user's own monitor config file."""
+        """The only non-Linux config write: strictly the user's own monitor file."""
         if set(body) != {"config"} or not isinstance(body["config"], dict):
             self.json_response(400, {"error": "invalid_body"})
             return
@@ -262,10 +284,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except OSError:
             self.json_response(503, {"schema_version": 1, "error": "config_unavailable"})
             return
-        # Saving never starts, restarts or probes anything; the next explicit
-        # `nmd monitor run` picks the new file up by itself.
+        # Saving never starts, restarts or probes anything by itself; in daemon
+        # mode the supervisor reloads the collector via the save hook, and a
+        # standalone `nmd monitor run` picks the new file up on its next start.
+        if self.server.on_config_saved is not None:
+            with contextlib.suppress(Exception):
+                self.server.on_config_saved()
         self.json_response(200, {"result": "config_saved", "config_path": str(self.server.config_path),
                                  "config": saved})
+
+    def _daemon_stop_post(self, body):
+        """The panel's only privileged action: stop the takeover, never start."""
+        if body != {}:
+            self.json_response(400, {"error": "invalid_body"})
+            return
+        reply = self.server.daemon_client.stop_takeover()
+        if "error" in reply:
+            self.json_response(503, {"schema_version": 1, "error": "daemon_unavailable"})
+            return
+        self.json_response(200, {"result": "stop_requested", "daemon": reply})
 
     def do_POST(self):
         if self._guard() is None:
@@ -280,6 +317,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if self.server.config_path is None:
                 self.json_response(405, {"error": "read_only"})
                 return
+        elif path == "/api/daemon/takeover/stop":
+            if self.server.daemon_client is None:
+                self.json_response(405, {"error": "read_only"})
+                return
         else:
             if nmd_platform.name() != "linux":
                 self.json_response(405, {"error": "read_only"})
@@ -291,6 +332,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if body is not None:
             if path == "/api/config":
                 self._config_post(body)
+            elif path == "/api/daemon/takeover/stop":
+                self._daemon_stop_post(body)
             else:
                 self._egress_post(path, body)
 
@@ -330,18 +373,22 @@ def demo_state():
         yield state
 
 
-def serve_dashboard(port, state_dir, sources_dir=None, config_path=None):
+def serve_dashboard(port, state_dir, sources_dir=None, config_path=None,
+                    daemon_client=None, collector_note="collector runs separately"):
     if not 0 <= port <= 65535:
         raise ValueError('invalid_port')
-    with DashboardServer(port, state_dir, sources_dir, config_path=config_path) as server:
+    with DashboardServer(port, state_dir, sources_dir, config_path=config_path,
+                         daemon_client=daemon_client) as server:
         capabilities = server.capabilities()
-        mode = ("local egress control" if capabilities["local_egress_control"]
+        mode = ("daemon" if capabilities.get("daemon")
+                else "local egress control" if capabilities["local_egress_control"]
                 else "monitor configuration" if capabilities["config_management"] else "read-only")
-        print(f"Dashboard: http://127.0.0.1:{server.server_address[1]}/ ({mode}; collector runs separately)", flush=True)
+        print(f"Dashboard: http://127.0.0.1:{server.server_address[1]}/ ({mode}; {collector_note})", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+    return server
 
 
 def main(argv=None, state_dir=None, config_file=None, sources_dir=None):

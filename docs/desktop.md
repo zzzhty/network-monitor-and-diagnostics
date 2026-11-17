@@ -103,6 +103,10 @@ nmd desktop uninstall          # 预检通过后移除整个 NMD.app 与自启 p
 两者可独立使用：`nmd gui` 单独跑时壳复用它；壳退出不影响外部启动的服务。
 常驻采集器（systemd user unit）与壳完全无关，关闭壳不停止监控。
 
+macOS 常驻守护（Phase C，`nmd macos daemon install`）启用后，面板由用户
+daemon 常驻服务：壳启动时经既有复用路径直接连接 daemon 的端口，不再自行
+spawn `nmd gui`；壳退出同样不影响 daemon 与采集。未安装 daemon 时行为不变。
+
 ## 测试与 CI
 
 首次成功读取空事件列表也会建立通知游标，随后出现的新事件正常通知；

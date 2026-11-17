@@ -294,7 +294,9 @@ class CapabilityTests(unittest.TestCase):
                 capabilities = nmd_platform.capabilities()
                 self.assertEqual(capabilities['platform'], platform)
                 self.assertEqual(capabilities['local_observations']['systemd_services'], platform == 'linux')
-                self.assertEqual(capabilities['background_service'], platform == 'linux')
+                self.assertEqual(capabilities['background_service'], platform != 'unsupported')
+                if platform == 'macos':
+                    self.assertEqual(capabilities['background_mechanism'], 'launchd_daemon')
                 self.assertFalse(capabilities['network_mutations'])
         with patch.object(nmd_platform, 'name', return_value='unsupported'):
             run = Mock(side_effect=AssertionError('unsupported platform cannot run commands'))

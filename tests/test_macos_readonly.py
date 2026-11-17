@@ -765,9 +765,7 @@ class CommandBoundTests(unittest.TestCase):
         self.assertNotRegex(source, r"tailscale['\"],\s*['\"]set")
         for name in ("restore", "cutover", "watchdog", "autostart"):
             self.assertFalse(hasattr(mod, name))
-        self.assertEqual(mod.PHASE_2_NOT_IMPLEMENTED, (
-            "boot_autostart",
-        ))
+        self.assertEqual(mod.PHASE_2_NOT_IMPLEMENTED, ())
 
     def test_bounded_reader_keeps_a_complete_body_and_drops_overlimit_or_timeout(self):
         payload = b"A" * 3000
@@ -903,10 +901,10 @@ class EntryTests(unittest.TestCase):
             "business_stable",
             "real_machine_verified",
             "不要使用 sudo",
-            "第二阶段仍未实现",
-            "只剩：开机自启",
+            "开机自启已由常驻 daemon 提供",
             "scripts/macos_prepare.py",
             "scripts/macos_takeover.py",
+            "scripts/nmd_daemon.py",
             "此次新代码没有在实机运行",
             "4044472",
             "不能只信可能缺键的 `scutil --proxy`",

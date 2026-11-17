@@ -199,8 +199,10 @@ def sample_local(run):
 def capabilities():
     platform = name()
     if platform == 'macos':
-        limitations = ['systemd_services_unsupported', 'background_service_unsupported',
-                       'network_management_unsupported', 'egress_sources_disabled']
+        # The Phase C daemon (launchd: root supervisor + user daemon) is
+        # opt-in via `nmd macos daemon install`; nothing runs without it.
+        limitations = ['systemd_services_unsupported', 'network_management_unsupported',
+                       'egress_sources_disabled']
     elif platform == 'windows':
         limitations = ['systemd_services_unsupported', 'network_management_unsupported',
                        'egress_sources_disabled']
@@ -216,7 +218,8 @@ def capabilities():
                 local_observations=dict(interfaces=platform in ('linux', 'macos', 'windows'),
                                         ipv4_routes=platform in ('linux', 'macos', 'windows'),
                                         systemd_services=platform == 'linux'),
-                background_service=platform in ('linux', 'windows'),
+                background_service=platform in ('linux', 'macos', 'windows'),
                 background_mechanism=('systemd' if platform == 'linux'
+                                      else 'launchd_daemon' if platform == 'macos'
                                       else 'scheduled_task' if platform == 'windows' else None),
                 limitations=limitations)

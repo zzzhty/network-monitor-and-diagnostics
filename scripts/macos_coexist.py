@@ -140,6 +140,7 @@ DEVELOPMENT_STEPS = (
     {"id": "opt-in-macos-sample", "status": "wired", "mutates_network": False},
     {"id": "config-and-snapshot", "status": "in_this_pr", "mutates_network": False},
     {"id": "cutover-controller", "status": "in_this_pr", "mutates_network": True},
+    {"id": "persistent-daemon", "status": "in_this_pr", "mutates_network": True},
 )
 
 # Parse bound for a complete status document. The isolated collector sliced at
@@ -198,6 +199,32 @@ ROLLBACK_POLICY = {
     "sleep_wake_keeps_absolute_deadline": True,
     "guarantees_restore_if_watchdog_and_sampler_die": False,
     "requires_watchdog_unhealthy_logic_change": False,
+    "implemented_in_this_repository": True,
+}
+
+# Phase C persistent-daemon policy: the daemon replaces the one-shot absolute
+# deadline with continuous supervision. The one-shot ROLLBACK_POLICY above keeps
+# describing `sudo nmd macos takeover` sessions exactly as before.
+DAEMON_POLICY = {
+    "absolute_deadline": False,
+    "snapshot_before_every_start_including_boot": True,
+    "never_restores_from_a_previous_session_snapshot": True,
+    "stop_restores": True,
+    "health_rollback_consecutive_critical_failures": 3,
+    "auto_retry_after_rollback": False,
+    "takeover_on_boot_default": False,
+    "same_boot_keepalive_restart_never_resumes": True,
+    "supervisor_keepalive_recovers_leftovers": True,
+    "mihomo_exit_restores_immediately": True,
+    "kills_only_own_processes": True,
+    "confirm_scutil_has_no_198_18_after_native_cleanup": True,
+    "restores_tailscale_exit_allow_lan_accept_dns": True,
+    "restores_nic_dns": True,
+    "changes_system_proxy": False,
+    "changes_bypass": False,
+    "changes_power_management": False,
+    "panel_may_start_takeover": False,
+    "requires_explicit_install": True,
     "implemented_in_this_repository": True,
 }
 
@@ -634,6 +661,19 @@ def validate_rollback_policy(policy: dict) -> list[str]:
         if key in policy and policy[key] != expected:
             errors.append(f"{key} must be {expected!r}")
     unknown = sorted(set(policy) - set(ROLLBACK_POLICY))
+    errors.extend(f"unknown policy key {key}" for key in unknown)
+    return errors
+
+
+def validate_daemon_policy(policy: dict) -> list[str]:
+    """Check the persistent-daemon policy; same static rules, no execution."""
+    if not isinstance(policy, dict):
+        return ["policy must be a dict"]
+    errors = [f"missing {key}" for key in DAEMON_POLICY if key not in policy]
+    for key, expected in DAEMON_POLICY.items():
+        if key in policy and policy[key] != expected:
+            errors.append(f"{key} must be {expected!r}")
+    unknown = sorted(set(policy) - set(DAEMON_POLICY))
     errors.extend(f"unknown policy key {key}" for key in unknown)
     return errors
 

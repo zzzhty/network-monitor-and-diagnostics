@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "dashboard": {
+    "port": 8765
+  },
+  "takeover": {
+    "inputs": {
+      "proxy_name": "VPS",
+      "server": "203.0.113.20",
+      "port": 1080
+    },
+    "profile": null,
+    "on_boot": false,
+    "check_interval_seconds": 20,
+    "critical_failures": 3,
+    "mihomo_path": null,
+    "state_dir": null
+  }
+}

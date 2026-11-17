@@ -187,7 +187,8 @@ class ProfileTests(unittest.TestCase):
             if path.name == "macos_coexist.py":
                 continue
             source = path.read_text(encoding="utf-8")
-            if path.name in ("macos_readonly.py", "macos_prepare.py", "macos_takeover.py"):
+            if path.name in ("macos_readonly.py", "macos_prepare.py",
+                             "macos_takeover.py", "nmd_daemon.py"):
                 self.assertIn("import macos_coexist", source)
                 continue
             self.assertNotIn("import macos_coexist", source)
@@ -394,7 +395,15 @@ class EvidenceBoundaryTests(unittest.TestCase):
 
     def test_rollback_policy_is_a_checklist_implemented_by_phase_b(self):
         self.assertEqual(m.validate_rollback_policy(m.ROLLBACK_POLICY), [])
+        self.assertEqual(m.validate_daemon_policy(m.DAEMON_POLICY), [])
         self.assertTrue(m.ROLLBACK_POLICY["implemented_in_this_repository"])
+        self.assertTrue(m.DAEMON_POLICY["implemented_in_this_repository"])
+        # The daemon replaces the deadline with health supervision; it never
+        # re-takes-over after a rollback and the panel cannot start one.
+        self.assertFalse(m.DAEMON_POLICY["absolute_deadline"])
+        self.assertFalse(m.DAEMON_POLICY["auto_retry_after_rollback"])
+        self.assertFalse(m.DAEMON_POLICY["panel_may_start_takeover"])
+        self.assertTrue(m.DAEMON_POLICY["snapshot_before_every_start_including_boot"])
         self.assertEqual(m.ROLLBACK_POLICY["short_test_minutes"], 10)
         self.assertEqual(m.ROLLBACK_POLICY["overnight_max_hours"], 8)
         self.assertFalse(m.ROLLBACK_POLICY["renew_deadline"])
@@ -549,12 +558,12 @@ class TailscaleStatusTests(unittest.TestCase):
         self.assertIn("no cutover or restore command", unknown.stdout)
         self.assertEqual(
             [step["status"] for step in m.DEVELOPMENT_STEPS],
-            ["in_this_pr", "wired", "wired", "in_this_pr", "in_this_pr"],
+            ["in_this_pr", "wired", "wired", "in_this_pr", "in_this_pr", "in_this_pr"],
         )
-        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "cutover-controller")
+        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "persistent-daemon")
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "in_this_pr")
         self.assertTrue(m.DEVELOPMENT_STEPS[-1]["mutates_network"] is True)
-        self.assertTrue(all(step["mutates_network"] is False for step in m.DEVELOPMENT_STEPS[:-1]))
+        self.assertTrue(all(step["mutates_network"] is False for step in m.DEVELOPMENT_STEPS[:-2]))
 
 
 class ProbeBatchTests(unittest.TestCase):

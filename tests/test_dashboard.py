@@ -57,6 +57,16 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("postJSON('/api/config'", js)
         self.assertIn('config_management', js)
 
+    def test_daemon_card_is_wired_stop_only(self):
+        html = (ROOT / 'web/index.html').read_text()
+        js = (ROOT / 'web/app.js').read_text()
+        self.assertIn('id="daemon-card"', html)
+        self.assertIn('id="daemon-stop"', html)
+        self.assertIn("fetch('/api/daemon/status'", js)
+        self.assertIn("postJSON('/api/daemon/takeover/stop'", js)
+        # The panel may stop a takeover but never start one.
+        self.assertNotIn("daemon/takeover/start", js)
+
     def test_product_identity(self):
         html = (ROOT / 'web/index.html').read_text()
         js = (ROOT / 'web/app.js').read_text()

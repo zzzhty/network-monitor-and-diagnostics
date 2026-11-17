@@ -4,7 +4,7 @@
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
   const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map(), pendingRefresh = new Set();
   let pendingChannel = false, pendingPolicy = false, candidateDrafts = null, diagnoseReport = null, pendingDiagnose = false;
-  let configState = null, configLoading = false, pendingConfig = false;
+  let configState = null, configLoading = false, pendingConfig = false, daemonStatus = null;
   const $ = id => document.getElementById(id);
   const make = (tag, value, cls) => {
     const el = document.createElement(tag);
@@ -374,12 +374,22 @@
     $('demo-notice').hidden = !demoMode;
     const platformName = { macos: 'macOS', linux: 'Linux', windows: 'Windows', unsupported: '未支持的平台' }[capabilities?.platform];
     const configHint = configManagementEnabled() ? '；监控配置可在「设置与帮助」页编辑。' : '。';
+    const daemonHint = capabilities?.daemon === true ? '；常驻守护运行中' : '；常驻守护可选（nmd macos daemon）';
     const platformNote = capabilities?.platform === 'macos'
-      ? ` · systemd 服务、后台安装和网络管理不支持；不读取出口来源配置${configHint}`
+      ? ` · systemd 与网络管理不支持${daemonHint}；不读取出口来源配置${configHint}`
       : capabilities?.platform === 'windows'
         ? ` · 计划任务在登录后采集；不管理系统网络或出口来源${configHint}`
         : '';
     text('platform-capabilities', platformName ? `${platformName} · ${canControl ? '本机出口控制' : configManagementEnabled() ? '只读诊断与配置编辑' : '只读面板'}${platformNote}` : '平台能力未知。');
+    const daemonOn = capabilities?.daemon === true;
+    $('daemon-card').hidden = !daemonOn;
+    if (daemonOn) {
+      const status = daemonStatus || {};
+      const active = capabilities.takeover_active === true || status.takeover_active === true;
+      text('daemon-state', active ? '接管中' : status.phase === 'rolled_back' ? '已回退 · 直连' : '直连');
+      text('daemon-detail', `开机策略：${status.on_boot ? '自动接管' : '保持直连'}${status.result ? ` · 上次结果：${status.result}` : ''}${status.failures ? ` · 连续故障周期 ${status.failures}` : ''}`);
+      $('daemon-stop').hidden = !active;
+    }
     $('config-card').hidden = !configManagementEnabled();
     $('config-unavailable').hidden = configManagementEnabled() || capabilities === null;
     if (configManagementEnabled() && !configState && !configLoading) loadConfig();
@@ -512,11 +522,19 @@
   }
   async function refresh() {
     if (busy) return;
-    busy = true; $('refresh').disabled = true;
+    busy = true; $('refresh').disabled = true; daemonStatus = null;
     const abort = new AbortController(), timeout = setTimeout(() => abort.abort(), 4000);
     const capabilityRequest = fetch('/api/capabilities', { signal: abort.signal, cache: 'no-store', credentials: 'same-origin' })
       .then(response => response.ok ? response.json() : null)
       .then(value => { capabilities = value?.schema_version === 1 ? value : null; })
+      .then(() => {
+        if (capabilities?.daemon !== true) return;
+        // Daemon facts come from the root supervisor via the dashboard relay.
+        return fetch('/api/daemon/status', { signal: abort.signal, cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' } })
+          .then(response => response.ok ? response.json() : null)
+          .then(value => { daemonStatus = value; })
+          .catch(() => { daemonStatus = null; });
+      })
       .catch(() => { capabilities = null; });
     const sourceRequest = fetch('/api/sources', { signal: abort.signal, cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' } })
       .then(response => response.ok ? response.json() : null)
@@ -703,6 +721,18 @@
       text('config-note', configErrors[error.message] || '保存失败，请检查输入后重试。');
     } finally {
       pendingConfig = false; renderConfig();
+    }
+  });
+  $('daemon-stop').addEventListener('click', async () => {
+    if (capabilities?.daemon !== true) return;
+    $('daemon-stop').disabled = true;
+    try {
+      await postJSON('/api/daemon/takeover/stop', {}, 8000, () => capabilities?.daemon === true);
+      daemonStatus = null;
+    } catch (error) {
+      text('daemon-detail', '停止请求失败；可稍后重试或使用 sudo nmd macos daemon stop。');
+    } finally {
+      await refresh();
     }
   });
   $('refresh').addEventListener('click', refresh);

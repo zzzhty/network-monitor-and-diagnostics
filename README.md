@@ -16,7 +16,7 @@ Linux GUI 可添加/重命名并管理明确主备；保存只写私有配置，
 ## macOS 实验性只读诊断
 
 源码 CLI 与浏览器面板现支持 macOS；需要已有的 Python 3.9+ 与 Bash，无原生 `.app` 包装。
-本节不安装服务、不配置代理，也不接管系统流量；唯一例外是显式的实验路径 `sudo nmd macos takeover`（sudo 前台、绝对截止、幂等回退，见 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)）。先用安全演示查看现有面板：
+本节默认不安装服务、不配置代理，也不接管系统流量；例外是两条显式的实验路径：`sudo nmd macos takeover`（单次 sudo 前台、绝对截止、幂等回退）与 `nmd macos daemon install`（Paseo 式常驻守护：root 管理器监督接管、健康驱动回退、面板归属 daemon，默认关），见 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。先用安全演示查看现有面板：
 
 ```bash
 cd ~/Projects/network-monitor-and-diagnostics

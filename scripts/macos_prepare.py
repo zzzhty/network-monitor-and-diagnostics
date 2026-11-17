@@ -33,7 +33,7 @@ import macos_readonly
 SCHEMA_VERSION = 1
 PHASE_A_IMPLEMENTED = ("config_generation", "pre_start_snapshot")
 # Drift guard: the readonly module keeps the canonical remaining list.
-PHASE_2_REMAINING = ("boot_autostart",)
+PHASE_2_REMAINING = ()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROXY_NAME = "VPS"

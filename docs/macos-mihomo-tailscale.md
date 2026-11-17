@@ -140,6 +140,7 @@ Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 st
 | 3 | 显式打开的 macOS 采样字段，默认关闭 | 已接入。`macos_readonly.enabled` 默认为 false |
 | 4 | 配置生成与启动前快照 | 已接入：`scripts/macos_prepare.py`（Phase A）。离线生成 + 只读快照；不启动进程、不改网络、不用 sudo |
 | 5 | 切网或回退控制器 | 已接入：`scripts/macos_takeover.py`（Phase B）。sudo 前台、绝对截止、幂等回退；未实机运行 |
+| 6 | 常驻守护与开机自启 | 已接入：`scripts/nmd_daemon.py`（Phase C）。root 管理器 + 用户 daemon、无绝对截止、健康/panic 回退、面板归属 daemon；未实机运行 |
 
 现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。Tailscale status 另有一条有界读取，上限是解析器的 1 MiB；超过上限或读到一半时丢掉正文，不解析前缀。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
 
@@ -234,7 +235,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `system_proxy` 同时带 `sources.scutil` 和 `sources.networksetup`。`disabled_saved_address_is_fault` 为 false。`bypass_reset`、`auto_disable`、`monitoring_prevents_reenable` 为 false。已关闭但保存的本机地址在 `disabled_saved`。失效的已启用代理是高优先级 `dead_proxy`，不能被 Tailscale 连通结果抵消。
 - `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
 
-第二阶段仍未实现的只剩：开机自启。配置生成与启动前快照由 `scripts/macos_prepare.py` 提供（离线与只读），独立 watchdog、幂等回退与切网由 `scripts/macos_takeover.py` 提供（sudo 前台、绝对截止）。控制器代码同样没有在实机运行。
+原第二阶段清单至此全部落地：开机自启已由常驻 daemon 提供（`scripts/nmd_daemon.py`，默认关闭、显式 `nmd macos daemon install` 安装）；配置生成与启动前快照由 `scripts/macos_prepare.py` 提供（离线与只读），单次有界接管由 `scripts/macos_takeover.py` 提供（sudo 前台、绝对截止），常驻接管与面板归属由 daemon 提供（无绝对截止，健康驱动回退与 panic 恢复，策略见 `DAEMON_POLICY`）。daemon 代码同样没有在实机运行。
 
 Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Windows 仍只做原来的检查，不把这套 macOS 命令搬过去。此次新代码没有在实机运行。过夜 23 秒窗口的根因未定。
 
@@ -264,6 +265,26 @@ PYTHONPATH=scripts python3 scripts/macos_prepare.py config \
 ```bash
 PYTHONPATH=scripts python3 scripts/macos_prepare.py snapshot [--state-dir DIR]
 ```
+
+## 常驻守护（Phase C）
+
+`scripts/nmd_daemon.py` 把接管做成 Paseo 式常驻守护：daemon 拥有状态与本地
+API，UI 全是薄客户端。两个进程：root 管理器（`/Library/LaunchDaemons`，
+launchd KeepAlive，持有 `/var/run/nmd-daemon.sock`，root:admin 0660）监督
+接管——**无绝对截止**，替代语义是健康驱动回退（连续关键故障周期，默认 3，
+可配）+ panic 恢复（mihomo 退出立即回退）+ 手动停止（IPC `takeover.stop`，
+admin 组可用；面板按钮同路经）+ 开机策略（`daemon.json` 的 `on_boot`，默认
+关；同 boot 的 KeepAlive 重启永不自动续接，防振荡）。用户 daemon（登录
+LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复用
+`DashboardServer`）；桌面壳经既有复用路径连接，不再 spawn。每次接管前——
+包括开机——**重新快照**，永不跨会话恢复；root 启动时先按会话文件回收上次
+的残留（phase=active → 回退）。策略清单见 `macos_coexist.DAEMON_POLICY`；
+单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠既有 preflight 双向失败关闭。
+安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|status|
+takeover-start`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
+launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。示例
+配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
+daemon 代码没有在实机运行。
 
 ## 接管控制器（Phase B）
 
