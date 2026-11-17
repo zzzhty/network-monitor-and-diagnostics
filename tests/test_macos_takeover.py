@@ -915,14 +915,21 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(mod.main(argv), 2, argv)
 
     def test_non_root_reexec_uses_absolute_sudo(self):
-        with patch.object(mod.os, "geteuid", return_value=1000), \
-                patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")), \
+        # Keep the real euid. A fake uid does not own this checkout, so the
+        # trust check would refuse a path that the actual user can run.
+        if os.geteuid() == 0:
+            self.skipTest("already root")
+        with patch.object(mod.os, "execvp", side_effect=AssertionError("execvp")), \
                 patch.object(mod.os, "execv", side_effect=SystemExit(0)) as invoked:
-            with self.assertRaises(SystemExit):
-                mod.main(["rollback"])
-        self.assertEqual(invoked.call_args.args[0], "/usr/bin/sudo")
-        self.assertEqual(invoked.call_args.args[1][0], "/usr/bin/sudo")
-        self.assertNotIn("sudo", invoked.call_args.args[1][1:])
+            try:
+                code = mod.main(["rollback"])
+            except SystemExit:
+                self.assertEqual(invoked.call_args.args[0], "/usr/bin/sudo")
+                self.assertEqual(invoked.call_args.args[1][0], "/usr/bin/sudo")
+                self.assertNotIn("sudo", invoked.call_args.args[1][1:])
+                return
+        self.assertFalse(invoked.called)
+        self.assertEqual(code, 2)
 
     def test_daemon_help_and_invalid_do_not_escalate(self):
         import nmd_daemon

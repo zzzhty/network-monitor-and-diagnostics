@@ -1138,10 +1138,11 @@ def _watchdog_still_running(state_dir, now=None):
 
 
 def _daemon_conflict(path=DAEMON_SOCKET):
-    """True when a daemon socket is present or cannot be classified.
+    """True when the root supervisor socket is present or cannot be classified.
 
-    Presence is enough. This does not connect, and it does not stop the
-    existing run-user daemon.
+    Only ``supervise`` binds this path. A user collector and an unloaded
+    system plist do not. Presence is enough. This does not connect, and it
+    does not stop the existing run-user daemon.
     """
     try:
         os.lstat(path)
