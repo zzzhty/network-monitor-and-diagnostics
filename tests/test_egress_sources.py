@@ -602,20 +602,58 @@ class DashboardSourceTests(LocalControllerFixture):
         dashboard = self.start_dashboard()
         status, body = self.dashboard_request(dashboard)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["active"], self.current)
+        view = json.loads(body)
         for secret in (b"SYNTHETIC_URL_SECRET", b"SYNTHETIC_PASSWORD", b"SYNTHETIC_CONTROLLER_SECRET"):
             self.assertNotIn(secret, body)
         for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
             self.assertEqual(self.dashboard_request(dashboard, method)[0], 405)
         for headers in ({"Host": "evil.invalid"}, {"Origin": "https://evil.invalid"}, {"Origin": "null"}):
             self.assertEqual(self.dashboard_request(dashboard, headers=headers)[0], 403)
-        with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
-            status, body = self.dashboard_request(dashboard)
-            self.assertEqual(status, 503)
-            self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
-            self.assertIsNone(json.loads(body)["active"])
+        if sys.platform == "linux":
+            # Linux wires the same source backend the CLI uses.
+            self.assertEqual(view["active"], self.current)
+            with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
+                status, body = self.dashboard_request(dashboard)
+                self.assertEqual(status, 503)
+                self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
+                self.assertIsNone(json.loads(body)["active"])
+            self.assertTrue(all(method == "GET" for method, *_ in self.requests))
+        else:
+            # macOS/Windows drop sources_dir. The panel stays read-only and does
+            # not call the controller or treat "no backend" as a selected node.
+            self.assertEqual(view, {"schema_version": 1, "sources": [], "active": None,
+                                    "controller": "not_configured"})
+            self.assertEqual(self.requests, [])
+            status, denied = self.dashboard_request(
+                dashboard, "POST", "/api/egress/select", {"node": self.current})
+            self.assertEqual(status, 405)
+            self.assertEqual(json.loads(denied), {"error": "read_only"})
+            self.assertEqual(self.current, self.node("tail-a"))
+            with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
+                status, body = self.dashboard_request(dashboard)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["active"], None)
+                self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
+            self.assertEqual(self.requests, [])
         self.assertFalse((self.base / "unused-state").exists())
-        self.assertTrue(all(method == "GET" for method, *_ in self.requests))
+
+    def test_non_linux_dashboard_never_opens_the_source_backend(self):
+        # Same contract as a real macOS process: sources_dir is dropped even
+        # when the caller passes one. Linux CI runs this via the platform stub.
+        with patch.object(observability.nmd_platform, "name", return_value="macos"):
+            dashboard = self.start_dashboard()
+            status, body = self.dashboard_request(dashboard)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {
+                "schema_version": 1, "sources": [], "active": None,
+                "controller": "not_configured"})
+            self.assertNotIn(b"SYNTHETIC", body)
+            self.assertEqual(self.requests, [])
+            status, denied = self.dashboard_request(
+                dashboard, "POST", "/api/egress/select", {"node": self.current})
+            self.assertEqual((status, json.loads(denied)), (405, {"error": "read_only"}))
+            self.assertEqual(self.current, self.node("tail-a"))
+            self.assertEqual(self.requests, [])
 
     def test_write_endpoints_switch_test_and_configure_auto(self):
         _linux_source_cli(self)
