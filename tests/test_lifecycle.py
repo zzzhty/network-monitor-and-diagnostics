@@ -173,42 +173,7 @@ class LifecycleTests(LifecycleFixture, unittest.TestCase):
         self.assertFalse((self.bin / 'mh').exists())
         self.assertFalse(self.root.exists())
 
-    def test_independent_clone_path_migration_and_repeat_bootstrap(self):
-        self.bin.mkdir()
-        for name in ("mh", "mihomoctl"):
-            (self.bin / name).symlink_to(self.source / "mihomoctl")
-        self.assert_ok(self.install("--manager-only", "--migrate-from", str(self.source)))
-        self.assertFalse(self.root.is_symlink())
-        self.assertNotEqual(self.git(self.root, "rev-parse", "--show-toplevel"), str(self.source))
-        self.assert_ok(self.install("--manager-only"))
-        self.assertFalse(self.events.exists())
-        moved = self.base / "renamed source"
-        self.source.rename(moved)
-        for name in ("mh", "mihomoctl"):
-            self.assertFalse((self.bin / name).is_symlink())
-        self.assertEqual((self.bin / "nmd").resolve(), self.root / "nmd")
-        result = subprocess.run(["nmd", "version"], cwd=self.base, env=self.env,
-                                capture_output=True, text=True)
-        self.assert_ok(result)
-        self.assertEqual(result.stdout.strip(), self.git(self.root, "rev-parse", "HEAD"))
-        self.assertNotEqual(self.invoke("status", root=moved).returncode, 0)
-        bad = self.invoke("unknown argument")
-        self.assertEqual(bad.returncode, 2)
-        self.assertIn("未知命令: unknown argument", bad.stderr)
-
-    def test_migration_replaces_old_nmd_and_preserves_checkout_and_data(self):
-        self.bin.mkdir()
-        (self.source / "history.sqlite3").write_text("historic data")
-        for name in ("nmd", "mh", "mihomoctl"):
-            (self.bin / name).symlink_to(self.source / "nmd")
-        self.assert_ok(self.install("--manager-only", "--migrate-from", str(self.source)))
-        self.assertEqual((self.bin / "nmd").resolve(), self.root / "nmd")
-        for name in ("mh", "mihomoctl"):
-            self.assertFalse((self.bin / name).is_symlink())
-        self.assertEqual((self.source / "history.sqlite3").read_text(), "historic data")
-        self.assertTrue((self.source / ".git").is_dir())
-
-    def test_legacy_links_are_untouched_without_explicit_migration(self):
+    def test_legacy_links_are_never_touched(self):
         self.bin.mkdir()
         for name in ("mh", "mihomoctl"):
             (self.bin / name).symlink_to(self.source / "mihomoctl")
@@ -216,23 +181,18 @@ class LifecycleTests(LifecycleFixture, unittest.TestCase):
         for name in ("mh", "mihomoctl"):
             self.assertEqual(os.readlink(self.bin / name), str(self.source / "mihomoctl"))
 
-    def test_migration_preserves_foreign_legacy_commands_and_symlink_chains(self):
-        self.bin.mkdir()
-        (self.bin / "mh").write_text("operator-owned command")
-        indirect = self.base / "foreign link"
-        indirect.symlink_to(self.source / "nmd")
-        (self.bin / "mihomoctl").symlink_to(indirect)
-        self.assert_ok(self.install("--manager-only", "--migrate-from", str(self.source)))
-        self.assertEqual((self.bin / "mh").read_text(), "operator-owned command")
-        self.assertEqual(os.readlink(self.bin / "mihomoctl"), str(indirect))
-
-    def test_migration_conflicting_nmd_does_not_remove_owned_legacy_links(self):
+    def test_foreign_nmd_symlink_is_refused_not_taken_over(self):
+        # The migrate-from takeover path is retired: a bin/nmd link pointing
+        # anywhere else — including an old-generation checkout — is occupied.
         self.bin.mkdir()
         (self.bin / "nmd").symlink_to(self.base / "unrelated-command")
-        (self.bin / "mh").symlink_to(self.source / "mihomoctl")
-        self.assertNotEqual(self.install("--manager-only", "--migrate-from", str(self.source)).returncode, 0)
+        self.assertNotEqual(self.install("--manager-only").returncode, 0)
         self.assertEqual(os.readlink(self.bin / "nmd"), str(self.base / "unrelated-command"))
-        self.assertEqual(os.readlink(self.bin / "mh"), str(self.source / "mihomoctl"))
+        self.assertFalse(self.root.exists())
+        (self.bin / "nmd").unlink()
+        (self.bin / "nmd").symlink_to(self.source / "nmd")
+        self.assertNotEqual(self.install("--manager-only").returncode, 0)
+        self.assertEqual((self.bin / "nmd").resolve(), self.source / "nmd")
         self.assertFalse(self.root.exists())
 
     def test_streamed_installer_from_unrelated_directory(self):

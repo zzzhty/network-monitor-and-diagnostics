@@ -88,9 +88,9 @@ origin/main，再从已审阅的新版源码目录执行：
 `sudo ./nmd adopt --home /opt/nmd --system`、`sudo ./nmd update --home /opt/nmd`，
 然后 `sudo /opt/nmd/nmd monitor install`；这不是将旧个人目录转换为系统安装的办法。
 
-旧命名安装可用显式 `--migrate-from "$HOME/.mh-ts"` 安装新版入口。它只清理确实指向
-指定旧 Git 目录的 `mh` / `mihomoctl` 链接，保留旧 checkout 与数据；如果旧链接指向
-其他源码目录，应使用实际路径。此选项不是 user/system 数据或服务迁移器。
+旧命名安装的 `--migrate-from` 选项已随 mh 一代彻底清理而退役。安装不再接管或删除
+任何 `mh` / `mihomoctl` 链接；如果机器上仍残留指向旧目录的命令链接，先手动确认并
+删除它们再安装——`bin/nmd` 若是指向旧 checkout 的链接，安装会按“路径已被占用”拒绝。
 
 切换 user/system 使用人工明确的顺序：
 

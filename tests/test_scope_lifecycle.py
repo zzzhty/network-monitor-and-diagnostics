@@ -119,10 +119,9 @@ class ScopeLifecycleTests(LifecycleFixture, unittest.TestCase):
             # Stop before locks, clone, links, or any system-path mutation.
             with self.assertRaises(PreflightReached):
                 manager.main(["bootstrap", "--system", "--manager-only"])
-            root, bindir, migration = preflight.call_args.args
+            root, bindir = preflight.call_args.args
             self.assertEqual(root, Path("/opt/nmd"))
             self.assertEqual(bindir, Path("/usr/local/bin"))
-            self.assertIsNone(migration)
         self.assertEqual(self.event_lines(), [])
 
     def test_system_rejects_personal_home_or_bin_directory(self):

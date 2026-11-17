@@ -158,15 +158,6 @@ def link_target(path):
     return Path(os.path.abspath(path.parent / os.readlink(path)))
 
 
-def migration_targets(migrate_from):
-    if migrate_from is None:
-        return set()
-    old = migrate_from.expanduser().resolve()
-    if not old.is_dir() or not (old / ".git").is_dir():
-        raise ManagerError(f"迁移来源必须是已有 Git 源码目录: {old}")
-    return {old / "mihomoctl", old / "nmd"}
-
-
 def preflight_windows_links(root, bindir):
     import nmd_windows
     if nmd_windows.command_inside_checkout(root, bindir) or nmd_windows.command_dir_blocked(bindir):
@@ -247,20 +238,20 @@ def remove_windows_links(root, bindir):
             _windows_user_path(removed)
 
 
-def preflight_links(root, bindir, migrate_from=None):
+def preflight_links(root, bindir):
     if sys.platform == "win32":
         return preflight_windows_links(root, bindir)
-    allowed = {root / "nmd"} | migration_targets(migrate_from)
+    allowed = {root / "nmd"}
     path = bindir / "nmd"
     if path.exists() or path.is_symlink():
         if not path.is_symlink() or link_target(path) not in allowed:
             raise ManagerError(f"命令路径已被占用，未覆盖: {path}")
 
 
-def install_links(root, bindir, migrate_from=None, register_path=True):
+def install_links(root, bindir, register_path=True):
     if sys.platform == "win32":
         return install_windows_links(root, bindir, register_path=register_path)
-    preflight_links(root, bindir, migrate_from)
+    preflight_links(root, bindir)
     bindir.mkdir(parents=True, exist_ok=True)
     path = bindir / "nmd"
     if path.is_symlink() and link_target(path) != root / "nmd":
@@ -269,13 +260,8 @@ def install_links(root, bindir, migrate_from=None, register_path=True):
         path.symlink_to(root / "nmd")
     if not path.is_file() or not os.access(path, os.X_OK) or path.resolve() != root / "nmd":
         raise ManagerError(f"新命令入口校验失败，未清理旧命令: {path}")
-    # Explicit migration only: delete exactly owned links after nmd is ready.
-    # Keep foreign commands, the old checkout, and all runtime data untouched.
-    allowed = migration_targets(migrate_from)
-    for name in ("mh", "mihomoctl"):
-        legacy = bindir / name
-        if legacy.is_symlink() and link_target(legacy) in allowed:
-            legacy.unlink()
+    # Legacy mh/mihomoctl command links are never touched: the migration
+    # option was retired after the old generation was fully cleaned up.
     if register_path and str(bindir) not in os.environ.get("PATH", "").split(os.pathsep):
         shell = Path(os.environ.get("SHELL", "/bin/sh")).name
         profile = Path.home() / {"zsh": ".zshrc", "bash": ".bashrc"}.get(shell, ".profile")
@@ -361,7 +347,7 @@ def bootstrap(args):
                 info = path.lstat()
                 if path.is_symlink() or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
                     raise ManagerError(f"系统安装父目录不可信: {path}")
-    preflight_links(root, bindir, args.migrate_from)
+    preflight_links(root, bindir)
     # A parent lock also covers first creation; it is not an installation receipt.
     with lock(root.parent / ("." + root.name.lstrip(".") + ".install.lock")):
         if root.exists():
@@ -388,7 +374,7 @@ def bootstrap(args):
         if scope == "system":
             trusted_system_checkout(root)
         with lock(root / ".git" / "nmd.lock"):
-            install_links(root, bindir, args.migrate_from, scope == "user" and not args.no_path)
+            install_links(root, bindir, scope == "user" and not args.no_path)
             if args.manager_only:
                 print("管理安装已就绪；运行 nmd monitor install 安装采集服务。网络配置仅由 nmd apply 显式应用。", flush=True)
             else:
@@ -1008,8 +994,6 @@ def main(argv=None):
         parser.add_argument("--home", type=Path)
         parser.add_argument("--repository", default=os.environ.get("NMD_REPOSITORY", REPOSITORY))
         parser.add_argument("--bin-dir", type=Path)
-        parser.add_argument("--migrate-from", type=Path,
-                            help="迁移此旧 Git 目录的命令链接；仅删除指向该目录的 mh/mihomoctl 链接，保留源码和数据")
         parser.add_argument("--manager-only", action="store_true", help="仅安装管理命令，暂不部署系统")
         parser.add_argument("--no-path", action="store_true", help="不修改 shell PATH 文件")
         bootstrap(parser.parse_args(argv[1:]))
