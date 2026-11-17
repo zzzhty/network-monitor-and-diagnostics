@@ -1,0 +1,266 @@
+# macOS：mihomo 与官方 Tailscale 共存（实验）
+
+这是一条显式选择的 macOS 实验路径，不自动启用，也不是生产稳定。它不改 Linux Home 上已经在用的 mihomo 与默认行为，Windows 延期。仓库不因此安装服务、不改系统网络，也不连接真实机器。
+
+记录来自用户本机实测，时间是 2026-11-17（Asia/Shanghai）。本仓库没有重跑这些测试，也没有原始日志。下面不写真实主机地址、用户目录、完整配置、账户或密钥。规则示例用文档占位地址 `203.0.113.20`，并注明它不是实测机器上的地址。
+
+实测表明：mihomo 1.19.34 的 TUN 可以和官方 Tailscale 同时运行。当时清掉了官方 Tailscale 的 exit node，官方 Tailscale 仍负责 tailnet 和 MagicDNS。mihomo 的海外出口是每台 VPS 自己的 SOCKS over tailnet，不是 Tailscale exit node。短时真实应用测试通过，随后在保持唤醒的情况下做了近 8 小时网络探针。
+
+## 状态矩阵
+
+三列不要混写。用户隔离配置是机器上另一个目录里的实验，不是本 PR 的代码或安装包。本 PR 的静态/CI 只说明仓库里的纯函数和文档。本 PR 代码尚未在实机运行。这句指共存实验和回退实现；只读采集在 `4044472` 上有过一次部分验收，代理交叉读取还没有复跑，见下文。
+
+| 项 | 用户隔离配置 | 本 PR 静态 / CI | 本 PR 实机 |
+| --- | --- | --- | --- |
+| mihomo 1.19.34 TUN 与官方 Tailscale 同时运行 | 短时应用测试与近 8 小时探针已观察 | 未重跑 | 未跑 |
+| 清 exit node，保留 tailnet 与 MagicDNS；海外出口为 VPS SOCKS over tailnet | 已观察 | 示例里写明约束 | 未跑 |
+| 路由排除 `100.64.0.0/10`、`fd7a:115c:a1e0::/48`；接口动态发现 | 已观察 | 示例拒绝写死 utun 序号 | 未跑 |
+| TUN 前缀 `198.18.0.1/30`；`native` 登记 `198.18.0.2` order 1 | 已观察 | 纯函数拒绝不存在的系统 DNS | 未跑 |
+| `resolv.conf` 不能单独判断；作用域 DNS 不保证全部走 native | 已观察 | 示例把这两项标成 false | 未跑 |
+| 三项代理指向无监听的 `127.0.0.1:7897`；关闭后恢复。Enabled No 不是故障 | 已观察。来源 Clash 只是推测 | dead proxy 只读分类有单测 | 未跑 |
+| 过夜 95 次采样，以及 04:06 的 1080 窗口 | 已观察。窗口根因未定 | 结论边界有单测 | 未跑 |
+| 过夜回退 08:53:55 rc 0 | 已观察 | 回退清单有单测，控制器未实现 | 未跑 |
+| 域名修复前 `ws.chatgpt.com` 有两条 GeoIP 直连超时 | 已观察。DNS 来源未知 | 旧顺序的夹具能复现这条直连 | 未跑 |
+| 四个 `DOMAIN-SUFFIX` 放在国内规则前，10 分钟短测命中 | 已观察，见下节 | 规则顺序和子域有单测 | 未跑 |
+| 10 分钟结束时的 RESTORED 12:14:30 | 只读核查通过 | 清单有单测 | 未跑。仓库实现尚未验证 |
+| Tailscale status 时间序列 | 55 次字段因 2000 字节截断而不可用 | 纯函数拒绝先截断再解析 | 采集器未接入 |
+| 睡眠唤醒、真实 IPv6、04:06 的 23 秒根因 | 未完成。短测未复现不等于修复 | 只锁定“不能标成完成” | 未跑 |
+
+Linux CI 通过不能标成 macOS 运行通过。
+
+## 配置落点
+
+Linux 网关仍然用仓库根目录的 `config.yaml`。这条 macOS 路径不改那个文件，也不另起一套 YAML 主配置。
+
+可审查的产物是 JSON 包装，不是 mihomo 能直接加载的配置，也不能交给 `mihomo -f`：
+
+- 生成与校验：`scripts/macos_coexist.py`
+- 示例：`examples/macos-mihomo-coexist.experiment.json`
+- 回归：`tests/test_macos_coexist.py`
+
+示例里的规则顺序是结构样例，不是用户机器的完整配置。国内域名规则、私网 CIDR、`GEOIP,CN,DIRECT`（没有 `no-resolve`）和 `MATCH,NMD-EXIT` 只用来固定先后次序。私网 CIDR 用文档网段代替当时夹在 geosite 与 geoip 之间的直连规则。
+
+`NMD-EXIT` 是既有海外出口组。域名修复只在国内 `GEOSITE,cn` 和 `GEOIP,CN` 之前加入：
+
+```text
+DOMAIN-SUFFIX,chatgpt.com,NMD-EXIT
+DOMAIN-SUFFIX,openai.com,NMD-EXIT
+DOMAIN-SUFFIX,oaistatic.com,NMD-EXIT
+DOMAIN-SUFFIX,oaiusercontent.com,NMD-EXIT
+```
+
+`DOMAIN-SUFFIX` 覆盖该名本身和它的子域，例如 `ws.chatgpt.com`、`api.openai.com`。它不匹配 `notchatgpt.com`、`chatgpt.com.evil.test` 这类只是长得像的名字。国内域名和国内 IP 仍走原来的直连规则。修复不改全局 IP 规则，也不把 `GEOIP,CN` 改到出口组。
+
+静态匹配用的“中国 IP”是调用方给的夹具，不是 GeoIP 数据库，也不是当时日志里的地址。
+
+出口块要求：
+
+- 类型是 socks5 over tailnet，`tailscale_exit_node` 为 false
+- 服务器必须是文档网段里的占位地址，示例为 `203.0.113.20:1080`
+- 接口发现为 `dynamic`，配置里不写 utun 序号，也不写 Linux 的 `tailscale0`
+
+DNS 约束：
+
+- 观察到的 TUN 接口前缀是 `198.18.0.1/30`。这里把它记成接口前缀，不把它写成 fake-ip 地址池
+- `tun.dns-mode=disabled` 不接管系统 DNS
+- `native` 只接受 `198.18.0.2`，并且该地址必须是这条前缀上的主机地址。`198.18.0.1` 是接口地址，不是这次登记的解析器；`198.18.0.5` 不在这条前缀上
+- scutil 顺序是 1，使默认系统解析和本机 mihomo DNS 一致
+- `resolv.conf` 不够用。作用域 DNS 不保证每一条查询都走 native
+
+IPv6：无 AAAA 不是故障。`curl -6` 可能打到 IPv4 映射地址，不能据此声称真实 IPv6 已经通过。示例里的 `real_ipv6_path_verified` 固定为 false。
+
+## 系统代理
+
+只做只读检测。启用中的 HTTP、HTTPS 或 SOCKS 指向已确认没有监听的地址时，记一条 `dead_proxy` 警告。监听状态未知时记 `listener_unknown`，不把它说成已经确认的 dead proxy。
+
+保存了 `127.0.0.1:7897` 但 Enabled No，不算故障。bypass 原样保留；代理禁用时，留下 bypass 无害。结果里没有关闭、打开或恢复动作。restore 不重新开启这些代理。
+
+curl 能经 TUN 或 VPS 成功，只说明这次 curl 成功。它默认不读 macOS 系统代理，所以不能代表 App 正常，也不能代表海外直连。
+
+## 探针分类
+
+旧的本地探针不在本仓库里。这里用纯函数把一条 `tun-` 样本分成下面几类，不再在路由和 DNS 通过之后一律标成待人工 TLS 复查：
+
+| 结果 | 分类 |
+| --- | --- |
+| rc 0，TLS 有效 | `tun_network_ok_needs_app_confirm` |
+| rc 28，HTTP 2xx/3xx，TLS 有效 | `tun_network_incomplete_transfer_needs_app_confirm` |
+| TLS 无效，或 rc 35/60，或其他非 0 且不属于上一行 | `tun_tls_or_transport_issues` |
+| 路由或 DNS 未通过 | `tun_route_or_dns_not_ready` |
+| 还没有 TLS 结论 | `tun_tls_evidence_missing` |
+
+rc 不是 0 时，传输不算完成。HTTP 200 不是 App 登录或聊天通过。`remote_ip` 只被记下，不用来判断是不是假站点。TLS 是否有效和 HTTP 应用层分开记录。
+
+单站 401、403、404、429、503，无 AAAA，以及单次 ping 失败，都不上升成整网关键故障。`system_proxy_disabled` 和 `local_7897_connection_refused` 是控制变量，不是故障。一条样本即使有 TLS 或传输问题，也不单独升成整网关键故障。
+
+一批探针里只要有一条 incomplete transfer，`summarize_probe_batch` 的 `fully_ok` 就是 false。它不从探针推断 App 是否正常。用户确认应用和网页正常，与同一次运行里的单次传输未完成可以同时成立。
+
+## 用户本机实测摘要
+
+探针从 00:53:53 开始，测试标记 00:53:57，绝对截止 08:53:53，08:53:55 回退成功（rc 0）。约每 5 分钟一次，共 95 次。没有超过 7.5 分钟的缺口，也没有睡眠。交流电睡眠为 0，由应用持有 `NoIdleSleepAssertion`，不是脚本里的 `caffeinate`。
+
+95 次都是 `critical=false`。这不代表没有故障。Baidu、Google 和出口的 TLS 与 HTTP 基本都通过。chatgpt 有一次 rc 28 且 HTTP 200，上限 5 秒。tailnet ping 有一次失败。RSS 大约从 48MB 升到 60MB 后趋稳，CPU 最高 3.7%。56 条 warning，0 条 error，0 条 fatal。启动时以及 04:06–04:07 有出口异常。
+
+`ws.chatgpt.com` 共 75 条。73 条 `MATCH` 到 `NMD-EXIT` 并成功。03:14:38.501 和 04:40:40.507 两条命中 RuleSet / geoip-cn 后 `DIRECT`，随后超时；解析结果是中国 IP，DNS 来源未知，不能证明污染。当时没有单独的 OpenAI 域名规则，顺序是 geosite-cn、内网 CIDR、geoip-cn（没有 `no-resolve`）、再 `MATCH` 到出口。
+
+### 1080 窗口
+
+04:06:50.261 到 04:07:13.720，经 tailnet 访问 VPS 的 SOCKS 1080 失败 29 次：先 4 次 `network is unreachable`，后 25 次超时（21 次 TCP、4 次 UDP），其中 5 次是自动健康检查。04:06:40.685 有一次成功，04:07:15.272 又成功。没有 Sleep/Wake，也没有 TUN 或默认接口变化。窗口夹在两次全绿采样之间。
+
+没有同期的 Tailscale 历史，也没有 VPS 侧日志。根因未定。不能声称 VPS 进程崩溃，也不能声称双 TUN 冲突。短测若要复查，需要把路由、接口、Tailscale 状态和 1080 可达性放在同一条时间线上，VPS 日志只是可选项。没有已授权的 VPS 通道，不能把单侧日志说成两端都覆盖了。不启动 SSH。
+
+### watchdog_unhealthy
+
+同一次运行里有一条 `watchdog_unhealthy`，比例 1/3。心跳新鲜度 8 秒，检查间隔 20 秒。这个搭配可能偏紧，但现有材料不能证明它一定是逻辑冲突。根因未知，不构成必须修复。
+
+### 10 分钟隔离短测与只读回退
+
+这次仍是用户隔离配置，不是本 PR 的代码或安装包。时间是 2026-11-17（Asia/Shanghai）。watchdog 12:04:28 启动，mihomo 12:04:29 启动，截止 12:14:28。12:07:19 时进程、心跳、native DNS、系统代理关闭和空的 Tailscale exit node 都正常。四个 `DOMAIN-SUFFIX` 已经加载在国内规则前面。
+
+从 12:05:21 起，`ws.chatgpt.com` 至少 7 次都是 `DomainSuffix(chatgpt.com)` 到 `NMD-EXIT`。`chatgpt.com`、`ab`、`codex-cloud`、`chat.openai.com`、`api.openai.com`、`cdn.platform.openai.com`、`oaiusercontent` 和 `persistent.oaistatic.com` 也命中专用规则，没有再走 GeoIP 或 DIRECT。整段 10 分钟里，四个后缀共 55 条：chatgpt 族 42、openai 8、oaiusercontent 3、oaistatic 2。其中 ws 的 7 条都走代理，这一族没有 GeoIP/DIRECT。
+
+用户在 12:07 确认应用和网页正常。探针 12:04:31 全部完成；12:05:37 的 chatgpt 是 rc 28、HTTP 200、TLS 通过、耗时 5.029 秒，按新逻辑记成 incomplete transfer，`fully_ok=false`，`notes=chatgpt_incomplete_transfer`，`critical=false`；12:06:45 恢复为全部完成。10 轮探针共 40 个请求：39 次 ok，1 次 incomplete transfer，0 次传输失败，0 次 critical。所以“应用正常”和单次传输未完成是同时成立的，不能写成全部探针都没有异常。
+
+到 VPS SOCKS 1080 的 TCP 是 55/55 成功，耗时 75–164 毫秒，路由稳定。warning 只有 2 条，分别是启动和结束时的默认接口变化；0 条 error。没有 1080 失败。这不表示过夜那次 23 秒窗口的根因已经修复，那次窗口仍然根因未定。
+
+Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 stdout 先切到 2000 字节再解析，命令 rc 是 0，但 backend、self online 和 peer 字段全是空。同一次运行里单独查询看到 BackendState 为 Running、Self.Online 为 true。路由、prefs 和 1080 记录还在，status 时间序列没有。55 次都是这个结果。VPS 侧没有采集，也没有已授权通道。不启动 SSH。
+
+截止 12:14:28 的回退在 12:14:30 返回 rc 0，标记 RESTORED。12:17:43 的只读核查没有本次测试的 mihomo、watchdog、sampler 或 collector，没有 utun5，scutil 里没有 198.18，也没有 sing-tun。默认路由回到官方 Tailscale，原来的 exit node、allow-lan 和 CorpDNS 已恢复，HTTP、HTTPS 和 SOCKS 仍是关闭。watchdog 和 sampler 在截止的同一秒各调用了一次 restore，两次都成功。这记下同秒重复回退的幂等风险。仓库实现尚未验证，本仓库没有实验启动器。
+
+过夜 08:53:55 的回退成功仍然有效。它和这次 10 分钟回退都只属于用户隔离配置。
+
+## 开发入口
+
+后续 macOS 工作从下面的纯函数接着做，不从隔离目录里的临时脚本搬进产品。
+
+| 顺序 | 模块任务 | 状态 |
+| --- | --- | --- |
+| 1 | `scripts/macos_coexist.py` 的规则、探针、代理和 status 白名单 | 本 PR。不改网络 |
+| 2 | 只读适配：把完整 stdout 交给 `normalize_tailscale_status` | 已由 `scripts/macos_readonly.py` 接入。不在解析前按输出上限切片 |
+| 3 | 显式打开的 macOS 采样字段，默认关闭 | 已接入。`macos_readonly.enabled` 默认为 false |
+| 4 | 切网或回退控制器 | 不在产品里。隔离目录的启动器不是本仓库 |
+
+现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。Tailscale status 另有一条有界读取，上限是解析器的 1 MiB；超过上限或读到一半时丢掉正文，不解析前缀。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
+
+`normalize_tailscale_status` 的契约：
+
+- 输入是完整 stdout（`str` 或 UTF-8 `bytes`）、整数 returncode、`truncated` 和解析上限。上限必须大于 2000。调用方先收齐有界输出，再调用；函数自己不跑命令。
+- 先判断截断、命令是否执行、体积和 returncode，再 `json.loads`。只有解析成功才读取白名单。
+- 输出只有 `availability`、`reason`、`backend_state`、`self_online`、`peer_summary`、`peer_count`、`peers_online`。没有主机名、地址、公钥或原文。
+- `unavailable` 是命令失败、超限、截断或 JSON 无效。`unknown` 是 JSON 有效但 BackendState 或 Self.Online 缺失。`offline` 是字段齐了但不是 Running 且 Online。`healthy` 只表示 BackendState 为 Running 且 Self.Online 为 true。peer 缺失时 peer 摘要是 unknown，不会把节点说成 offline，也不会把缺字段说成 healthy。
+
+权限和平台：上面的纯函数没有系统权限，也不自己执行命令。Linux Home 的 `config.yaml` 与 Windows 范围不变。只读命令在 `scripts/macos_readonly.py`，由下面的采集接入在 macOS 上显式执行。它不写入路由、DNS、代理或 Tailscale，也不使用 sudo。
+
+离线命令是真实的，示例输出也来自这条命令，不是一次实机采集：
+
+```bash
+python3 scripts/macos_coexist.py profile
+python3 scripts/macos_coexist.py normalize-status --returncode 0 <<'JSON'
+{"BackendState":"Running","Self":{"Online":true,"HostName":"example-host"},"Peer":{"p1":{"Online":true},"p2":{"Online":false}}}
+JSON
+```
+
+`profile` 打印的就是 `examples/macos-mihomo-coexist.experiment.json`。它带 `nmd_experiment` 包装，`directly_loadable_by_mihomo` 为 false。不要把它交给 `mihomo -f`。
+
+`normalize-status` 的示例输出：
+
+```json
+{
+  "availability": "healthy",
+  "reason": null,
+  "backend_state": "Running",
+  "self_online": true,
+  "peer_summary": "known",
+  "peer_count": 2,
+  "peers_online": 1
+}
+```
+
+示例输入里的 `HostName` 不会出现在输出里。没有 `restore` 或 `cutover` 子命令。
+
+## 只读采集接入
+
+这一步把 Tailscale、路由、DNS、系统代理和可选 VPS 端口接进现有采集器。它依赖 PR #4（`cursor/macos-mihomo-tailscale-coexist-2919`）。合并顺序是先合并 PR #4，再合并本变更。本变更不合并 PR #4。
+
+入口有两个，都只读：
+
+- 采集器：`monitor.json` 的 `macos_readonly.enabled` 为 true 时，`nmd monitor run` 的本地样本带 `macos_readonly`。缺省是 false，不跑这些命令。示例见 `examples/monitor-local.json`。
+- 显式命令：`python3 scripts/macos_readonly.py observe`。在 Linux 或 Windows 上打印 `not_applicable`，不调用 macOS 命令。`--config` 只取其中的 `vps`；命令本身就是一次显式读取，不看 `enabled`。
+
+离线开发可以在没有 macOS 的环境运行。这里的 `observe` 得到 `not_applicable`，这不是健康：
+
+```bash
+python3 scripts/macos_readonly.py observe
+python3 -m unittest test_macos_readonly test_macos_coexist -v
+python3 scripts/check_architecture.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+不要把 Linux 测试当成实机通过，也不要使用 sudo：
+
+1. 不要执行会改路由、DNS、代理或 Tailscale 的命令。
+2. 在自己的 `monitor.json` 里把 `macos_readonly.enabled` 设为 true。VPS 只填写已经在用的地址和端口；端口不能是 22。不写 `vps` 就不会做 TCP，也不会扫描 tailnet。
+3. 运行 `python3 scripts/macos_readonly.py observe --config <monitor.json>`。
+4. 看字段：`tailscale.availability` 只有完整 JSON 解析成功才可能是 healthy；`routes.default_interfaces` 来自路由表，不是写死的接口名；`dns` 只留布尔，不回显解析器地址；关闭的代理即使保存着 127.0.0.1:7897 也进入 `disabled_saved`，没有 `dead_proxy`；`vps_tcp.status` 为 ok 时 `business_stable` 仍是 false，也不表示 tailnet、路由、DNS 或应用正常。
+5. 再看一次系统代理和路由，确认这次命令没有改它们。已启用但端口不通只留下警告，不会自动关闭，也不会改 bypass。
+6. `real_machine_verified` 和 `overnight_23s_root_cause_fixed` 在代码里固定为 false。
+
+2026-11-17 14:55–14:59（Asia/Hong_Kong）用 `git archive` 在用户 Mac 上跑过 PR5 `4044472`（`40444724a36079da9919b5089e6b48ab345dc69f`）的 `python3 scripts/macos_readonly.py observe`。Tailscale 完整 JSON 解析通过。路由是按路由表发现的。DNS 已回到官方 MagicDNS，没有 198.18。当时 `scutil --proxy` 几乎只剩 FTP passive，没有 HTTPEnable、HTTPSEnable、SOCKSEnable，旧逻辑把 `system_proxy.status` 记成 `unknown` / `missing_field`。同一时刻 `networksetup` 显示 Wi-Fi 的 HTTP、HTTPS、SOCKS 都是 Enabled: No，Server/Port 仍是 127.0.0.1:7897，旧输出没有写入 `disabled_saved`。VPS 没有 monitor 配置，所以是 `not_configured`，没有编造或扫描地址。这次验收时三项代理是关闭的，保存着的地址不是故障，机器在代理关闭时是安全的。下面的交叉读取还没有在那台 Mac 上复跑。此次新代码没有在实机运行。
+
+### 系统代理交叉读取
+
+历史情况要按实际范围写。卸载 Clash 之后，macOS Wi-Fi 的系统 HTTP、HTTPS、SOCKS 代理仍是启用，并指向 127.0.0.1:7897，但本机没有进程监听。遵守系统代理的 ChatGPT Mac App、浏览器，以及后来的 Google 连不上。curl 默认不读 macOS 系统代理，所以 TUN 或 VPS 探针仍可能成功，让人误以为整网正常。用户关掉这三项之后确认应用恢复。官方 Tailscale 自己通常不走这条 HTTP 代理，当时的 bot 连接也可能仍然是通的；这不是“Tailscale 协议本身必然中断”。要防的是已启用且不可达的系统代理，再次让遵守系统代理的应用（包括可能走这条代理的相关连接）静默失败。
+
+只读诊断同时看两个来源，不能只信可能缺键的 `scutil --proxy`：
+
+- `scutil --proxy` 提供 HTTPEnable、HTTPSEnable、SOCKSEnable 和对应的 Proxy/Port。
+- `networksetup -listallnetworkservices` 之后，对活跃服务读 `-getwebproxy`、`-getsecurewebproxy`、`-getsocksfirewallproxy` 的 Enabled、Server、Port。带星号的停用服务不查询。服务过多时保留 Wi-Fi，并标明被截断。
+- 某一来源命令失败或缺少启用字段时，该来源记为 `unavailable` 或 `missing_field` / `unknown`。另一来源已经证实的启用或关闭保留，不用未知结果盖掉它。两个来源都没有证实，才让整段代理保持未知或不可用。两个来源不一致时不把启用的那一侧藏起来。
+- 未启用，即使 Server/Port 仍是 127.0.0.1:7897，也写入 `disabled_saved`。`effect` 为 `not_a_fault`，`disabled_saved_address_is_fault` 为 false。bypass 只计数，不保存域名，也不改写。
+- 已启用，并且指向本机端口，连接被拒绝或超时：`dead_proxy`，`priority` 为 `high`，`affects_system_proxy_clients` 为 true。`effect` 为 `system_proxy_clients_blocked`。Tailscale 为 healthy、tailnet 通、ping 通或 curl 成功都不把 `report_is_health` 变成 true；`dead_proxy_blocks_health_claim` 为 true。`tailscale_reachable_means_apps_ok` 恒为 false。curl 不读系统代理，所以 curl 成功同样不能排除这个问题。
+- 已启用且本机端口能接通：记下启用，`effect` 为 `enabled_and_reachable`。这不是上面那种失效代理。
+- 已启用但目标不是本机地址：不拨号，不把地址写进报告。
+- 失败命令的正文不解析。报告不保存账户、机器身份或非本机代理地址。
+
+这次不会自动关闭代理，不会改 bypass，不用 sudo，也不写网络设置。`monitoring_prevents_reenable` 恒为 false。诊断没有在运行时，挡不住有人再次启用一个失效代理；那是以后的持续监控或显式管理，不是这次的自动禁用。
+
+样本字段 `macos_readonly` 的契约：
+
+- `status`：`not_applicable`（不是 macOS）、`not_enabled`（macOS 但未打开）、`observed`（读完了，不是健康）、`partial`、`unavailable`。
+- `report_is_health` 恒为 false。`actions` 恒为空。`mutates_network` 和 `uses_sudo` 恒为 false。
+- `tailscale` 只保留 PR #4 的白名单。超限、截断、命令失败、非法文本是 `unavailable`；缺字段是 `unknown`。不会把 2000 字节前缀解析成 healthy。
+- `routes.interface_discovery` 为 `dynamic`。没有配置 VPS 时 `tailnet_route_status` 是 `not_configured`。
+- `system_proxy` 同时带 `sources.scutil` 和 `sources.networksetup`。`disabled_saved_address_is_fault` 为 false。`bypass_reset`、`auto_disable`、`monitoring_prevents_reenable` 为 false。已关闭但保存的本机地址在 `disabled_saved`。失效的已启用代理是高优先级 `dead_proxy`，不能被 Tailscale 连通结果抵消。
+- `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
+
+第二阶段仍未实现，这里只留清单：配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启。
+
+Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Windows 仍只做原来的检查，不把这套 macOS 命令搬过去。此次新代码没有在实机运行。过夜 23 秒窗口的根因未定。
+
+## 回退约束
+
+本仓库没有实验启动器，这次也不把风险网络控制器做进产品。下面只是以后若有独立实验工具时必须满足的清单；`implemented_in_this_repository` 为 false，校验函数不会快照、启动或回退。
+
+- 先做快照，独立 watchdog 确认存活之后才切网
+- 绝对截止时间。短测 10 分钟，过夜最长 8 小时，到期不续期
+- STOP 或到期都回退。只结束自己的进程
+- 清掉 native 动态 DNS 后，确认 scutil 里不再有 198.18，再恢复原来的 Tailscale exit node、allow-lan、accept-dns 和网卡 DNS
+- 不改系统代理，也不改 bypass
+- 连续 3 次关键故障才回退
+- 不自愈循环，不安装 daemon 或自动启动，不改电源设置
+- 睡眠唤醒之后仍按绝对截止时间计算
+- 不保证 watchdog 和采样进程都被杀掉之后还能恢复
+
+## 合并前与之后
+
+合并前至少要满足：静态测试和架构检查通过；证据矩阵仍把用户隔离配置、本 PR 静态/CI、本 PR 实机分成三列；示例 JSON 仍然不能被 mihomo 直接加载。本 PR 代码尚未在实机运行的范围见上文：共存实验、回退和这次的代理交叉读取都还没有实机复跑。是否合并由用户决定，CI 变绿不自动合并。
+
+这些还没有完成，也不阻塞把上面的纯函数当作下一步的开发基线：
+
+1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
+2. 只读采集在 `4044472` 上做过一次部分验收；代理交叉读取还没有复跑。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
+3. 睡眠唤醒。
+4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
+5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。
+
+Linux CI 通过不能标成 macOS 运行通过。这条 PR 保持 draft。

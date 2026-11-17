@@ -4,5 +4,9 @@
   "timeout_seconds": 5,
   "retention_hours": 168,
   "max_samples": 100000,
-  "probes": []
+  "probes": [],
+  "macos_readonly": {
+    "enabled": false,
+    "vps": null
+  }
 }

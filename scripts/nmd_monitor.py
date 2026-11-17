@@ -24,12 +24,14 @@ import tempfile
 import time
 from urllib.parse import urlsplit, quote
 
+import macos_readonly
 import nmd_platform
 import nmd_windows
 
 SCHEMA_VERSION = 1
 DEFAULT_CONFIG = dict(schema_version=1, interval_seconds=30, timeout_seconds=5,
-                      retention_hours=168, max_samples=100000, probes=[])
+                      retention_hours=168, max_samples=100000, probes=[],
+                      macos_readonly=None)
 
 
 def validate_config(value):
@@ -78,6 +80,7 @@ def validate_config(value):
             raise ValueError('unexpected_proxy')
         probes.append(p)
     cfg['probes'] = probes
+    cfg['macos_readonly'] = macos_readonly.validate_settings(cfg['macos_readonly'])
     return cfg
 
 
@@ -258,6 +261,8 @@ def sample_probe(config, stop_event=None):
     local = {'id': 'local', 'type': 'passive', 'path': 'local', 'status': 'unknown',
              'error': None, 'timings': {}, 'observed_at': now}
     local.update(nmd_platform.sample_local(_run))
+    # Opt-in macOS reads only. Disabled, Linux, and Windows do not run them.
+    local['macos_readonly'] = macos_readonly.collect(nmd_platform.name(), cfg['macos_readonly'])
     results = [local]
     for p in cfg['probes']:
         r = {k: p[k] for k in ('id', 'type', 'path')}
