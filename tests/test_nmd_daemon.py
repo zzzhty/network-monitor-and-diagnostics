@@ -31,14 +31,17 @@ CONFIG = {"schema_version": 1, "dashboard": {"port": 8765},
                        "critical_failures": 3, "mihomo_path": MIHOMO, "state_dir": None}}
 
 
-def make_supervisor(state, table, config=None, *, on_boot=False, boottime=lambda: 111):
+def make_supervisor(state, table, config=None, *, on_boot=False, boottime=lambda: 111,
+                    validator=None, geodata_dir=None):
     config = json.loads(json.dumps(config or CONFIG))
     config["takeover"]["on_boot"] = on_boot
     return d.RootSupervisor(
         config, state, runner=table.runner, mutator=table.mutator,
         spawner=table.spawner, tcp=table.tcp, exists=lambda path: path == TS,
         sleep=table.sleep, now=lambda: table.clock, boottime=boottime,
-        socket_path=Path(state) / "nmd.sock")
+        socket_path=Path(state) / "nmd.sock",
+        validator=validator or (lambda mihomo, config_path, work_dir: (True, "")),
+        geodata_dir=geodata_dir)
 
 
 class ConfigTests(unittest.TestCase):
@@ -187,6 +190,50 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(result["mihomo_running"])
         self.assertEqual(sup.mutations, [])
         self.assertNotEqual(sup.status()["phase"], d.PHASE_ACTIVE)
+
+    def test_failed_validation_reports_the_stage_and_detail(self):
+        table = Table()
+        sup = make_supervisor(self.state, table,
+                              validator=lambda m, c, w: (False, "geodata not found"))
+        result = sup.dispatch({"cmd": "takeover.start"}, 0)
+        self.assertEqual(result["error"], "mihomo_t_failed")
+        self.assertEqual(result["detail"], "geodata not found")
+        self.assertEqual(result["geodata_staged"], [])
+        records = json.loads(sorted(self.state.glob("takeover-*.json"))[-1]
+                             .read_text(encoding="utf-8"))
+        self.assertEqual(records["result"], "mihomo_t_failed")
+        self.assertEqual(records["detail"], "geodata not found")
+        self.assertEqual(sup.mutations, [])
+
+    def test_geodata_is_staged_from_the_local_mihomo_dir(self):
+        geodata = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(geodata, ignore_errors=True))
+        (geodata / "geoip.metadb").write_bytes(b"geoip")
+        (geodata / "geosite.dat").write_bytes(b"geosite")
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        seen = {}
+
+        def validator(mihomo, config_path, work_dir):
+            seen["work_dir"] = str(work_dir)
+            return True, ""
+
+        sup = make_supervisor(self.state, table, validator=validator, geodata_dir=geodata)
+        result = sup.dispatch({"cmd": "takeover.start"}, 0)
+        self.assertEqual(result["result"], "takeover_active")
+        staged_dir = Path(seen["work_dir"])
+        self.assertEqual((staged_dir / "geoip.metadb").read_bytes(), b"geoip")
+        self.assertEqual((staged_dir / "geosite.dat").read_bytes(), b"geosite")
+        self.assertIn("geoip.metadb", result.get("geodata_staged", []))
+
+    def test_exit_node_clear_failure_reports_the_stage(self):
+        table = Table(fail_mutations=(((2, "--exit-node="),),))
+        sup = make_supervisor(self.state, table)
+        result = sup.dispatch({"cmd": "takeover.start"}, 0)
+        self.assertEqual(result["error"], "exit_node_clear_failed")
+        self.assertEqual(sup.mutations, [])
+        records = json.loads(sorted(self.state.glob("takeover-*.json"))[-1]
+                             .read_text(encoding="utf-8"))
+        self.assertEqual(records["result"], "exit_node_clear_failed")
 
     def test_health_failures_rollback_without_auto_retry(self):
         table = Table(dns_dirty_window=(1, 40), tcp_ok=False)

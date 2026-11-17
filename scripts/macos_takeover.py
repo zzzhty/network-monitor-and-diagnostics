@@ -111,6 +111,13 @@ def mutating_allowlisted(argv, mihomo_path=None):
     if argv[0] in allowed_mihomo:
         if argv[1:3] == ["-t", "-f"] and len(argv) == 4:
             return True
+        # Self-contained working dir: geodata and config live next to each other.
+        if argv[1:2] == ["-d"] and Path(argv[2]).is_absolute():
+            rest = argv[3:]
+            if rest[:1] == ["-f"] and len(argv) == 5:
+                return True
+            if rest[:2] == ["-t", "-f"] and len(argv) == 6:
+                return True
         if argv[1:2] == ["-f"] and len(argv) == 3:
             return True
     return False

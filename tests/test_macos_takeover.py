@@ -158,6 +158,8 @@ class AllowlistTests(unittest.TestCase):
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "192.0.2.53", "192.0.2.54"],
             [MIHOMO, "-t", "-f", "/tmp/config.yaml"],
             [MIHOMO, "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-d", "/tmp/work", "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-d", "/tmp/work", "-t", "-f", "/tmp/config.yaml"],
         )
         for argv in allowed:
             with self.subTest(argv=argv):
@@ -180,6 +182,7 @@ class AllowlistTests(unittest.TestCase):
             ["/tmp/other/mihomo", "-f", "/tmp/config.yaml"],
             [MIHOMO, "-d", "/tmp"],
             [MIHOMO, "-t", "-f", "/tmp/config.yaml", "--ext-ui"],
+            [MIHOMO, "-d", "relative", "-f", "/tmp/config.yaml"],
         )
         for argv in rejected:
             with self.subTest(argv=argv):

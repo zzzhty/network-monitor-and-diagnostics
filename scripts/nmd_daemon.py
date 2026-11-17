@@ -363,12 +363,52 @@ def boot_id():
     return _linux_boot_id()
 
 
+GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
+
+
+def stage_geodata(target_dir, source_dir=None):
+    """Copy any existing geodata next to the config so `-t` and `-f` are
+    self-contained; missing files are reported, never downloaded here."""
+    import shutil
+    source_dir = Path(source_dir) if source_dir is not None else Path.home() / ".config/mihomo"
+    staged, missing = [], []
+    for name in GEODATA_FILES:
+        target = Path(target_dir) / name
+        if target.exists():
+            staged.append(name)
+            continue
+        source = source_dir / name
+        if source.is_file():
+            shutil.copy2(source, target)
+            staged.append(name)
+        else:
+            missing.append(name)
+    return staged, missing
+
+
+def run_mihomo_validate(mihomo, config_path, work_dir, timeout=30):
+    """Gate + run `mihomo -t` with stderr captured; bounded_run drops stderr,
+    and for validation the failure text is the whole point."""
+    argv = [mihomo, "-t", "-d", str(work_dir), "-f", str(config_path)]
+    if not macos_takeover.mutating_allowlisted(argv, mihomo_path=mihomo):
+        raise DaemonError("mutation_not_allowlisted")
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "validate timeout"
+    except OSError:
+        return False, "mihomo not executable"
+    tail = (result.stderr or result.stdout or "").strip()[-400:]
+    return result.returncode == 0, tail
+
+
 class RootSupervisor:
     """Owns the takeover; every host interaction is injectable for tests."""
 
     def __init__(self, config, state_dir, *, runner=None, mutator=None,
                  spawner=None, tcp=None, exists=None, sleep=None, now=None,
-                 boottime=None, socket_path=SOCKET_PATH):
+                 boottime=None, socket_path=SOCKET_PATH, validator=None,
+                 geodata_dir=None):
         self.config = validate_daemon_config(config)
         takeover = self.config["takeover"]
         self.state_dir = Path(state_dir)
@@ -376,6 +416,8 @@ class RootSupervisor:
         self.sleep = sleep or time.sleep
         self.now = now or time.monotonic
         self.boottime = boottime or boot_id
+        self.validator = validator or run_mihomo_validate
+        self.geodata_dir = geodata_dir
         mihomo = macos_takeover.first_mihomo(exists=exists, override=takeover["mihomo_path"])
         if mutator is None:
             def mutator(argv):  # noqa: E306
@@ -419,6 +461,20 @@ class RootSupervisor:
         except (OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
+
+    def _record_failed_start(self, outcome, extra):
+        """Persist a run record even when the start never reached the cutover."""
+        self.result = outcome
+        self._persist_session()
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        record = {"schema_version": DAEMON_SCHEMA_VERSION, "kind": "nmd_daemon_run",
+                  "result": outcome, "phase": self.phase,
+                  "boot_id": self.boot, "started_at": self.started_at,
+                  "mutations": [], "rollback": None}
+        record.update(extra or {})
+        macos_prepare._atomic_private_write(
+            self.state_dir, f"takeover-{stamp}.json",
+            json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n")
 
     def _record_run(self, outcome, rollback):
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -495,17 +551,28 @@ class RootSupervisor:
                 config_dir = self.state_dir / "takeover"
                 macos_prepare._create_private_parents(config_dir)
                 macos_prepare._atomic_private_write(config_dir, "config.yaml", text.encode())
-                self.mutator([self.mihomo, "-t", "-f", str(config_dir / "config.yaml")])
+                staged, missing = stage_geodata(config_dir, self.geodata_dir)
+                ok, detail = self.validator(self.mihomo, config_dir / "config.yaml", config_dir)
+                if not ok:
+                    self._record_failed_start("mihomo_t_failed",
+                                              {"detail": detail, "geodata_staged": staged,
+                                               "geodata_missing": missing})
+                    return {"error": "mihomo_t_failed", "detail": detail,
+                            "geodata_staged": staged, "geodata_missing": missing}
                 _, summary, _ = macos_prepare.collect_snapshot(
                     "macos", self.state_dir, runner=self.runner, exists=self.exists)
                 if summary.get("has_198_18") is True or summary.get("mihomo_running") is True:
                     return {"error": "preflight_failed",
                             "has_198_18": summary.get("has_198_18"),
                             "mihomo_running": summary.get("mihomo_running")}
-                self.mutator([self.tailscale, "set", "--exit-node="])
+                try:
+                    self.mutator([self.tailscale, "set", "--exit-node="])
+                except macos_takeover.TakeoverError as exc:
+                    self._record_failed_start("exit_node_clear_failed", {"detail": str(exc)})
+                    return {"error": "exit_node_clear_failed", "detail": str(exc)}
                 mutations.append([self.tailscale, "set", "--exit-node="])
                 process = macos_takeover.MihomoProcess(
-                    [self.mihomo, "-f", str(config_dir / "config.yaml")],
+                    [self.mihomo, "-d", str(config_dir), "-f", str(config_dir / "config.yaml")],
                     str(config_dir / "mihomo.log"))
                 process.start(spawner=self.spawner)
                 ready_by = self.now() + macos_takeover.READY_TIMEOUT_SECONDS
@@ -538,7 +605,8 @@ class RootSupervisor:
             self.result = None
             self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
             self._persist_session()
-            return {"result": "takeover_active", "reason": reason}
+            return {"result": "takeover_active", "reason": reason,
+                    "geodata_staged": staged}
 
     def _finish_locked(self, outcome, process, mutations):
         """Shared teardown+rollback for every exit path; caller holds the lock."""
