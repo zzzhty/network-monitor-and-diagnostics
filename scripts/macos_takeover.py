@@ -1061,6 +1061,13 @@ def _mark_engaged(state_dir, snapshot_name):
         Path(state_dir), ENGAGED_FILE, (snapshot_name + "\n").encode("ascii"))
 
 
+def _engaged_result(deadline_unix):
+    """The shared deadline writing the marker is a normal end, not an error."""
+    if deadline_unix is not None and int(time.time()) >= int(deadline_unix):
+        return "deadline_reached"
+    return "rollback_already_engaged"
+
+
 def _mutation_blocked(state_dir, snapshot_name):
     """True when this run must not start or change anything else.
 
@@ -1123,7 +1130,7 @@ def assert_acceptance_state(path):
     return path
 
 
-def _watchdog_still_running(state_dir, now=None):
+def _watchdog_still_running(state_dir):
     """True when a previous acceptance watchdog may still roll this directory back."""
     document = _read_ready_document(Path(state_dir) / READY_FILE)
     if not isinstance(document, dict) or document.get("ready") is not True:
@@ -1132,8 +1139,7 @@ def _watchdog_still_running(state_dir, now=None):
     deadline = document.get("deadline_unix")
     if type(pid) is not int or isinstance(pid, bool) or type(deadline) is not int or isinstance(deadline, bool):
         return True
-    if (now or time.time)() >= deadline:
-        return False
+    # Deadline starts the restore. It does not mean the process has exited.
     return _pid_alive(pid) is not False
 
 
@@ -1423,12 +1429,15 @@ def _spawn_watch(state_dir, pin, deadline_unix):
     argv = [str(python), str(script), "rollback-watch",
             "--state-dir", str(state_dir), "--pin", pin,
             "--deadline", str(int(deadline_unix)), "--parent", str(os.getpid())]
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
+    account = _sudo_user_home()
+    if account is not None:
+        env["SUDO_USER"] = account.pw_name
     log = open(Path(state_dir) / "rollback-watch.log", "ab")
     try:
         return subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-            start_new_session=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"})
+            start_new_session=True, env=env)
     finally:
         log.close()
 
@@ -1580,6 +1589,7 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     write_pin(state_dir, snapshot_name)
     pin_holder[0] = snapshot_name
     step("snapshot_taken")
+    deadline_unix = None
     if external_rollback:
         deadline_unix = int(time.time()) + minutes * 60
         record["guarantees_restore_if_watchdog_dies"] = False
@@ -1633,17 +1643,26 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         step("exit_node_cleared")
         if not config_is_direct_regular(config_dir, config_path):
             raise TakeoverError("config_not_confined")
-        if external_rollback and _mutation_blocked(state_dir, snapshot_name):
-            raise TakeoverError("rollback_already_engaged")
-        process.start(spawner=spawner)
-        write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
+        if external_rollback:
+            with RollbackLock(state_dir):
+                if _mutation_blocked(state_dir, snapshot_name):
+                    raise TakeoverError("rollback_already_engaged")
+                process.start(spawner=spawner)
+                try:
+                    write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
+                except Exception:
+                    process.terminate_group()
+                    raise
+        else:
+            process.start(spawner=spawner)
+            write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
         step("mihomo_started")
 
         deadline = now() + minutes * 60
         ready_by = now() + READY_TIMEOUT_SECONDS
         while now() < ready_by:
             if external_rollback and _mutation_blocked(state_dir, snapshot_name):
-                record["result"] = "rollback_already_engaged"
+                record["result"] = _engaged_result(deadline_unix)
                 return record
             _, dns_text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
             parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
@@ -1667,7 +1686,7 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         failures = 0
         while True:
             if external_rollback and _mutation_blocked(state_dir, snapshot_name):
-                record["result"] = "rollback_already_engaged"
+                record["result"] = _engaged_result(deadline_unix)
                 return record
             _write_heartbeat(state_dir / "watchdog-heartbeat")
             cycle_failed = False
@@ -1793,12 +1812,16 @@ def main(argv=None):
     except TakeoverError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
-    if os.geteuid() != 0:
-        try:
+    try:
+        if os.geteuid() != 0:
             reexec_root(Path(__file__).resolve(), argv)
-        except TakeoverError as exc:
-            print(json.dumps({"error": str(exc)}), file=sys.stderr)
             return 2
+        # Already root: still refuse an interpreter or script that fails the
+        # same owner, mode, and ancestor checks. This does not search PATH.
+        _trusted_interpreter()
+        _trusted_script(Path(__file__).resolve())
+    except TakeoverError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
     try:
         if argv[0] == "rollback-watch":

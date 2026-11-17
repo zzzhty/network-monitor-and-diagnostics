@@ -1064,6 +1064,91 @@ class CLITests(unittest.TestCase):
             self.assertEqual(record["result"], "watchdog_not_ready")
             self.assertFalse(any(item[0] == TS for item in table.mutations))
 
+    def test_launch_is_inside_the_rollback_lock(self):
+        table = Table(dns_dirty_window=(1, 21))
+        seen = {}
+
+        def spawner(_argv, log_path):
+            import fcntl
+            lock = Path(log_path).parent.parent / "rollback.lock"
+            handle = open(lock, "a+b")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                seen["held"] = True
+            else:
+                seen["held"] = False
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+            return FakeProcess(table)
+
+        self.record(table, external_rollback=True, arm_watchdog=self._ready_arm,
+                    spawner=spawner)
+        self.assertTrue(seen["held"])
+
+    def test_deadline_marker_is_a_normal_completion(self):
+        table = Table(dns_dirty_window=(1, 21))
+        clock = {"wall": None}
+
+        def wall():
+            return 1_700_000_000 if clock["wall"] is None else clock["wall"]
+
+        def arm(state, pin, deadline):
+            clock["deadline"] = deadline
+            clock["state"] = state
+            clock["pin"] = pin
+            return {"ready": True, "pid": 1, "pgid": 2, "pin": pin}
+
+        def sleeping(seconds):
+            table.clock += seconds
+            clock["wall"] = clock["deadline"]
+            mod._mark_engaged(clock["state"], clock["pin"])
+
+        with patch.object(mod.time, "time", side_effect=wall):
+            record = self.record(table, sleep=sleeping, external_rollback=True,
+                                 arm_watchdog=arm)
+        self.assertEqual(record["result"], "deadline_reached")
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+
+    def test_watchdog_spawn_keeps_the_validated_user(self):
+        import pwd
+        account = pwd.getpwuid(os.getuid())
+        if account.pw_uid == 0 or not mod._ACCOUNT_NAME.fullmatch(account.pw_name):
+            self.skipTest("no ordinary account name")
+        captured = {}
+
+        def popen(argv, **kwargs):
+            captured["env"] = kwargs["env"]
+            captured["argv"] = argv
+
+            class Child:
+                pid = 1
+
+                def poll(self):
+                    return 0
+
+            return Child()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"SUDO_USER": account.pw_name}, clear=False), \
+                patch.object(mod.subprocess, "Popen", side_effect=popen):
+            mod._spawn_watch(Path(tmp), "pre-start-20260101T000000Z.json", 50)
+        self.assertEqual(captured["env"]["SUDO_USER"], account.pw_name)
+        self.assertEqual(captured["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertNotIn("HOME", captured["env"])
+
+    def test_past_deadline_watchdog_still_blocks_until_it_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            document = {"ready": True, "pid": os.getpid(), "pgid": 9, "euid": 0,
+                        "pin": "pre-start-20260101T000000Z.json",
+                        "deadline_unix": int(time.time()) - 5}
+            (state / mod.READY_FILE).write_text(json.dumps(document), encoding="utf-8")
+            self.assertTrue(mod._watchdog_still_running(state))
+            with patch.object(mod, "_pid_alive", return_value=False):
+                self.assertFalse(mod._watchdog_still_running(state))
+
     def test_confirm_ready_rejects_unknown_and_shared_group(self):
         document = {"ready": True, "pid": 7, "pgid": 8, "euid": 0,
                     "pin": "pre-start-20260101T000000Z.json", "deadline_unix": 50}
