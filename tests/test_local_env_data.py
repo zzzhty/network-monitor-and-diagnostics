@@ -18,7 +18,7 @@ class LocalEnvDataTests(unittest.TestCase):
                 env.write_text(payload.format(marker=marker) + "\n")
                 result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), "help"],
                                         env=dict(os.environ, NMD_LOCAL_ENV=str(env)),
-                                        text=True, capture_output=True)
+                                        text=True, encoding="utf-8", capture_output=True)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(marker.exists())
 
@@ -29,5 +29,5 @@ class LocalEnvDataTests(unittest.TestCase):
                 env.write_text("# only data\nNMD_VPS_PUB=" + value + "\n")
                 result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), "help"],
                                         env=dict(os.environ, NMD_LOCAL_ENV=str(env)),
-                                        text=True, capture_output=True)
+                                        text=True, encoding="utf-8", capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)

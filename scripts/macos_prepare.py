@@ -65,12 +65,15 @@ _HEADER = (
 
 # --- snapshot: read-only commands, allowlisted before any spawn -------------
 
+# All users, full `comm` paths. Short names (`ucomm`, `-c`) truncate or are a
+# different field; a current-uid filter misses root and still grows past a cap.
+_PS_SNAPSHOT_ARGV = ("/bin/ps", "-axo", "pid=,comm=")
 _SNAPSHOT_COMMANDS = (
     (("/usr/sbin/netstat", "-rn", "-f", "inet"), 2),
     (("/usr/sbin/netstat", "-rn", "-f", "inet6"), 2),
     (("/usr/sbin/scutil", "--dns"), 2),
     (("/usr/sbin/scutil", "--proxy"), 2),
-    (("/bin/ps", "-axo", "pid=,comm="), 2),
+    (_PS_SNAPSHOT_ARGV, 2),
 )
 _SETUP = "/usr/sbin/networksetup"
 # Read forms only. A write flag is absent here, so it cannot match.
@@ -81,6 +84,13 @@ _TAILSCALE_TIMEOUT = 3
 _TAILSCALE_STATUS_LIMIT = macos_coexist.TAILSCALE_STATUS_PARSE_LIMIT
 _PREFS_LIMIT = 65536
 _FIXED_LIMIT = 65536
+# A busy Darwin 27 host printed 78965 bytes / 853 lines of full paths (median
+# comm 84 bytes, max 220) in about 20ms, exit 0, empty stderr, valid UTF-8.
+# The 64KiB cap read 65537 bytes, discarded the body, and the snapshot became
+# unknown. 1MiB is the shared reader's ceiling and about 13x that table.
+# Past it the body is dropped whole: a prefix is not a complete observation.
+# Other snapshot commands stay at 64KiB.
+_PS_SNAPSHOT_LIMIT = 1024 * 1024
 _PREFS_KEYS = ("ExitNodeID", "ExitNodeIP", "CorpDNS", "RouteAll",
                "ExitNodeAllowLANAccess", "WantRunning")
 
@@ -363,6 +373,8 @@ def write_config(text, out_path, *, repo_root=REPO_ROOT):
 
 
 def _limit_for(key):
+    if key == _PS_SNAPSHOT_ARGV:
+        return _PS_SNAPSHOT_LIMIT
     for argv, _ in _SNAPSHOT_COMMANDS:
         if key == argv:
             return _FIXED_LIMIT
@@ -544,10 +556,36 @@ def _parse_scutil_proxy(code, text, error):
     return {"status": "observed", "reason": None, "protocols": protocols, "bypass": bypass}
 
 
+def _ps_failure(error, code):
+    """Why this ps read cannot decide absence. None means the listing is complete."""
+    if not error and code == 0:
+        return None
+    if error == "timeout":
+        return "timeout"
+    if error == "output_too_large":
+        return "output_too_large"
+    if error == "invalid_text":
+        return "invalid_text"
+    # Non-zero exit and command_failed are one class. tool_missing,
+    # permission_denied, and launch_error stay the generic unknown.
+    if error == "command_failed" or (error is None and code not in (0, None)):
+        return "command_failed"
+    return "unavailable"
+
+
+_PS_NOTES = {
+    "timeout": "ps_timeout",
+    "output_too_large": "ps_output_too_large",
+    "invalid_text": "ps_invalid_text",
+    "command_failed": "ps_command_failed",
+}
+
+
 def _parse_ps(code, text, error):
     result = {"mihomo": [], "sing_tun": [], "tailscale": []}
-    if error or code != 0:
-        return result, "unavailable"
+    reason = _ps_failure(error, code)
+    if reason is not None:
+        return result, reason
     for line in text.splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit():
@@ -692,7 +730,12 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
         notes.append("tailscale_prefs_unavailable")
     if ps_reason is not None:
         # A failed or truncated ps is unknown. null is not "mihomo is absent".
+        # The specific token names timeout / non-zero / over-limit / bad text.
+        # Neither token carries process text.
         notes.append("ps_unavailable")
+        specific = _PS_NOTES.get(ps_reason)
+        if specific:
+            notes.append(specific)
 
     has_198_18 = dns["has_198_18"]
     exit_node_selected = bool(prefs.get("ExitNodeID") or prefs.get("ExitNodeIP"))

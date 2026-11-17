@@ -37,7 +37,7 @@ tailscale_checks() {{ record probes; }}
 {overrides}
 main {shlex.quote(command)}
 """
-            result = subprocess.run(["bash", "-c", script], text=True,
+            result = subprocess.run(["bash", "-c", script], text=True, encoding="utf-8",
                                     capture_output=True, timeout=10)
             return result, events.read_text().splitlines() if events.exists() else []
 
@@ -120,7 +120,7 @@ tailscale_checks() {{ record probes-failed; return 42; }}
                 sudo.chmod(0o755)
                 env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"])
                 result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), "stop"], capture_output=True,
-                                        text=True, env=env)
+                                        text=True, encoding="utf-8", env=env)
                 self.assertEqual(result.returncode, 42)
                 self.assertEqual(result.stderr.splitlines(),
                                  ["--", "bash", str(ROOT / "local-setup.sh"), "stop"])

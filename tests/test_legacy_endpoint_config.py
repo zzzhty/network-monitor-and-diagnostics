@@ -26,7 +26,7 @@ class LegacyEndpointConfigTests(unittest.TestCase):
         return subprocess.run(["bash", "-c", prelude + "\nsource " +
                                shlex.quote(str(ROOT / "local-setup.sh")) + "\n" + body],
                               env=dict(self.env, **overrides), capture_output=True, text=True,
-                              timeout=5)
+                              encoding="utf-8", timeout=5)
 
     def test_unconfigured_commands_stop_before_privilege_probe_or_write(self):
         for command in ("verify", "setup", "apply", "deploy", "cutover", "rollback", "test-stop"):
@@ -49,7 +49,7 @@ class LegacyEndpointConfigTests(unittest.TestCase):
         output = self.base / "rendered.yaml"
         result = self.shell("render_config " + shlex.quote(str(output)), NMD_LOCAL_ENV=str(local))
         self.assertEqual(result.returncode, 0, result.stderr)
-        text = output.read_text()
+        text = output.read_text(encoding="utf-8")
         self.assertIn("server: 100.64.0.2", text)
         self.assertIn("198.18.0.2/32", text)
         self.assertNotIn("203.0.113.20", text)

@@ -17,7 +17,8 @@ class RecoveryTests(unittest.TestCase):
         self.events = self.base / 'events'
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def local(self, command='deploy', failure='', active=False, package_failure=False):
         return self.shell(f'''
@@ -276,7 +277,8 @@ class LocalOverrideTests(unittest.TestCase):
         self.base = Path(self.temp.name)
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def env_file(self, body=None):
         path = self.base / 'nmd-local.env'
@@ -296,17 +298,18 @@ printf 'VPS_PUB=%s\\n' "$VPS_PUB"''')
         dest = self.base / 'rendered.yaml'
         result = self.render_with(self.env_file(), dest)
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = (ROOT / 'config.yaml').read_text().replace(
+        expected = (ROOT / 'config.yaml').read_text(encoding='utf-8').replace(
             self.PLACEHOLDER, self.FAKE_PUB)
-        self.assertEqual(dest.read_text(), expected)
-        self.assertNotIn(self.PLACEHOLDER, dest.read_text())
+        self.assertEqual(dest.read_text(encoding='utf-8'), expected)
+        self.assertNotIn(self.PLACEHOLDER, dest.read_text(encoding='utf-8'))
         self.assertIn(f'VPS_PUB={self.FAKE_PUB}', result.stdout)
 
     def test_default_without_override_keeps_placeholder(self):
         dest = self.base / 'rendered.yaml'
         result = self.render_with(self.base / 'absent.env', dest)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(dest.read_text(), (ROOT / 'config.yaml').read_text())
+        self.assertEqual(dest.read_text(encoding='utf-8'),
+                         (ROOT / 'config.yaml').read_text(encoding='utf-8'))
         self.assertIn(f'VPS_PUB={self.PLACEHOLDER}', result.stdout)
 
     def test_invalid_override_refuses_to_load(self):
@@ -368,7 +371,8 @@ class VerifyRetryTests(unittest.TestCase):
         self.env.write_text(f'NMD_VPS_PUB={self.FAKE_PUB}\n')
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def verify(self, cloudflare_body):
         calls = self.base / 'calls'
@@ -429,7 +433,8 @@ class PeerProbeTests(unittest.TestCase):
         self.env.write_text('NMD_VPS_PUB=198.51.100.77\n')
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def probe(self, ping_output, ping_status):
         out = self.base / 'ping.out'

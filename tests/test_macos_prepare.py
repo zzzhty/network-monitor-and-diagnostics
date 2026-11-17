@@ -313,16 +313,92 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("ps_unavailable", snapshot["takeover_ready"]["notes"])
         self.assertFalse(mod.summarize_snapshot(snapshot)["mihomo_running"])
 
-    def test_failed_ps_is_unknown_and_not_a_ready_signal(self):
+    def test_failed_ps_is_unknown_and_names_the_cause_without_the_listing(self):
+        cases = (
+            ((None, "UNIQUE_PS_LISTING_TOKEN", "output_too_large"), "ps_output_too_large"),
+            ((None, "UNIQUE_PS_LISTING_TOKEN", "timeout"), "ps_timeout"),
+            ((2, "UNIQUE_PS_LISTING_TOKEN", None), "ps_command_failed"),
+            ((0, "UNIQUE_PS_LISTING_TOKEN", "command_failed"), "ps_command_failed"),
+            ((0, "UNIQUE_PS_LISTING_TOKEN", "invalid_text"), "ps_invalid_text"),
+            ((None, "UNIQUE_PS_LISTING_TOKEN", "tool_missing"), None),
+        )
+        for result, specific in cases:
+            with self.subTest(error=result[2], code=result[0]):
+                table = fixtures()
+                table[("/bin/ps", "-axo", "pid=,comm=")] = result
+                snapshot = self.build(table)
+                ready = snapshot["takeover_ready"]
+                encoded = json.dumps(snapshot)
+                self.assertIsNone(ready["mihomo_absent"])
+                self.assertIn("ps_unavailable", ready["notes"])
+                if specific is None:
+                    self.assertFalse(any(note != "ps_unavailable" and note.startswith("ps_")
+                                         for note in ready["notes"]))
+                else:
+                    self.assertIn(specific, ready["notes"])
+                self.assertEqual(snapshot["processes"]["mihomo"], [])
+                self.assertIsNone(mod.summarize_snapshot(snapshot)["mihomo_running"])
+                self.assertNotIn("UNIQUE_PS_LISTING_TOKEN", encoded)
+                self.assertIsNot(ready["mihomo_absent"], True)
+
+    def test_ps_past_64kib_keeps_full_path_matches_and_drops_the_listing(self):
+        marker = "UNIQUE_PS_LISTING_TOKEN"
+        filler = f"  1000 /System/Library/PrivateFrameworks/{marker}/helper\n"
+        repeats = (65536 // len(filler.encode())) + 2
+        text = filler * repeats
+        text += "  77 /usr/local/libexec/mihomo-helper\n"
+        text += "    88 /usr/libexec/mihomo\n"
+        text += "  90 /Library/SystemExtensions/tailscaled.systemextension/tailscaled\n"
+        self.assertGreater(len(text.encode()), 65536)
+        self.assertLess(len(text.encode()), mod._PS_SNAPSHOT_LIMIT)
         table = fixtures()
-        table[("/bin/ps", "-axo", "pid=,comm=")] = (None, "", "output_too_large")
+        table[("/bin/ps", "-axo", "pid=,comm=")] = (0, text, None)
         snapshot = self.build(table)
         ready = snapshot["takeover_ready"]
-        self.assertIsNone(ready["mihomo_absent"])
-        self.assertIn("ps_unavailable", ready["notes"])
+        self.assertFalse(ready["mihomo_absent"])
+        self.assertNotIn("ps_unavailable", ready["notes"])
+        self.assertEqual(snapshot["processes"]["mihomo"], [{"pid": 88, "comm": "mihomo"}])
+        self.assertEqual(snapshot["processes"]["tailscale"], [{"pid": 90, "comm": "tailscaled"}])
+        self.assertEqual(snapshot["commands"][4], ["/bin/ps", "-axo", "pid=,comm="])
+        self.assertNotIn("-u", snapshot["commands"][4])
+        self.assertNotIn("-c", snapshot["commands"][4])
+        self.assertTrue(mod.summarize_snapshot(snapshot)["mihomo_running"])
+        self.assertNotIn(marker, json.dumps(snapshot))
+        self.assertNotIn("/usr/libexec/mihomo", json.dumps(snapshot))
+
+    def test_snapshot_ps_bound_keeps_a_busy_mac_table_and_drops_past_the_cap(self):
+        self.assertGreaterEqual(mod._PS_SNAPSHOT_LIMIT, 78965)
+        self.assertEqual(mod._PS_SNAPSHOT_LIMIT, 1024 * 1024)
+        self.assertLessEqual(mod._PS_SNAPSHOT_LIMIT, macos_readonly._PARSE_LIMIT)
+        self.assertEqual(mod._limit_for(("/bin/ps", "-axo", "pid=,comm=")), mod._PS_SNAPSHOT_LIMIT)
+        self.assertEqual(mod._limit_for(("/usr/sbin/netstat", "-rn", "-f", "inet")), mod._FIXED_LIMIT)
+        self.assertEqual(mod._limit_for(("/bin/ps", "-p", "42", "-o", "lstart=,args=")), mod._FIXED_LIMIT)
+        self.assertEqual(mod._FIXED_LIMIT, 65536)
+        with patch.object(macos_readonly, "bounded_run", return_value=(0, b"  1 /sbin/launchd\n", None)) as run:
+            code, text, error = mod.execute(["/bin/ps", "-axo", "pid=,comm="], 2)
+        self.assertEqual((code, error, text), (0, None, "  1 /sbin/launchd\n"))
+        self.assertEqual(run.call_args.args[2], mod._PS_SNAPSHOT_LIMIT)
+        script = "import sys; sys.stdout.buffer.write(b'A'*int(sys.argv[1]))"
+        code, data, error = macos_readonly.bounded_run(
+            [sys.executable, "-c", script, "78965"], 5, mod._PS_SNAPSHOT_LIMIT)
+        self.assertEqual((code, error, len(data)), (0, None, 78965))
+        code, data, error = macos_readonly.bounded_run(
+            [sys.executable, "-c", script, str(mod._PS_SNAPSHOT_LIMIT + 1)],
+            5, mod._PS_SNAPSHOT_LIMIT)
+        self.assertEqual((code, data, error), (None, b"", "output_too_large"))
+
+    def test_non_utf8_ps_is_invalid_text_and_does_not_return_the_bytes(self):
+        blob = b"  1 /sbin/launchd\n  9 /\xff\n  8 /usr/local/bin/mihomo\n"
+        with patch.object(macos_readonly, "bounded_run", return_value=(0, blob, None)):
+            code, text, error = mod.execute(["/bin/ps", "-axo", "pid=,comm="], 2)
+        self.assertEqual((code, text, error), (0, "", "invalid_text"))
+        table = fixtures()
+        table[("/bin/ps", "-axo", "pid=,comm=")] = (code, text, error)
+        snapshot = self.build(table)
+        self.assertIsNone(snapshot["takeover_ready"]["mihomo_absent"])
+        self.assertIn("ps_invalid_text", snapshot["takeover_ready"]["notes"])
         self.assertEqual(snapshot["processes"]["mihomo"], [])
-        self.assertIsNone(mod.summarize_snapshot(snapshot)["mihomo_running"])
-        self.assertIsNot(ready["mihomo_absent"], True)
+        self.assertNotIn("/usr/local/bin/mihomo", json.dumps(snapshot))
 
     def test_services_wire_first_starred_skipped_automatic_empty(self):
         services = self.build()["dns"]["services"]
