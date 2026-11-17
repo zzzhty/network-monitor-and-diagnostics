@@ -243,7 +243,7 @@ Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Window
 
 `scripts/macos_prepare.py` 的 `config` 子命令从实验 profile 加用户输入离线生成一份 mihomo 可加载的 YAML。它不跑 `mihomo -t`（CI 没有 mihomo 二进制；实机 `-t` 是后续阶段步骤），校验全部离线完成：复用 `macos_coexist` 的 `validate_experiment_profile`、`validate_rule_order`、`insert_overseas_domain_rules`、`find_hardcoded_utun` 和 `mihomo_would_load`。
 
-- 输入：profile（默认 `examples/macos-mihomo-coexist.experiment.json`）+ inputs JSON（`server`/`port`，可选 `proxy_name`）。`server` 只接受 Tailnet 字面 IP（100.64.0.0/10 或 fd7a:115c:a1e0::/48）或恰好是文档占位 `203.0.113.20`；占位与真实值混用报错；端口 22 拒绝。
+- 输入：profile（默认 `examples/macos-mihomo-coexist.experiment.json`）+ inputs JSON（`server`/`port`，可选 `proxy_name`）。`server` 只接受 Tailnet 字面 IP（100.64.0.0/10 或 fd7a:115c:a1e0::/48）或恰好是文档占位 `203.0.113.20`；占位的锚点是服务器地址——用占位地址时端口须保持示例对 `1080`，真实 Tailnet 地址配任意合法端口（含标准 SOCKS `1080`）；端口 22 拒绝。
 - 相对 Linux `config.yaml` 的 macOS 适配（`validate_document` 逐条断言）：删 `iproute2-*`、`device`、代理 `interface-name`、`mixed-port`/`external-controller`、文档占位网段 DIRECT、`PROCESS-NAME,tailscaled` 与 Ubuntu 联网检测域名；TUN 加 `dns-mode: native`（mihomo ≥ 1.19.33，macOS 默认 disabled 故显式写明）；`nameserver-policy` 不绑定接口。
 - 真实地址永不进仓库：`--out` 拒绝仓库树内的路径，父目录 0700、文件 0600 原子写；仓库里只有占位版 `examples/macos-mihomo-takeover.inputs.example.json` 与黄金文件 `examples/macos-mihomo-takeover.example.yaml`（用 `--stdout` 刷新，字节级比对入测试）。输出确定性：无时间戳、固定键序。
 

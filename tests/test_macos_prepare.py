@@ -189,12 +189,16 @@ class ConfigNegativeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     mod.validate_inputs(value)
 
-    def test_placeholder_and_real_values_may_not_be_mixed(self):
-        for value in ({"server": macos_coexist.PLACEHOLDER_SOCKS_HOST, "port": 1081},
-                      {"server": "100.64.0.8", "port": macos_coexist.PLACEHOLDER_SOCKS_PORT}):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    mod.validate_inputs(value)
+    def test_placeholder_pairing_and_real_standard_port(self):
+        # The placeholder server pins the example pair; a real tailnet server
+        # may use any valid port, including the standard SOCKS 1080.
+        with self.assertRaisesRegex(ValueError, "placeholder_server_requires"):
+            mod.validate_inputs({"server": macos_coexist.PLACEHOLDER_SOCKS_HOST, "port": 1081})
+        self.assertEqual(
+            mod.validate_inputs({"server": "100.64.0.8",
+                                 "port": macos_coexist.PLACEHOLDER_SOCKS_PORT}),
+            {"proxy_name": "VPS", "server": "100.64.0.8",
+             "port": macos_coexist.PLACEHOLDER_SOCKS_PORT})
 
     def test_invalid_profile_is_rejected_before_any_document(self):
         broken = json.loads(json.dumps(PROFILE))

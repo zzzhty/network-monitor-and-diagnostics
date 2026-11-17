@@ -133,9 +133,12 @@ def validate_inputs(value):
         raise ValueError("invalid_port")
     if port == 22:
         raise ValueError("ssh_port_not_allowed")
-    placeholder_port = port == macos_coexist.PLACEHOLDER_SOCKS_PORT
-    if placeholder_server != placeholder_port:
-        raise ValueError("inputs must be all placeholders or all real")
+    if placeholder_server and port != macos_coexist.PLACEHOLDER_SOCKS_PORT:
+        # The placeholder anchor is the RFC 5737 server address, which can
+        # never be a real tailnet IP; port 1080 is the standard SOCKS port and
+        # perfectly valid with a real server. Only the checked-in example pair
+        # must stay exactly (203.0.113.20, 1080).
+        raise ValueError("placeholder_server_requires_placeholder_port")
     return {"proxy_name": _proxy_name(value.get("proxy_name", DEFAULT_PROXY_NAME)),
             "server": server, "port": port}
 
