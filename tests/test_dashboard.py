@@ -62,6 +62,10 @@ class DashboardTests(unittest.TestCase):
         js = (ROOT / 'web/app.js').read_text()
         self.assertIn('id="daemon-card"', html)
         self.assertIn('id="daemon-stop"', html)
+        self.assertLess(html.index('id="connection"'), html.index('id="daemon-card"'))
+        self.assertLess(html.index('id="daemon-card"'), html.index('id="overview"'))
+        self.assertNotIn('id="daemon-card"', html.split('id="overview"', 1)[1])
+        self.assertIn('守护不可达', js)
         self.assertIn("fetch('/api/daemon/status'", js)
         self.assertIn("postJSON('/api/daemon/takeover/stop'", js)
         # The panel may stop a takeover but never start one.

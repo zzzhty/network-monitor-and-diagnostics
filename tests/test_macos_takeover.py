@@ -34,8 +34,9 @@ class Table:
     """Fixture host: read-only answers, mutable effects, one fake process."""
 
     def __init__(self, *, dns_dirty_window=None, tcp_ok=True, status_healthy=True,
-                 ps_mihomo=False, exit_node_selected=True, corp_dns=True,
-                 services=(("Wi-Fi", []),), fail_mutations=(), process_alive=True):
+                 ps_mihomo=False, exit_node_selected=True,
+                 services=(("Wi-Fi", []),), fail_mutations=(), process_alive=True,
+                 corp_dns=True, allow_lan=False):
         self.dns_dirty_window = dns_dirty_window  # (from, to) in fake seconds
         self.tcp_ok = tcp_ok
         self.status_healthy = status_healthy
@@ -45,6 +46,8 @@ class Table:
         self.snapshot_corp_dns = corp_dns
         self.snapshot_services = {name: list(servers) for name, servers in services}
         self.service_dns = {name: list(servers) for name, servers in services}
+        self.corp_dns = corp_dns
+        self.allow_lan = allow_lan
         self.mutations = []
         self.fail_mutations = fail_mutations
         self.process_alive = process_alive
@@ -85,8 +88,8 @@ class Table:
             return 0, json.dumps(body), None
         if argv == (TS, "debug", "prefs"):
             prefs = {"ExitNodeID": None if self.exit_node_cleared else "nodekey:abc",
-                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
-                     "ExitNodeAllowLANAccess": False, "WantRunning": True}
+                     "ExitNodeIP": None, "CorpDNS": self.corp_dns, "RouteAll": False,
+                     "ExitNodeAllowLANAccess": self.allow_lan, "WantRunning": True}
             return 0, json.dumps(prefs), None
         raise AssertionError(f"unexpected read {argv}")
 
@@ -101,6 +104,15 @@ class Table:
             for item in argv[2:]:
                 if item.startswith("--exit-node="):
                     self.exit_node_cleared = item == "--exit-node="
+                elif item == "--accept-dns=true":
+                    self.corp_dns = True
+                elif item == "--accept-dns=false":
+                    self.corp_dns = False
+                elif item in ("--exit-node-allow-lan-access",
+                              "--exit-node-allow-lan-access=true"):
+                    self.allow_lan = True
+                elif item == "--exit-node-allow-lan-access=false":
+                    self.allow_lan = False
         if argv[0:2] == ["/usr/sbin/networksetup", "-setdnsservers"]:
             rest = argv[2:]
             self.service_dns[rest[0]] = [] if rest[1] == "Empty" else rest[1:]
@@ -156,10 +168,12 @@ class AllowlistTests(unittest.TestCase):
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "Empty"],
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "192.0.2.53"],
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "192.0.2.53", "192.0.2.54"],
-            [MIHOMO, "-t", "-f", "/tmp/config.yaml"],
-            [MIHOMO, "-f", "/tmp/config.yaml"],
-            [MIHOMO, "-d", "/tmp/work", "-f", "/tmp/config.yaml"],
-            [MIHOMO, "-d", "/tmp/work", "-t", "-f", "/tmp/config.yaml"],
+            ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "fe80::1%en0"],
+            [MIHOMO, "-d", "/tmp/work", "-f", "/tmp/work/config.yaml"],
+            [MIHOMO, "-d", "/tmp/work", "-t", "-f", "/tmp/work/config.yaml"],
+            [TS, "set", "--exit-node-allow-lan-access=true"],
+            [TS, "set", "--exit-node-allow-lan-access=false"],
+            [TS, "set", "--accept-dns=false"],
         )
         for argv in allowed:
             with self.subTest(argv=argv):
@@ -174,15 +188,24 @@ class AllowlistTests(unittest.TestCase):
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "Empty", "extra"],
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi;rm", "Empty"],
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "vps.example.com"],
+            ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "fe80::1%en0;rm"],
+            ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "fe80::1%"],
             [TS, "set", "--advertise-routes=10.0.0.0/8"],
             [TS, "set", "--logout"],
             [TS, "set"],
             ["/bin/sh", "-c", "true"],
             ["/usr/bin/sudo", TS, "set", "--exit-node="],
             ["/tmp/other/mihomo", "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-t", "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-d", "/tmp/work", "-f", "/tmp/config.yaml"],
+            [MIHOMO, "-d", "/tmp/work", "-f", "/tmp/work/../config.yaml"],
+            [MIHOMO, "-d", "/tmp/../work", "-f", "/tmp/work/config.yaml"],
             [MIHOMO, "-d", "/tmp"],
             [MIHOMO, "-t", "-f", "/tmp/config.yaml", "--ext-ui"],
             [MIHOMO, "-d", "relative", "-f", "/tmp/config.yaml"],
+            [TS, "set", "--exit-node-allow-lan-access=maybe"],
+            [TS, "set", "--exit-node=bad node"],
         )
         for argv in rejected:
             with self.subTest(argv=argv):
@@ -192,10 +215,11 @@ class AllowlistTests(unittest.TestCase):
                 mod.execute_mutating(["/bin/sh", "-c", "true"])
 
     def test_explicit_mihomo_path_widens_only_that_binary(self):
-        self.assertTrue(mod.mutating_allowlisted(
-            ["/opt/custom/mihomo", "-t", "-f", "/tmp/c.yaml"], mihomo_path="/opt/custom/mihomo"))
-        self.assertFalse(mod.mutating_allowlisted(
-            ["/opt/custom/mihomo", "-t", "-f", "/tmp/c.yaml"], mihomo_path="/opt/other/mihomo"))
+        allowed = ["/opt/custom/mihomo", "-d", "/tmp/work", "-t", "-f", "/tmp/work/c.yaml"]
+        self.assertTrue(mod.mutating_allowlisted(allowed, mihomo_path="/opt/custom/mihomo"))
+        self.assertFalse(mod.mutating_allowlisted(allowed, mihomo_path="/opt/other/mihomo"))
+        outside = ["/opt/custom/mihomo", "-d", "/tmp/work", "-f", "/tmp/other/c.yaml"]
+        self.assertFalse(mod.mutating_allowlisted(outside, mihomo_path="/opt/custom/mihomo"))
 
 
 class TakeoverFlowTests(unittest.TestCase):
@@ -208,6 +232,11 @@ class TakeoverFlowTests(unittest.TestCase):
         record = self.record(table)
         self.assertEqual(record["result"], "deadline_reached")
         self.assertEqual(record["mutations"], [[TS, "set", "--exit-node="]])
+        # The -t call is gated but is not a network mutation. Its argv is the
+        # only shape production validation is allowed to exec.
+        self.assertTrue(mod.mutating_allowlisted(table.mutations[0], mihomo_path=MIHOMO))
+        self.assertEqual(table.mutations[0][1:4], ["-d", table.mutations[0][2], "-t"])
+        self.assertEqual(Path(table.mutations[0][-1]).parent, Path(table.mutations[0][2]))
         self.assertIn("native_dns_ready", record["steps"])
         self.assertEqual(record["rollback"]["result"], "rollback_restored")
         self.assertIn("exit_node_restored", record["rollback"]["steps"])
@@ -275,7 +304,7 @@ class TakeoverFlowTests(unittest.TestCase):
         self.assertNotIn("mihomo_started", record["steps"])
 
     def test_failed_mihomo_t_stops_before_any_mutation(self):
-        table = Table(fail_mutations=(((1, "-t"),),))
+        table = Table(fail_mutations=(((3, "-t"),),))
         record = self.record(table)
         self.assertTrue(str(record["result"]).startswith("config_invalid"))
         self.assertEqual(record["mutations"], [])
@@ -369,6 +398,256 @@ class RollbackTests(unittest.TestCase):
             # The live exit node stays exactly as it is: no empty-value guess.
             self.assertEqual([m for m in table.mutations if m[0] == TS], [])
             self.assertIn("Wi-Fi:restored", result["steps"])
+
+    def test_allow_lan_and_accept_dns_restore_and_second_pass_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            table.corp_dns = False
+            table.allow_lan = True
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--accept-dns=true"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node-allow-lan-access=false"], table.mutations)
+            after = len(table.mutations)
+            again = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                 sleep=table.sleep, now=lambda: table.clock,
+                                 tailscale_path=TS)
+            self.assertEqual(again["result"], "rollback_restored")
+            self.assertEqual(len(table.mutations), after)
+            self.assertIn("accept_dns_unchanged", again["steps"])
+            self.assertIn("allow_lan_unchanged", again["steps"])
+
+    def test_pin_beats_a_newer_post_cutover_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state)
+            newer = {"schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+                     "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:evil",
+                                             "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                             "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+                     "dns": {"services": []}}
+            (state / "pre-start-20261118T000000Z.json").write_text(
+                json.dumps(newer), encoding="utf-8")
+            mod.write_pin(state, pinned.name)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["snapshot"], pinned.name)
+            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertFalse(any("evil" in json.dumps(item) for item in table.mutations))
+
+    def test_symlink_snapshot_and_symlink_pin_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state)
+            evil = state / "evil.json"
+            evil.write_text(json.dumps({
+                "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+                "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:evil",
+                                        "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                        "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+                "dns": {"services": []}}), encoding="utf-8")
+            (state / "pre-start-20261118T000000Z.json").symlink_to(evil)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["snapshot"], pinned.name)
+            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            link = state / mod.PIN_FILE
+            link.symlink_to(evil)
+            with self.assertRaisesRegex(mod.TakeoverError, "pin_untrusted"):
+                mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                             sleep=table.sleep, now=lambda: table.clock,
+                             tailscale_path=TS)
+
+    def test_unsafe_exit_node_is_not_passed_to_tailscale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, prefs={
+                "status": "observed", "ExitNodeID": "bad node", "ExitNodeIP": None,
+                "CorpDNS": True, "RouteAll": False, "ExitNodeAllowLANAccess": False,
+                "WantRunning": True})
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_incomplete")
+            self.assertIn("exit_node_unrestorable", result["steps"])
+            self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_one_dns_service_failure_does_not_skip_the_next(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, services=(("Wi-Fi", ["192.0.2.53"]),
+                                                 ("Ethernet", ["192.0.2.54"])))
+            table = Table(services=(("Wi-Fi", []), ("Ethernet", [])),
+                          fail_mutations=(( (0, "/usr/sbin/networksetup"), (2, "Wi-Fi") ),))
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_incomplete")
+            self.assertIn("Wi-Fi:failed", result["steps"])
+            self.assertIn("Ethernet:restored", result["steps"])
+
+    def test_one_unreadable_scutil_does_not_abort_the_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            calls = {"dns": 0}
+
+            def runner(argv, timeout):
+                if tuple(argv) == ("/usr/sbin/scutil", "--dns"):
+                    calls["dns"] += 1
+                    if calls["dns"] == 1:
+                        return 1, "", "scutil_failed"
+                return table.runner(argv, timeout)
+
+            result = mod.rollback(state, runner=runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertGreaterEqual(calls["dns"], 2)
+            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+
+    def test_unreadable_live_prefs_leave_the_exit_node_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            table = Table()
+
+            def runner(argv, timeout):
+                if len(argv) >= 2 and argv[-2:] == ["debug", "prefs"]:
+                    return 1, "", "prefs_failed"
+                return table.runner(argv, timeout)
+
+            result = mod.rollback(state, runner=runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_incomplete")
+            self.assertIn("prefs_unreadable", result["steps"])
+            self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+            self.assertIn("Wi-Fi:restored", result["steps"])
+
+    def test_rollback_signals_only_the_recorded_mihomo_leader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, services=(("Wi-Fi", []),))
+            mod.write_owner(state, 4242, MIHOMO)
+            killed = []
+
+            def runner(argv, timeout):
+                if tuple(argv) == ("/bin/ps", "-axo", "pid=,comm="):
+                    return 0, "    1 /sbin/launchd\n 4242 /usr/local/bin/mihomo\n 7777 /bin/bash\n", None
+                return Table().runner(argv, timeout)
+
+            with patch.object(mod.os, "getpgid", return_value=4242), \
+                    patch.object(mod.os, "killpg", side_effect=lambda pgid, sig: killed.append(pgid)):
+                result = mod.rollback(state, runner=runner, mutator=Table().mutator,
+                                      sleep=lambda _seconds: None, now=lambda: 0.0,
+                                      tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn("owner_signalled", result["steps"])
+            self.assertEqual(set(killed), {4242})
+
+            killed.clear()
+            mod.write_owner(state, 4242, MIHOMO)
+
+            def other(argv, timeout):
+                if tuple(argv) == ("/bin/ps", "-axo", "pid=,comm="):
+                    return 0, " 4242 /usr/bin/python3\n", None
+                return Table().runner(argv, timeout)
+
+            with patch.object(mod.os, "getpgid", side_effect=AssertionError("pgid")), \
+                    patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
+                result = mod.rollback(state, runner=other, mutator=Table().mutator,
+                                      sleep=lambda _seconds: None, now=lambda: 0.0,
+                                      tailscale_path=TS)
+            self.assertIn("owner_not_running", result["steps"])
+
+            mod.write_owner(state, 4242, MIHOMO)
+            with patch.object(mod.os, "getpgid", return_value=1), \
+                    patch.object(mod.os, "killpg", side_effect=AssertionError("signal")):
+                result = mod.rollback(state, runner=runner, mutator=Table().mutator,
+                                      sleep=lambda _seconds: None, now=lambda: 0.0,
+                                      tailscale_path=TS)
+            self.assertIn("owner_not_session_leader", result["steps"])
+
+
+class WorkdirTests(unittest.TestCase):
+    def test_validation_refuses_a_symlink_config_without_spawning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            secret = Path(tmp) / "secret.yaml"
+            secret.write_text("secret", encoding="utf-8")
+            link = work / "config.yaml"
+            link.symlink_to(secret)
+            with patch.object(mod.subprocess, "run", side_effect=AssertionError("spawn")):
+                ok, detail = mod.run_mihomo_validate(MIHOMO, link, work)
+            self.assertFalse(ok)
+            self.assertEqual(detail, "config_not_confined")
+            self.assertEqual(secret.read_text(encoding="utf-8"), "secret")
+
+    def test_geodata_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            secret = base / "secret"
+            secret.write_bytes(b"secret")
+            source = base / "src"
+            source.mkdir()
+            (source / "geoip.metadb").symlink_to(secret)
+            (source / "geosite.dat").write_bytes(b"geosite")
+            target = base / "work"
+            target.mkdir()
+            planted = target / "Country.mmdb"
+            planted.symlink_to(secret)
+            staged, missing = mod.stage_geodata(target, source)
+            self.assertNotIn("geoip.metadb", staged)
+            self.assertIn("geoip.metadb", missing)
+            self.assertIn("geosite.dat", staged)
+            self.assertEqual((target / "geosite.dat").read_bytes(), b"geosite")
+            self.assertFalse(planted.exists())
+            self.assertFalse(planted.is_symlink())
+            self.assertEqual(secret.read_bytes(), b"secret")
+
+    def test_omitted_tcp_uses_the_readonly_connector(self):
+        seen = {}
+
+        def connector(host, port, timeout):
+            seen["target"] = (host, port)
+            return {"status": "ok"}
+
+        table = Table(dns_dirty_window=(1, 61))
+        with patch.object(macos_readonly, "tcp_connect", connector):
+            record = TakeoverFlowTests().record(table, tcp=None)
+        self.assertEqual(record["result"], "deadline_reached")
+        self.assertEqual(seen["target"], (INPUTS["server"], INPUTS["port"]))
+
+    def test_state_dir_symlink_is_refused_before_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real"
+            real.mkdir()
+            link = Path(tmp) / "link"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(mod.TakeoverError, "state_dir_symlink"):
+                mod.takeover(inputs=INPUTS, profile=PROFILE, minutes=1, mihomo_path=MIHOMO,
+                             state_dir=link, runner=Table().runner, mutator=Table().mutator,
+                             spawner=Table().spawner, tcp=Table().tcp,
+                             exists=lambda path: path == TS, sleep=lambda _s: None,
+                             now=lambda: 0.0)
+            self.assertEqual(list(real.iterdir()), [])
 
 
 class ContractPins(unittest.TestCase):
