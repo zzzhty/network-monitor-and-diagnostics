@@ -92,8 +92,6 @@ _PUBLIC_ERRORS = {
     "truncated",
 }
 PHASE_2_NOT_IMPLEMENTED = (
-    "config_generation",
-    "pre_start_snapshot",
     "independent_watchdog",
     "idempotent_rollback",
     "cutover",

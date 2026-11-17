@@ -138,6 +138,7 @@ DEVELOPMENT_STEPS = (
     {"id": "pure-checks", "status": "in_this_pr", "mutates_network": False},
     {"id": "read-only-status-adapter", "status": "wired", "mutates_network": False},
     {"id": "opt-in-macos-sample", "status": "wired", "mutates_network": False},
+    {"id": "config-and-snapshot", "status": "in_this_pr", "mutates_network": False},
     {"id": "cutover-controller", "status": "not_in_product", "mutates_network": True},
 )
 

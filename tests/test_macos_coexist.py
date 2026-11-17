@@ -187,7 +187,7 @@ class ProfileTests(unittest.TestCase):
             if path.name == "macos_coexist.py":
                 continue
             source = path.read_text(encoding="utf-8")
-            if path.name == "macos_readonly.py":
+            if path.name in ("macos_readonly.py", "macos_prepare.py"):
                 self.assertIn("import macos_coexist", source)
                 continue
             self.assertNotIn("import macos_coexist", source)
@@ -549,7 +549,7 @@ class TailscaleStatusTests(unittest.TestCase):
         self.assertIn("no cutover or restore command", unknown.stdout)
         self.assertEqual(
             [step["status"] for step in m.DEVELOPMENT_STEPS],
-            ["in_this_pr", "wired", "wired", "not_in_product"],
+            ["in_this_pr", "wired", "wired", "in_this_pr", "not_in_product"],
         )
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "cutover-controller")
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "not_in_product")

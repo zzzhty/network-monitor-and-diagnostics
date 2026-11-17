@@ -766,8 +766,6 @@ class CommandBoundTests(unittest.TestCase):
         for name in ("restore", "cutover", "watchdog", "autostart"):
             self.assertFalse(hasattr(mod, name))
         self.assertEqual(mod.PHASE_2_NOT_IMPLEMENTED, (
-            "config_generation",
-            "pre_start_snapshot",
             "independent_watchdog",
             "idempotent_rollback",
             "cutover",
@@ -909,7 +907,8 @@ class EntryTests(unittest.TestCase):
             "real_machine_verified",
             "不要使用 sudo",
             "第二阶段仍未实现",
-            "配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启",
+            "独立 watchdog、幂等回退、切网、开机自启",
+            "scripts/macos_prepare.py",
             "此次新代码没有在实机运行",
             "4044472",
             "不能只信可能缺键的 `scutil --proxy`",

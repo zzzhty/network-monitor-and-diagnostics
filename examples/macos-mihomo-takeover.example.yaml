@@ -1,0 +1,76 @@
+# NMD macOS mihomo 实验配置 — Phase A 生成，勿手改
+# 203.0.113.20 是文档占位，不是实机地址
+# 本配置未做实机验证；实机启动前先运行 mihomo -t（后续阶段步骤）。
+mode: rule
+log-level: info
+ipv6: false
+tcp-concurrent: true
+unified-delay: true
+geo-auto-update: true
+geo-update-interval: 72
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+  dns-mode: native
+  route-exclude-address:
+    - 100.64.0.0/10
+    - fd7a:115c:a1e0::/48
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '+.tailscale.com'
+    - '+.tailscale.io'
+    - '+.ts.net'
+    - '+.lan'
+    - '+.local'
+    - '+.home.arpa'
+    - 'localhost.*'
+  nameserver-policy:
+    '+.ts.net': 100.100.100.100
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports:
+        - 443
+        - 8443
+    HTTP:
+      ports:
+        - 80
+proxies:
+  - name: VPS
+    type: socks5
+    server: 203.0.113.20
+    port: 1080
+    udp: true
+proxy-groups:
+  - name: NMD-EXIT
+    type: select
+    proxies:
+      - VPS
+rules:
+  - 'DOMAIN-SUFFIX,tailscale.com,DIRECT'
+  - 'DOMAIN-SUFFIX,tailscale.io,DIRECT'
+  - 'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve'
+  - 'IP-CIDR6,fd7a:115c:a1e0::/48,DIRECT,no-resolve'
+  - 'DOMAIN-SUFFIX,chatgpt.com,NMD-EXIT'
+  - 'DOMAIN-SUFFIX,openai.com,NMD-EXIT'
+  - 'DOMAIN-SUFFIX,oaistatic.com,NMD-EXIT'
+  - 'DOMAIN-SUFFIX,oaiusercontent.com,NMD-EXIT'
+  - 'GEOSITE,cn,DIRECT'
+  - 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve'
+  - 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve'
+  - 'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve'
+  - 'GEOIP,CN,DIRECT'
+  - 'MATCH,NMD-EXIT'

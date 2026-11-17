@@ -138,7 +138,8 @@ Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 st
 | 1 | `scripts/macos_coexist.py` 的规则、探针、代理和 status 白名单 | 本 PR。不改网络 |
 | 2 | 只读适配：把完整 stdout 交给 `normalize_tailscale_status` | 已由 `scripts/macos_readonly.py` 接入。不在解析前按输出上限切片 |
 | 3 | 显式打开的 macOS 采样字段，默认关闭 | 已接入。`macos_readonly.enabled` 默认为 false |
-| 4 | 切网或回退控制器 | 不在产品里。隔离目录的启动器不是本仓库 |
+| 4 | 配置生成与启动前快照 | 已接入：`scripts/macos_prepare.py`（Phase A）。离线生成 + 只读快照；不启动进程、不改网络、不用 sudo |
+| 5 | 切网或回退控制器 | 不在产品里。隔离目录的启动器不是本仓库 |
 
 现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。Tailscale status 另有一条有界读取，上限是解析器的 1 MiB；超过上限或读到一半时丢掉正文，不解析前缀。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
 
@@ -233,9 +234,36 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `system_proxy` 同时带 `sources.scutil` 和 `sources.networksetup`。`disabled_saved_address_is_fault` 为 false。`bypass_reset`、`auto_disable`、`monitoring_prevents_reenable` 为 false。已关闭但保存的本机地址在 `disabled_saved`。失效的已启用代理是高优先级 `dead_proxy`，不能被 Tailscale 连通结果抵消。
 - `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
 
-第二阶段仍未实现，这里只留清单：配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启。
+第二阶段仍未实现的只剩：独立 watchdog、幂等回退、切网、开机自启。配置生成与启动前快照已由 `scripts/macos_prepare.py` 提供（离线与只读，不启动进程、不用 sudo、不改网络）。
 
 Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Windows 仍只做原来的检查，不把这套 macOS 命令搬过去。此次新代码没有在实机运行。过夜 23 秒窗口的根因未定。
+
+## 配置生成（Phase A）
+
+`scripts/macos_prepare.py` 的 `config` 子命令从实验 profile 加用户输入离线生成一份 mihomo 可加载的 YAML。它不跑 `mihomo -t`（CI 没有 mihomo 二进制；实机 `-t` 是后续阶段步骤），校验全部离线完成：复用 `macos_coexist` 的 `validate_experiment_profile`、`validate_rule_order`、`insert_overseas_domain_rules`、`find_hardcoded_utun` 和 `mihomo_would_load`。
+
+- 输入：profile（默认 `examples/macos-mihomo-coexist.experiment.json`）+ inputs JSON（`server`/`port`，可选 `proxy_name`）。`server` 只接受 Tailnet 字面 IP（100.64.0.0/10 或 fd7a:115c:a1e0::/48）或恰好是文档占位 `203.0.113.20`；占位与真实值混用报错；端口 22 拒绝。
+- 相对 Linux `config.yaml` 的 macOS 适配（`validate_document` 逐条断言）：删 `iproute2-*`、`device`、代理 `interface-name`、`mixed-port`/`external-controller`、文档占位网段 DIRECT、`PROCESS-NAME,tailscaled` 与 Ubuntu 联网检测域名；TUN 加 `dns-mode: native`（mihomo ≥ 1.19.33，macOS 默认 disabled 故显式写明）；`nameserver-policy` 不绑定接口。
+- 真实地址永不进仓库：`--out` 拒绝仓库树内的路径，父目录 0700、文件 0600 原子写；仓库里只有占位版 `examples/macos-mihomo-takeover.inputs.example.json` 与黄金文件 `examples/macos-mihomo-takeover.example.yaml`（用 `--stdout` 刷新，字节级比对入测试）。输出确定性：无时间戳、固定键序。
+
+```bash
+PYTHONPATH=scripts python3 scripts/macos_prepare.py config \
+  --inputs examples/macos-mihomo-takeover.inputs.example.json --stdout
+```
+
+## 启动前快照（Phase A）
+
+`snapshot` 子命令按固定顺序只读采集系统状态，为后续幂等回退留证据：`netstat -rn -f inet/inet6`、`scutil --dns`、`scutil --proxy`、`ps -axo pid=,comm=`、`networksetup -listallnetworkservices` + 活跃服务（Wi-Fi 优先，≤8，跳过带星号）的 `-getdnsservers`、`tailscale status --json`，以及 `tailscale debug prefs`（ExitNodeID/ExitNodeIP/CorpDNS/RouteAll/ExitNodeAllowLANAccess/WantRunning——macOS 侧首个 prefs 读取，只读）。全部 argv 过本模块白名单后经 `macos_readonly.bounded_run` 执行；写 flag 与 `tailscale set` 在进程启动前就被拒绝。
+
+- 快照文件保留真实值（exit node id、解析器、网关、代理端点），写在默认 `~/.local/state/nmd-monitor/`（尊重绝对 XDG_STATE_HOME；与来源注册表同一私有信任域）的 `pre-start-<UTC时间戳>.json`，目录 0700、文件 0600 原子写；检查与写入都作用在解析后的真实路径上，符号链接无法把文件重定向进仓库。
+- stdout 只输出 `summarize_snapshot` 的脱敏视图：各段 status、计数、布尔和 exit node id 的 sha256 指纹，不回显任何地址。
+- `takeover_ready` 记录三个前置判断：scutil 无 198.18、无 mihomo 进程、是否选定 exit node；缺哪段读不到就进 notes，不猜。
+- 后续阶段的回退只消费这份文件：复验 scutil 无 198.18 后按 prefs 恢复 exit node / allow-lan / accept-dns，按 services 恢复网卡 DNS（空列表即 Automatic）；系统代理与 bypass 始终只读不回写。同秒重复回退的幂等风险继续由回退约束承担。
+- 非 macOS 平台返回 `not_applicable` 且零命令。新的 config/snapshot 代码没有在实机运行。
+
+```bash
+PYTHONPATH=scripts python3 scripts/macos_prepare.py snapshot [--state-dir DIR]
+```
 
 ## 回退约束
 
