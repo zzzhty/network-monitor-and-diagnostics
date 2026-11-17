@@ -75,13 +75,13 @@ def dns_text():
     ])
 
 
-def proxy_text(socks="0"):
+def proxy_text(socks="0", http="0", https="0"):
     return "\n".join([
         "<dictionary> {",
-        "  HTTPEnable : 0",
+        "  HTTPEnable : " + http,
         "  HTTPProxy : 127.0.0.1",
         "  HTTPPort : 7897",
-        "  HTTPSEnable : 0",
+        "  HTTPSEnable : " + https,
         "  HTTPSProxy : 127.0.0.1",
         "  HTTPSPort : 7897",
         "  SOCKSEnable : " + socks,
@@ -96,6 +96,65 @@ def proxy_text(socks="0"):
     ])
 
 
+SETUP = "/usr/sbin/networksetup"
+SETUP_LIST = (SETUP, "-listallnetworkservices")
+FTP_ONLY_PROXY = "<dictionary> {\n  FTP passive : 1\n}\n"
+
+
+def setup_get(flag, service="Wi-Fi"):
+    return (SETUP, flag, service)
+
+
+def service_list(services=("Wi-Fi",)):
+    lines = ["An asterisk (*) denotes that a network service is disabled."]
+    lines.extend(services)
+    return "\n".join(lines) + "\n"
+
+
+def setup_proxy_text(enabled="No", server="127.0.0.1", port="7897"):
+    return "\n".join([
+        "Enabled: " + enabled,
+        "Server: " + server,
+        "Port: " + port,
+        "Authenticated Proxy Enabled: 0",
+        "",
+    ])
+
+
+def setup_outputs(http="No", https="No", socks="No", server="127.0.0.1", port="7897", services=("Wi-Fi",)):
+    values = {"http": http, "https": https, "socks": socks}
+    flags = {
+        "http": "-getwebproxy",
+        "https": "-getsecurewebproxy",
+        "socks": "-getsocksfirewallproxy",
+    }
+    scripted = {SETUP_LIST: (0, service_list(services), None)}
+    for name, flag in flags.items():
+        for service in services:
+            if str(service).startswith("*"):
+                continue
+            scripted[setup_get(flag, service)] = (
+                0, setup_proxy_text(values[name], server, port), None,
+            )
+    return scripted
+
+
+def read_commands(ipv6=False, service="Wi-Fi"):
+    commands = [NETSTAT]
+    if ipv6:
+        commands.append(NETSTAT6)
+    commands.extend([
+        DNS,
+        PROXY,
+        SETUP_LIST,
+        setup_get("-getwebproxy", service),
+        setup_get("-getsecurewebproxy", service),
+        setup_get("-getsocksfirewallproxy", service),
+        TAILSCALE,
+    ])
+    return commands
+
+
 def outputs(overrides=None):
     base = {
         NETSTAT: (0, route_text(), None),
@@ -104,6 +163,7 @@ def outputs(overrides=None):
         PROXY: (0, proxy_text(), None),
         TAILSCALE: (0, status_text(), None),
     }
+    base.update(setup_outputs())
     if overrides:
         base.update(overrides)
     return base
@@ -181,6 +241,8 @@ class PlatformBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(report["status"], "not_applicable")
             self.assertEqual(report["commands"], [])
+            self.assertEqual(report["system_proxy"]["effect"], "not_applicable")
+            self.assertEqual(report["system_proxy"]["sources"]["networksetup"]["status"], "not_applicable")
             self.assertFalse(report["mutates_network"])
             self.assertNotIn(DOC_HOST, json.dumps(report))
         self.assertEqual(dials, [])
@@ -200,6 +262,7 @@ class PlatformBoundaryTests(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0][0], argv_head)
             blob = str(run.call_args_list)
             self.assertNotIn("scutil", blob)
+            self.assertNotIn("networksetup", blob)
             self.assertNotIn("/usr/bin/tailscale", blob)
             self.assertNotIn("status', '--json'", blob)
 
@@ -218,8 +281,8 @@ class ReadOnlyReportTests(unittest.TestCase):
         blob = json.dumps(report)
         for secret in (SECRET_HOST, SECRET_KEY, "secret-token", "a.example.ts.net", "100.64.0.2"):
             self.assertNotIn(secret, blob)
-        self.assertEqual([item[0] for item in calls], [NETSTAT, DNS, PROXY, TAILSCALE])
-        self.assertEqual([item[1] for item in calls], [2, 2, 2, 3])
+        self.assertEqual([item[0] for item in calls], read_commands())
+        self.assertEqual([item[1] for item in calls], [2, 2, 2, 2, 2, 2, 2, 3])
         self.assertFalse(report["report_is_health"])
         self.assertFalse(report["business_stable"])
         self.assertEqual(report["actions"], [])
@@ -332,7 +395,7 @@ class ReadOnlyReportTests(unittest.TestCase):
 
     def test_ipv6_tailnet_route_is_separate_from_the_ipv4_default(self):
         report, calls = collect(enabled({"host": TAILNET6_HOST, "port": 1080}), outputs())
-        self.assertEqual([item[0] for item in calls], [NETSTAT, NETSTAT6, DNS, PROXY, TAILSCALE])
+        self.assertEqual([item[0] for item in calls], read_commands(ipv6=True))
         self.assertEqual(report["routes"]["default_interfaces"], ["en0"])
         self.assertEqual(report["routes"]["tailnet_interface"], "utun3")
         self.assertEqual(report["routes"]["ipv6_default_status"], "observed")
@@ -395,11 +458,19 @@ class ReadOnlyReportTests(unittest.TestCase):
             dials.append((host, port, timeout))
             return {"status": "refused", "elapsed_ms": 3}
 
-        report, _calls = collect(enabled(), outputs({PROXY: (0, proxy_text("1"), None)}), tcp=tcp)
+        scripted = outputs({PROXY: (0, proxy_text("1"), None)})
+        scripted.update(setup_outputs(socks="Yes"))
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
         warnings = report["system_proxy"]["warnings"]
         self.assertEqual(dials, [("127.0.0.1", 7897, 1)])
         self.assertEqual(warnings, [{
-            "code": "dead_proxy", "protocol": "socks", "endpoint": "127.0.0.1:7897", "read_only": True,
+            "code": "dead_proxy",
+            "protocol": "socks",
+            "endpoint": "127.0.0.1:7897",
+            "read_only": True,
+            "priority": "high",
+            "affects_system_proxy_clients": True,
+            "tailscale_success_does_not_clear": True,
         }])
         self.assertEqual(report["system_proxy"]["actions"], [])
         self.assertFalse(report["system_proxy"]["auto_disable"])
@@ -424,12 +495,226 @@ class ReadOnlyReportTests(unittest.TestCase):
         }])
         self.assertNotIn("198.51.100.9", json.dumps(report))
 
-    def test_missing_proxy_fields_stay_unknown(self):
+    def test_missing_proxy_fields_stay_unknown_when_neither_source_confirms(self):
         text = "HTTPProxy : 198.51.100.9\nHTTPSProxy : 198.51.100.9\n"
-        report, _calls = collect(enabled(), outputs({PROXY: (0, text, None)}))
-        self.assertEqual(report["system_proxy"]["status"], "unknown")
-        self.assertEqual(report["system_proxy"]["reason"], "missing_field")
+        scripted = outputs({
+            PROXY: (0, text, None),
+            setup_get("-getwebproxy"): (0, "Server: 198.51.100.9\nPort: 8080\n", None),
+            setup_get("-getsecurewebproxy"): (0, "Server: 198.51.100.9\nPort: 8080\n", None),
+            setup_get("-getsocksfirewallproxy"): (0, "Server: 198.51.100.9\nPort: 8080\n", None),
+        })
+        report, _calls = collect(enabled(), scripted)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["status"], "unknown")
+        self.assertEqual(proxy["reason"], "missing_field")
+        self.assertEqual(proxy["disabled_saved"], [])
+        self.assertEqual(proxy["sources"]["scutil"]["status"], "missing_field")
+        self.assertEqual(proxy["sources"]["networksetup"]["status"], "unknown")
         self.assertNotIn("198.51.100.9", json.dumps(report))
+
+    def test_scutil_without_http_keys_keeps_networksetup_disabled_saved_address(self):
+        def tcp(*_args):
+            raise AssertionError("disabled proxy must not be dialed")
+
+        scripted = outputs({PROXY: (0, FTP_ONLY_PROXY, None)})
+        report, calls = collect(enabled(), scripted, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["status"], "observed")
+        self.assertIsNone(proxy["reason"])
+        self.assertEqual(proxy["effect"], "not_a_fault")
+        self.assertEqual(proxy["warnings"], [])
+        self.assertFalse(proxy["disabled_saved_address_is_fault"])
+        self.assertEqual(proxy["missing_protocols"], [])
+        self.assertEqual(
+            sorted((item["protocol"], item["endpoint"]) for item in proxy["disabled_saved"]),
+            [("http", "127.0.0.1:7897"), ("https", "127.0.0.1:7897"), ("socks", "127.0.0.1:7897")],
+        )
+        self.assertEqual(proxy["sources"]["scutil"]["status"], "missing_field")
+        self.assertEqual(proxy["sources"]["networksetup"]["status"], "observed")
+        for protocol in ("http", "https", "socks"):
+            item = proxy["protocols"][protocol]
+            self.assertEqual(item["state"], "disabled")
+            self.assertEqual(item["scutil"], "missing")
+            self.assertEqual(item["networksetup"], "disabled")
+            self.assertEqual(item["established_by"], ["networksetup"])
+            self.assertTrue(item["sources_agree"])
+            self.assertFalse(item["saved_address_is_fault"])
+        self.assertEqual(proxy["services_read"], ["Wi-Fi"])
+        self.assertFalse(proxy["auto_disable"])
+        self.assertFalse(proxy["monitoring_prevents_reenable"])
+        self.assertFalse(report["dead_proxy_blocks_health_claim"])
+        self.assertIn(SETUP_LIST, [item[0] for item in calls])
+
+    def test_enabled_refused_proxy_is_not_cleared_by_tailscale(self):
+        dials = []
+
+        def tcp(host, port, timeout):
+            dials.append((host, port, timeout))
+            return {"status": "refused", "elapsed_ms": 4}
+
+        scripted = outputs({PROXY: (0, FTP_ONLY_PROXY, None)})
+        scripted.update(setup_outputs(http="Yes", https="Yes", socks="Yes"))
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(dials, [("127.0.0.1", 7897, 1)])
+        self.assertEqual(
+            [(item["protocol"], item["code"], item["priority"]) for item in proxy["warnings"]],
+            [("http", "dead_proxy", "high"), ("https", "dead_proxy", "high"), ("socks", "dead_proxy", "high")],
+        )
+        for warning in proxy["warnings"]:
+            self.assertTrue(warning["affects_system_proxy_clients"])
+            self.assertTrue(warning["tailscale_success_does_not_clear"])
+            self.assertEqual(warning["endpoint"], "127.0.0.1:7897")
+        self.assertEqual(proxy["effect"], "system_proxy_clients_blocked")
+        self.assertEqual(proxy["dead_proxy_priority"], "high")
+        self.assertEqual(proxy["disabled_saved"], [])
+        self.assertEqual(proxy["actions"], [])
+        self.assertFalse(proxy["auto_disable"])
+        self.assertFalse(proxy["bypass_reset"])
+        self.assertFalse(proxy["curl_reads_system_proxy"])
+        self.assertFalse(proxy["tailscale_reachable_means_apps_ok"])
+        self.assertFalse(proxy["monitoring_prevents_reenable"])
+        self.assertEqual(report["tailscale"]["availability"], "healthy")
+        self.assertTrue(report["dead_proxy_blocks_health_claim"])
+        self.assertFalse(report["report_is_health"])
+        self.assertNotEqual(report["status"], "healthy")
+
+    def test_partial_enable_warns_only_for_the_enabled_protocol(self):
+        def tcp(host, port, timeout):
+            self.assertEqual((host, port, timeout), ("127.0.0.1", 7897, 1))
+            return {"status": "refused", "elapsed_ms": 2}
+
+        scripted = outputs({PROXY: (0, FTP_ONLY_PROXY, None)})
+        scripted.update(setup_outputs(http="No", https="No", socks="Yes"))
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual([item["protocol"] for item in proxy["warnings"]], ["socks"])
+        self.assertEqual(proxy["warnings"][0]["code"], "dead_proxy")
+        self.assertEqual(
+            sorted(item["protocol"] for item in proxy["disabled_saved"]),
+            ["http", "https"],
+        )
+        self.assertEqual(proxy["protocols"]["http"]["state"], "disabled")
+        self.assertEqual(proxy["protocols"]["socks"]["state"], "enabled")
+        self.assertEqual(proxy["effect"], "system_proxy_clients_blocked")
+        self.assertFalse(report["report_is_health"])
+
+    def test_enabled_and_reachable_is_not_the_dead_proxy_fault(self):
+        def tcp(host, port, timeout):
+            self.assertEqual((host, port, timeout), ("127.0.0.1", 7897, 1))
+            return {"status": "ok", "elapsed_ms": 2}
+
+        scripted = outputs({PROXY: (0, proxy_text(http="1", https="1", socks="1"), None)})
+        scripted.update(setup_outputs(http="Yes", https="Yes", socks="Yes"))
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["warnings"], [])
+        self.assertEqual(proxy["effect"], "enabled_and_reachable")
+        self.assertIsNone(proxy["dead_proxy_priority"])
+        self.assertFalse(report["dead_proxy_blocks_health_claim"])
+        self.assertFalse(proxy["monitoring_prevents_reenable"])
+        self.assertFalse(report["report_is_health"])
+
+    def test_sources_that_disagree_do_not_hide_an_enabled_dead_proxy(self):
+        def tcp(*_args):
+            return {"status": "refused", "elapsed_ms": 1}
+
+        scripted = outputs({PROXY: (0, proxy_text("0"), None)})
+        scripted.update(setup_outputs(socks="Yes"))
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
+        socks = report["system_proxy"]["protocols"]["socks"]
+        self.assertEqual(socks["state"], "enabled")
+        self.assertFalse(socks["sources_agree"])
+        self.assertEqual(report["system_proxy"]["warnings"][0]["code"], "dead_proxy")
+        self.assertNotIn("socks", [item["protocol"] for item in report["system_proxy"]["disabled_saved"]])
+
+    def test_one_failed_source_does_not_erase_the_other(self):
+        secret = "secret.service.invalid"
+
+        def tcp(*_args):
+            raise AssertionError("disabled proxy must not be dialed")
+
+        listed = outputs({
+            SETUP_LIST: (1, "Wi-Fi\nEnabled: Yes\n" + secret + "\n", None),
+        })
+        report, calls = collect(enabled(), listed, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["sources"]["networksetup"]["status"], "unavailable")
+        self.assertEqual(proxy["sources"]["scutil"]["status"], "observed")
+        self.assertEqual(proxy["effect"], "not_a_fault")
+        self.assertEqual(len(proxy["disabled_saved"]), 3)
+        self.assertEqual(proxy["protocols"]["http"]["established_by"], ["scutil"])
+        self.assertNotIn(setup_get("-getwebproxy"), [item[0] for item in calls])
+        self.assertNotIn(secret, json.dumps(report))
+
+        failed_scutil = outputs({
+            PROXY: (1, "HTTPEnable : 1\nHTTPProxy : 198.51.100.9\nHTTPPort : 8080\n" + secret + "\n", None),
+        })
+        report, _calls = collect(enabled(), failed_scutil, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["sources"]["scutil"]["status"], "unavailable")
+        self.assertEqual(proxy["sources"]["networksetup"]["status"], "observed")
+        self.assertEqual(proxy["effect"], "not_a_fault")
+        self.assertEqual(len(proxy["disabled_saved"]), 3)
+        self.assertEqual(proxy["protocols"]["http"]["established_by"], ["networksetup"])
+        self.assertNotIn("198.51.100.9", json.dumps(report))
+        self.assertNotIn(secret, json.dumps(report))
+
+        both = outputs({
+            PROXY: (1, "HTTPEnable : 1\nHTTPProxy : 198.51.100.9\n", None),
+            SETUP_LIST: (1, "Enabled: Yes\nServer: 198.51.100.9\n", None),
+        })
+        report, calls = collect(enabled(), both, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["status"], "unavailable")
+        self.assertEqual(proxy["effect"], "unknown")
+        self.assertEqual(proxy["disabled_saved"], [])
+        self.assertEqual(proxy["warnings"], [])
+        self.assertFalse(report["report_is_health"])
+        self.assertNotEqual(report["status"], "healthy")
+        self.assertNotIn(setup_get("-getwebproxy"), [item[0] for item in calls])
+        self.assertNotIn("198.51.100.9", json.dumps(report))
+
+    def test_one_protocol_read_failing_does_not_drop_the_confirmed_protocols(self):
+        secret = "secret.proxy.invalid"
+
+        def tcp(*_args):
+            raise AssertionError("dial")
+
+        scripted = outputs({PROXY: (0, FTP_ONLY_PROXY, None)})
+        scripted[setup_get("-getwebproxy")] = (1, "Enabled: Yes\nServer: " + secret + "\n", None)
+        report, _calls = collect(enabled(), scripted, tcp=tcp)
+        proxy = report["system_proxy"]
+        self.assertEqual(proxy["status"], "partial")
+        self.assertEqual(proxy["protocols"]["http"]["state"], "unknown")
+        self.assertEqual(proxy["protocols"]["https"]["state"], "disabled")
+        self.assertEqual(proxy["protocols"]["socks"]["state"], "disabled")
+        self.assertEqual(
+            sorted(item["protocol"] for item in proxy["disabled_saved"]),
+            ["https", "socks"],
+        )
+        self.assertNotEqual(proxy["status"], "unknown")
+        self.assertNotIn(secret, json.dumps(report))
+
+    def test_inactive_services_are_not_queried_and_wifi_survives_the_cap(self):
+        starred = outputs({
+            SETUP_LIST: (0, service_list(("Wi-Fi", "*Thunderbolt Bridge")), None),
+        })
+        report, calls = collect(enabled(), starred)
+        argv = [item[0] for item in calls]
+        self.assertIn(setup_get("-getwebproxy", "Wi-Fi"), argv)
+        self.assertNotIn(setup_get("-getwebproxy", "Thunderbolt Bridge"), argv)
+        self.assertEqual(report["system_proxy"]["inactive_service_count"], 1)
+        names = tuple("Lan{}".format(index) for index in range(8)) + ("Wi-Fi",)
+        capped = outputs()
+        capped.update(setup_outputs(services=names))
+        report, calls = collect(enabled(), capped)
+        argv = [item[0] for item in calls]
+        self.assertTrue(report["system_proxy"]["services_capped"])
+        self.assertEqual(report["system_proxy"]["services_read"][0], "Wi-Fi")
+        self.assertNotIn("Lan7", report["system_proxy"]["services_read"])
+        self.assertNotIn(setup_get("-getwebproxy", "Lan7"), argv)
+        self.assertEqual(report["system_proxy"]["status"], "partial")
 
     def test_unconfigured_vps_is_not_a_dial_or_a_scan(self):
         def tcp(*_args):
@@ -446,6 +731,8 @@ class CommandBoundTests(unittest.TestCase):
         with patch.object(mod.subprocess, "Popen", side_effect=AssertionError("spawn")):
             for argv in (
                 ["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"],
+                ["/usr/sbin/networksetup", "-setwebproxy", "Wi-Fi", "127.0.0.1", "7897"],
+                ["/usr/sbin/networksetup", "-getwebproxy", "-Wi-Fi"],
                 ["/bin/sh", "-c", "true"],
                 ["/usr/bin/sudo", "/usr/sbin/scutil", "--dns"],
                 ["/tmp/not-a-tailscale", "status", "--json"],
@@ -470,7 +757,10 @@ class CommandBoundTests(unittest.TestCase):
     def test_source_has_no_write_command(self):
         source = (ROOT / "scripts/macos_readonly.py").read_text(encoding="utf-8")
         self.assertNotRegex(source, r"""['"]sudo['"]""")
-        self.assertNotIn("networksetup", source)
+        self.assertNotRegex(source, r"-set[a-z]*proxy")
+        self.assertNotRegex(source, r"-setnetworkserviceenabled")
+        self.assertNotRegex(source, r"-setproxybypassdomains")
+        self.assertIn('"/usr/sbin/networksetup"', source)
         self.assertNotIn("paramiko", source)
         self.assertNotRegex(source, r"tailscale['\"],\s*['\"]set")
         for name in ("restore", "cutover", "watchdog", "autostart"):
@@ -599,7 +889,7 @@ class EntryTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in run.call_args_list], [
             ["/sbin/ifconfig", "-a"], ["/usr/sbin/netstat", "-rn", "-f", "inet"],
         ])
-        self.assertEqual(calls, [NETSTAT, DNS, PROXY, TAILSCALE])
+        self.assertEqual(calls, read_commands())
         self.assertEqual(sample["interfaces"], ["en0", "en1", "lo0", "utun2"])
         self.assertEqual(sample["macos_readonly"]["tailscale"]["availability"], "healthy")
         self.assertEqual(sample["macos_readonly"]["routes"]["tailnet_interface"], "utun7")
@@ -621,6 +911,11 @@ class EntryTests(unittest.TestCase):
             "第二阶段仍未实现",
             "配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启",
             "此次新代码没有在实机运行",
+            "4044472",
+            "不能只信可能缺键的 `scutil --proxy`",
+            "dead_proxy_blocks_health_claim",
+            "monitoring_prevents_reenable",
+            "挡不住有人再次启用一个失效代理",
             "根因未定",
         ):
             self.assertIn(phrase, text, phrase)

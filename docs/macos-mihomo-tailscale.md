@@ -8,7 +8,7 @@
 
 ## 状态矩阵
 
-三列不要混写。用户隔离配置是机器上另一个目录里的实验，不是本 PR 的代码或安装包。本 PR 的静态/CI 只说明仓库里的纯函数和文档。本 PR 代码尚未在实机运行。
+三列不要混写。用户隔离配置是机器上另一个目录里的实验，不是本 PR 的代码或安装包。本 PR 的静态/CI 只说明仓库里的纯函数和文档。本 PR 代码尚未在实机运行。这句指共存实验和回退实现；只读采集在 `4044472` 上有过一次部分验收，代理交叉读取还没有复跑，见下文。
 
 | 项 | 用户隔离配置 | 本 PR 静态 / CI | 本 PR 实机 |
 | --- | --- | --- | --- |
@@ -196,14 +196,33 @@ python3 scripts/check_architecture.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-真实 Mac 上的只读验收这次没有跑。不要把 Linux 测试当成实机通过，也不要使用 sudo：
+不要把 Linux 测试当成实机通过，也不要使用 sudo：
 
 1. 不要执行会改路由、DNS、代理或 Tailscale 的命令。
 2. 在自己的 `monitor.json` 里把 `macos_readonly.enabled` 设为 true。VPS 只填写已经在用的地址和端口；端口不能是 22。不写 `vps` 就不会做 TCP，也不会扫描 tailnet。
 3. 运行 `python3 scripts/macos_readonly.py observe --config <monitor.json>`。
-4. 看字段：`tailscale.availability` 只有完整 JSON 解析成功才可能是 healthy；`routes.default_interfaces` 来自路由表，不是写死的接口名；`dns` 只留布尔，不回显解析器地址；关闭的代理即使保存着 127.0.0.1:7897 也没有 `dead_proxy`；`vps_tcp.status` 为 ok 时 `business_stable` 仍是 false，也不表示 tailnet、路由、DNS 或应用正常。
+4. 看字段：`tailscale.availability` 只有完整 JSON 解析成功才可能是 healthy；`routes.default_interfaces` 来自路由表，不是写死的接口名；`dns` 只留布尔，不回显解析器地址；关闭的代理即使保存着 127.0.0.1:7897 也进入 `disabled_saved`，没有 `dead_proxy`；`vps_tcp.status` 为 ok 时 `business_stable` 仍是 false，也不表示 tailnet、路由、DNS 或应用正常。
 5. 再看一次系统代理和路由，确认这次命令没有改它们。已启用但端口不通只留下警告，不会自动关闭，也不会改 bypass。
 6. `real_machine_verified` 和 `overnight_23s_root_cause_fixed` 在代码里固定为 false。
+
+2026-11-17 14:55–14:59（Asia/Hong_Kong）用 `git archive` 在用户 Mac 上跑过 PR5 `4044472`（`40444724a36079da9919b5089e6b48ab345dc69f`）的 `python3 scripts/macos_readonly.py observe`。Tailscale 完整 JSON 解析通过。路由是按路由表发现的。DNS 已回到官方 MagicDNS，没有 198.18。当时 `scutil --proxy` 几乎只剩 FTP passive，没有 HTTPEnable、HTTPSEnable、SOCKSEnable，旧逻辑把 `system_proxy.status` 记成 `unknown` / `missing_field`。同一时刻 `networksetup` 显示 Wi-Fi 的 HTTP、HTTPS、SOCKS 都是 Enabled: No，Server/Port 仍是 127.0.0.1:7897，旧输出没有写入 `disabled_saved`。VPS 没有 monitor 配置，所以是 `not_configured`，没有编造或扫描地址。这次验收时三项代理是关闭的，保存着的地址不是故障，机器在代理关闭时是安全的。下面的交叉读取还没有在那台 Mac 上复跑。此次新代码没有在实机运行。
+
+### 系统代理交叉读取
+
+历史情况要按实际范围写。卸载 Clash 之后，macOS Wi-Fi 的系统 HTTP、HTTPS、SOCKS 代理仍是启用，并指向 127.0.0.1:7897，但本机没有进程监听。遵守系统代理的 ChatGPT Mac App、浏览器，以及后来的 Google 连不上。curl 默认不读 macOS 系统代理，所以 TUN 或 VPS 探针仍可能成功，让人误以为整网正常。用户关掉这三项之后确认应用恢复。官方 Tailscale 自己通常不走这条 HTTP 代理，当时的 bot 连接也可能仍然是通的；这不是“Tailscale 协议本身必然中断”。要防的是已启用且不可达的系统代理，再次让遵守系统代理的应用（包括可能走这条代理的相关连接）静默失败。
+
+只读诊断同时看两个来源，不能只信可能缺键的 `scutil --proxy`：
+
+- `scutil --proxy` 提供 HTTPEnable、HTTPSEnable、SOCKSEnable 和对应的 Proxy/Port。
+- `networksetup -listallnetworkservices` 之后，对活跃服务读 `-getwebproxy`、`-getsecurewebproxy`、`-getsocksfirewallproxy` 的 Enabled、Server、Port。带星号的停用服务不查询。服务过多时保留 Wi-Fi，并标明被截断。
+- 某一来源命令失败或缺少启用字段时，该来源记为 `unavailable` 或 `missing_field` / `unknown`。另一来源已经证实的启用或关闭保留，不用未知结果盖掉它。两个来源都没有证实，才让整段代理保持未知或不可用。两个来源不一致时不把启用的那一侧藏起来。
+- 未启用，即使 Server/Port 仍是 127.0.0.1:7897，也写入 `disabled_saved`。`effect` 为 `not_a_fault`，`disabled_saved_address_is_fault` 为 false。bypass 只计数，不保存域名，也不改写。
+- 已启用，并且指向本机端口，连接被拒绝或超时：`dead_proxy`，`priority` 为 `high`，`affects_system_proxy_clients` 为 true。`effect` 为 `system_proxy_clients_blocked`。Tailscale 为 healthy、tailnet 通、ping 通或 curl 成功都不把 `report_is_health` 变成 true；`dead_proxy_blocks_health_claim` 为 true。`tailscale_reachable_means_apps_ok` 恒为 false。curl 不读系统代理，所以 curl 成功同样不能排除这个问题。
+- 已启用且本机端口能接通：记下启用，`effect` 为 `enabled_and_reachable`。这不是上面那种失效代理。
+- 已启用但目标不是本机地址：不拨号，不把地址写进报告。
+- 失败命令的正文不解析。报告不保存账户、机器身份或非本机代理地址。
+
+这次不会自动关闭代理，不会改 bypass，不用 sudo，也不写网络设置。`monitoring_prevents_reenable` 恒为 false。诊断没有在运行时，挡不住有人再次启用一个失效代理；那是以后的持续监控或显式管理，不是这次的自动禁用。
 
 样本字段 `macos_readonly` 的契约：
 
@@ -211,7 +230,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `report_is_health` 恒为 false。`actions` 恒为空。`mutates_network` 和 `uses_sudo` 恒为 false。
 - `tailscale` 只保留 PR #4 的白名单。超限、截断、命令失败、非法文本是 `unavailable`；缺字段是 `unknown`。不会把 2000 字节前缀解析成 healthy。
 - `routes.interface_discovery` 为 `dynamic`。没有配置 VPS 时 `tailnet_route_status` 是 `not_configured`。
-- `system_proxy.disabled_saved_address_is_fault` 为 false。`bypass_reset` 和 `auto_disable` 为 false。
+- `system_proxy` 同时带 `sources.scutil` 和 `sources.networksetup`。`disabled_saved_address_is_fault` 为 false。`bypass_reset`、`auto_disable`、`monitoring_prevents_reenable` 为 false。已关闭但保存的本机地址在 `disabled_saved`。失效的已启用代理是高优先级 `dead_proxy`，不能被 Tailscale 连通结果抵消。
 - `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
 
 第二阶段仍未实现，这里只留清单：配置生成、启动前快照、独立 watchdog、幂等回退、切网、开机自启。
@@ -234,12 +253,12 @@ Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Window
 
 ## 合并前与之后
 
-合并前至少要满足：静态测试和架构检查通过；证据矩阵仍把用户隔离配置、本 PR 静态/CI、本 PR 实机分成三列；示例 JSON 仍然不能被 mihomo 直接加载。本 PR 代码尚未在实机运行。是否合并由用户决定，CI 变绿不自动合并。
+合并前至少要满足：静态测试和架构检查通过；证据矩阵仍把用户隔离配置、本 PR 静态/CI、本 PR 实机分成三列；示例 JSON 仍然不能被 mihomo 直接加载。本 PR 代码尚未在实机运行的范围见上文：共存实验、回退和这次的代理交叉读取都还没有实机复跑。是否合并由用户决定，CI 变绿不自动合并。
 
 这些还没有完成，也不阻塞把上面的纯函数当作下一步的开发基线：
 
 1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
-2. 只读采集的实机验收还没有做。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
+2. 只读采集在 `4044472` 上做过一次部分验收；代理交叉读取还没有复跑。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
 3. 睡眠唤醒。
 4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
 5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。
