@@ -281,10 +281,12 @@ LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复
 的残留（phase=active → 回退）。策略清单见 `macos_coexist.DAEMON_POLICY`；
 单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠既有 preflight 双向失败关闭。
 安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|status|
-takeover-start`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
+takeover-start|takeover-stop`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
 launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。示例
 配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
-daemon 代码没有在实机运行。
+**`nmd update` 只更新磁盘代码，launchd 里的 root 管理器仍在跑旧代码**——更新后
+需 `nmd macos daemon stop && nmd macos daemon start` 重载（update 会在安装了
+守护时提示）。daemon 代码没有在实机运行。
 
 ## 接管控制器（Phase B）
 

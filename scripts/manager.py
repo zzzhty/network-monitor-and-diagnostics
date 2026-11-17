@@ -418,6 +418,15 @@ def update(root, check_only):
             setting(root, "pendingApply", "true")
             git(root, "merge", "--ff-only", target)
         print("代码更新完成；没有应用网络配置或重启服务。需要时运行 nmd apply。", flush=True)
+        if nmd_platform.name() == "macos":
+            # launchd keeps running the old code until the daemon restarts.
+            try:
+                from nmd_daemon import daemon_receipt
+                installed = daemon_receipt(root) is not None
+            except Exception:
+                installed = False
+            if installed:
+                print("常驻守护仍在运行旧代码；执行 nmd macos daemon stop && nmd macos daemon start 重载。", flush=True)
 
 
 def monitor_install(root):
