@@ -285,7 +285,7 @@ LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复
 `rollback_restored`（native DNS 仍有 198.18、prefs 读不到、exit node 无法
 安全写回、或某一块网卡 DNS 失败）时阶段留在 `needs_rollback`，管理器稍后重试
 这一次恢复，**不会**因此再开一轮接管，`takeover.start` 在此期间返回
-`rollback_pending`。恢复完成后也不自动再接管。策略清单见
+`rollback_pending`。恢复完成后也不自动再接管。原先的 `critical_failures` 等开机抑制结果在这次恢复里保留，不会被改写成 `recovered_leftovers`，因此 `on_boot` 不会在恢复刚完成时再开一轮接管。策略清单见
 `macos_coexist.DAEMON_POLICY`；单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠
 既有 preflight 双向失败关闭。健康检查含 Tailscale status 和配置里的 VPS SOCKS
 TCP 连接；TCP 成功只说明端口接受了握手，不是应用成功，HTTP 200 不在这项检查里。

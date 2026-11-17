@@ -516,8 +516,34 @@ class SupervisorTests(unittest.TestCase):
         sup._recover_leftovers()
         sup._boot_policy()
         self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        self.assertEqual(sup.status()["result"], "critical_failures")
         self.assertFalse(sup.status()["takeover_active"])
         self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_finished_pending_rollback_keeps_the_failure_and_does_not_restart(self):
+        name = "pre-start-20261117T000000Z.json"
+        self.state.joinpath(name).write_text(json.dumps({
+            "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+            "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:abc",
+                                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                     "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+            "dns": {"services": []}}), encoding="utf-8")
+        session = {"schema_version": 1, "label": d.LABEL, "boot_id": 111,
+                   "phase": d.PHASE_NEEDS_ROLLBACK, "result": "critical_failures",
+                   "snapshot_name": name, "started_at": None}
+        (self.state / d.SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
+        table = Table()
+        table.exit_node_cleared = True
+        sup = make_supervisor(self.state, table, on_boot=True, boottime=lambda: 222)
+        sup._recover_leftovers()
+        sup._boot_policy()
+        status = sup.status()
+        self.assertEqual((status["phase"], status["result"]),
+                         (d.PHASE_ROLLED_BACK, "critical_failures"))
+        self.assertFalse(status["takeover_active"])
+        self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+        self.assertFalse(any(item[2:3] == ["--exit-node="] for item in table.mutations
+                             if item[0] == TS))
 
     def test_state_dir_ancestor_symlink_and_shared_parent_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

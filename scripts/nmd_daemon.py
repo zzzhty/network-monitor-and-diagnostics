@@ -564,6 +564,12 @@ class RootSupervisor:
             # starting: we may already have cleared the exit node. active: the
             # takeover is still logically on. needs_rollback: a previous
             # restore did not finish. All three use the pinned snapshot.
+            # A pending rollback already has an outcome (critical_failures and
+            # the other boot-suppressing results). Replacing that with
+            # recovered_leftovers would let on_boot start another takeover
+            # the moment the restore succeeds.
+            pending = session.get("phase") == PHASE_NEEDS_ROLLBACK
+            prior = self.result if pending and self.result in SUPPRESS_BOOT_RESULTS else None
             try:
                 rollback = self._rollback_now()
             except Exception as exc:
@@ -571,10 +577,10 @@ class RootSupervisor:
             self.last_rollback = rollback
             self.phase = (PHASE_ROLLED_BACK if rollback.get("result") == "rollback_restored"
                           else PHASE_NEEDS_ROLLBACK)
-            self.result = "recovered_leftovers"
+            self.result = prior if prior is not None else "recovered_leftovers"
             self.process = None
             self._persist_session()
-            self._record_run("recovered_leftovers", rollback)
+            self._record_run(self.result, rollback)
 
     def _boot_policy(self):
         """True boot with on_boot and a healthy history resumes takeover.
