@@ -92,7 +92,7 @@
     "sleep_wake_keeps_absolute_deadline": true,
     "guarantees_restore_if_watchdog_and_sampler_die": false,
     "requires_watchdog_unhealthy_logic_change": false,
-    "implemented_in_this_repository": false
+    "implemented_in_this_repository": true
   },
   "unverified_claims": {
     "rerun_by_repository_ci": false,

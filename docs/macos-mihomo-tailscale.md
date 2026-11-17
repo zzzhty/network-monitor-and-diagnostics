@@ -139,7 +139,7 @@ Tailscale status 仍不可用：隔离采集把 `tailscale status --json` 的 st
 | 2 | 只读适配：把完整 stdout 交给 `normalize_tailscale_status` | 已由 `scripts/macos_readonly.py` 接入。不在解析前按输出上限切片 |
 | 3 | 显式打开的 macOS 采样字段，默认关闭 | 已接入。`macos_readonly.enabled` 默认为 false |
 | 4 | 配置生成与启动前快照 | 已接入：`scripts/macos_prepare.py`（Phase A）。离线生成 + 只读快照；不启动进程、不改网络、不用 sudo |
-| 5 | 切网或回退控制器 | 不在产品里。隔离目录的启动器不是本仓库 |
+| 5 | 切网或回退控制器 | 已接入：`scripts/macos_takeover.py`（Phase B）。sudo 前台、绝对截止、幂等回退；未实机运行 |
 
 现有采集器 `scripts/nmd_monitor.py` 的 `_run` 在命令输出超过 65536 字节时返回 `output_too_large` 和空正文，不会把截断前缀解析成健康。Tailscale status 另有一条有界读取，上限是解析器的 1 MiB；超过上限或读到一半时丢掉正文，不解析前缀。仓库里没有先切 2000 字节再解析 Tailscale JSON 的实现。Linux 的 `local-setup.sh` 把完整 JSON 交给解析器，这次不改它。
 
@@ -234,7 +234,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `system_proxy` 同时带 `sources.scutil` 和 `sources.networksetup`。`disabled_saved_address_is_fault` 为 false。`bypass_reset`、`auto_disable`、`monitoring_prevents_reenable` 为 false。已关闭但保存的本机地址在 `disabled_saved`。失效的已启用代理是高优先级 `dead_proxy`，不能被 Tailscale 连通结果抵消。
 - `vps_tcp` 不保存主机地址，只保存端口、地址类别和指纹。未配置是 `not_configured`。单次 TCP 成功不等于业务稳定。
 
-第二阶段仍未实现的只剩：独立 watchdog、幂等回退、切网、开机自启。配置生成与启动前快照已由 `scripts/macos_prepare.py` 提供（离线与只读，不启动进程、不用 sudo、不改网络）。
+第二阶段仍未实现的只剩：开机自启。配置生成与启动前快照由 `scripts/macos_prepare.py` 提供（离线与只读），独立 watchdog、幂等回退与切网由 `scripts/macos_takeover.py` 提供（sudo 前台、绝对截止）。控制器代码同样没有在实机运行。
 
 Linux 的 `config.yaml`、默认采集命令和 `local-setup.sh` 不改。Windows 仍只做原来的检查，不把这套 macOS 命令搬过去。此次新代码没有在实机运行。过夜 23 秒窗口的根因未定。
 
@@ -265,9 +265,22 @@ PYTHONPATH=scripts python3 scripts/macos_prepare.py config \
 PYTHONPATH=scripts python3 scripts/macos_prepare.py snapshot [--state-dir DIR]
 ```
 
+## 接管控制器（Phase B）
+
+`scripts/macos_takeover.py` 把上面的实验落成仓库内的 sudo 前台控制器，经 `sudo nmd macos takeover|rollback` 或直接 `sudo python3 scripts/macos_takeover.py …` 调用（非 root 自动把自身交还 sudo 重跑）。变更面是封闭集合，逐一在 `mutating_allowlisted` 里把关后才执行：`tailscale set` 仅限 `--exit-node*`/`--exit-node-allow-lan-access`/`--accept-dns=true|false`，`networksetup -setdnsservers`，以及对自己这台 mihomo 的 `-t` 校验与 `-f` 启动；系统代理与 bypass 永不触碰。
+
+一次 takeover 的顺序：生成配置并写入私有 state 目录 → `mihomo -t` 实机校验（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 清 exit node → 启动自有进程组 → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过；只回收自己启动的进程组；scutil 仍残留 198.18 时拒绝恢复并报 `rollback_blocked_dirty_dns`；快照读不到 prefs 时不动 exit node（宁可留下现状也不猜空值）。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
+
+```bash
+sudo nmd macos takeover --inputs /path/to/inputs.json --minutes 10
+sudo nmd macos rollback            # 手动幂等回退，读最新快照
+```
+
+控制器代码没有在实机运行：上面的顺序有离线测试逐路径覆盖（含停止、到期、三个故障周期、就绪超时、进程早退、前置失败与各类回退），真实机器上的首次运行仍按上文的实机验收边界对待。
+
 ## 回退约束
 
-本仓库没有实验启动器，这次也不把风险网络控制器做进产品。下面只是以后若有独立实验工具时必须满足的清单；`implemented_in_this_repository` 为 false，校验函数不会快照、启动或回退。
+Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前台控制器，`implemented_in_this_repository` 已为 true。清单本身不变，控制器同样未在实机运行：
 
 - 先做快照，独立 watchdog 确认存活之后才切网
 - 绝对截止时间。短测 10 分钟，过夜最长 8 小时，到期不续期

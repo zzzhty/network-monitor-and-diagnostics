@@ -9,7 +9,7 @@ NMD 按机器角色分工，不在每台电脑上重复做一遍网关。
 | NMD 在这里做什么 | 部署、分流、监控、自动修复 | 监控（monitor）和诊断（diagnostics） | 监控（monitor）和诊断（diagnostics） |
 | 后台 | systemd：系统 mihomo，以及独立的 monitor 单元 | 没有采集服务。可选 LaunchAgent 只启动桌面壳 | 当前用户的计划任务 `\NMD\Monitor`，登录期间运行 |
 
-macOS 和 Windows 上，NMD 的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期用哪一款客户端仍在调研（具体软件调研中，待定）。NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
+macOS 和 Windows 上，NMD 的默认定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期用哪一款客户端仍在调研（具体软件调研中，待定）。macOS 另有一条实验路径：`sudo nmd macos takeover` 以 sudo 前台方式自行运行 mihomo 接管整机出口，带绝对截止时间与幂等回退，见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md)——仅显式运行，不安装任何常驻组件；Windows 无此路径。除此之外 NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。安装和命令见 [macOS 使用说明](macos.md)、[Windows 使用说明](windows.md)。Linux 的部署、切换和验收见 [runbook.md](../runbook.md)。
 
 ## 为什么这样分
 

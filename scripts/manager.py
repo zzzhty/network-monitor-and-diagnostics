@@ -867,8 +867,9 @@ def main(argv=None):
         allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
         if platform == "macos":
             # User-level shell lifecycle and managed-install code updates only;
-            # deployment and systemd stay Linux-only.
-            allowed |= {"desktop", "bootstrap", "update"}
+            # deployment and systemd stay Linux-only. `macos` is the Phase B
+            # experimental sudo-foreground takeover controller.
+            allowed |= {"desktop", "bootstrap", "update", "macos"}
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
@@ -886,6 +887,8 @@ def main(argv=None):
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
                   "  update [--check]  快进更新代码，不部署网络\n"
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
+                  "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
+                  "                         见 docs/macos-mihomo-tailscale.md\n"
                   "Linux 网络管理、apply 与 systemd 生命周期在 macOS 不支持。")
             return
         if command == "version":
@@ -951,6 +954,15 @@ def main(argv=None):
         with lock(ROOT / ".git" / "nmd.lock"):
             desktop_main(ROOT, argv[1:])
         return
+    if command == "macos":
+        # Darwin-only by construction: on Linux the platform gate above never
+        # opens this path, and the controller itself re-execs under sudo —
+        # so never let another platform fall through into that re-exec.
+        if platform != "macos":
+            print(f"未知命令: {command}", file=sys.stderr)
+            raise SystemExit(2)
+        from macos_takeover import main as takeover_cli
+        raise SystemExit(takeover_cli(argv[1:]))
     if command in {"monitor", "gui", "machine", "demo"}:
         # Observability also works in an uninstalled checkout, without sudo.
         from observability import main as observe

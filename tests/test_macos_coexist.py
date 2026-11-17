@@ -145,7 +145,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(profile["domain_fix"]["live_short_test"], "not_run")
         self.assertEqual(profile["domain_fix"]["user_isolated_short_test"],
                          "observed_outside_this_repository")
-        self.assertFalse(profile["rollback_policy"]["implemented_in_this_repository"])
+        self.assertTrue(profile["rollback_policy"]["implemented_in_this_repository"])
         self.assertTrue(all(value is False for value in profile["unverified_claims"].values()))
         text = m.dump_profile(profile)
         self.assertIsNone(m._UTUN_LITERAL.search(text))
@@ -187,7 +187,7 @@ class ProfileTests(unittest.TestCase):
             if path.name == "macos_coexist.py":
                 continue
             source = path.read_text(encoding="utf-8")
-            if path.name in ("macos_readonly.py", "macos_prepare.py"):
+            if path.name in ("macos_readonly.py", "macos_prepare.py", "macos_takeover.py"):
                 self.assertIn("import macos_coexist", source)
                 continue
             self.assertNotIn("import macos_coexist", source)
@@ -392,9 +392,9 @@ class EvidenceBoundaryTests(unittest.TestCase):
         self.assertTrue(explicit["real_ipv6_path_verified"])
         self.assertFalse(m.UNVERIFIED_CLAIMS["real_ipv6_passed"])
 
-    def test_rollback_policy_is_a_checklist_and_not_a_launcher(self):
+    def test_rollback_policy_is_a_checklist_implemented_by_phase_b(self):
         self.assertEqual(m.validate_rollback_policy(m.ROLLBACK_POLICY), [])
-        self.assertFalse(m.ROLLBACK_POLICY["implemented_in_this_repository"])
+        self.assertTrue(m.ROLLBACK_POLICY["implemented_in_this_repository"])
         self.assertEqual(m.ROLLBACK_POLICY["short_test_minutes"], 10)
         self.assertEqual(m.ROLLBACK_POLICY["overnight_max_hours"], 8)
         self.assertFalse(m.ROLLBACK_POLICY["renew_deadline"])
@@ -403,7 +403,7 @@ class EvidenceBoundaryTests(unittest.TestCase):
         self.assertFalse(m.WATCHDOG_UNHEALTHY_OBSERVATION["required_fix"])
         self.assertFalse(m.WATCHDOG_UNHEALTHY_OBSERVATION["logic_conflict_established"])
         for key, flipped in (
-            ("implemented_in_this_repository", True),
+            ("implemented_in_this_repository", False),
             ("changes_system_proxy", True),
             ("changes_bypass", True),
             ("consecutive_critical_failures_before_rollback", 1),
@@ -441,7 +441,7 @@ class EvidenceBoundaryTests(unittest.TestCase):
             "睡眠唤醒",
             "Linux CI 通过不能标成 macOS 运行通过",
             "本 PR 代码尚未在实机运行",
-            "本仓库没有实验启动器",
+            "scripts/macos_takeover.py",
             "用户隔离配置",
             "不是本 PR 的代码或安装包",
             "RESTORED",
@@ -549,10 +549,11 @@ class TailscaleStatusTests(unittest.TestCase):
         self.assertIn("no cutover or restore command", unknown.stdout)
         self.assertEqual(
             [step["status"] for step in m.DEVELOPMENT_STEPS],
-            ["in_this_pr", "wired", "wired", "in_this_pr", "not_in_product"],
+            ["in_this_pr", "wired", "wired", "in_this_pr", "in_this_pr"],
         )
         self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "cutover-controller")
-        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "not_in_product")
+        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "in_this_pr")
+        self.assertTrue(m.DEVELOPMENT_STEPS[-1]["mutates_network"] is True)
         self.assertTrue(all(step["mutates_network"] is False for step in m.DEVELOPMENT_STEPS[:-1]))
 
 

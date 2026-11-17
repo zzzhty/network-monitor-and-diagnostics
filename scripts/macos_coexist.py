@@ -139,7 +139,7 @@ DEVELOPMENT_STEPS = (
     {"id": "read-only-status-adapter", "status": "wired", "mutates_network": False},
     {"id": "opt-in-macos-sample", "status": "wired", "mutates_network": False},
     {"id": "config-and-snapshot", "status": "in_this_pr", "mutates_network": False},
-    {"id": "cutover-controller", "status": "not_in_product", "mutates_network": True},
+    {"id": "cutover-controller", "status": "in_this_pr", "mutates_network": True},
 )
 
 # Parse bound for a complete status document. The isolated collector sliced at
@@ -198,7 +198,7 @@ ROLLBACK_POLICY = {
     "sleep_wake_keeps_absolute_deadline": True,
     "guarantees_restore_if_watchdog_and_sampler_die": False,
     "requires_watchdog_unhealthy_logic_change": False,
-    "implemented_in_this_repository": False,
+    "implemented_in_this_repository": True,
 }
 
 WATCHDOG_UNHEALTHY_OBSERVATION = {

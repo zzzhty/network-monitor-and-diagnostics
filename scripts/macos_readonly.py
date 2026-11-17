@@ -92,9 +92,6 @@ _PUBLIC_ERRORS = {
     "truncated",
 }
 PHASE_2_NOT_IMPLEMENTED = (
-    "independent_watchdog",
-    "idempotent_rollback",
-    "cutover",
     "boot_autostart",
 )
 
