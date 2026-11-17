@@ -690,12 +690,16 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
         notes.append("scutil_dns_unavailable")
     if prefs["status"] != "observed":
         notes.append("tailscale_prefs_unavailable")
+    if ps_reason is not None:
+        # A failed or truncated ps is unknown. null is not "mihomo is absent".
+        notes.append("ps_unavailable")
 
     has_198_18 = dns["has_198_18"]
     exit_node_selected = bool(prefs.get("ExitNodeID") or prefs.get("ExitNodeIP"))
     takeover_ready = {
         "scutil_has_no_198_18": None if has_198_18 is None else not has_198_18,
-        "mihomo_absent": not processes["mihomo"] if ps_reason is None else None,
+        # None means the ps read did not succeed. It must not be used as ready.
+        "mihomo_absent": None if ps_reason is not None else not processes["mihomo"],
         "exit_node_selected": exit_node_selected,
         "notes": notes,
     }
@@ -715,8 +719,22 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
     )
 
 
+def _summary_mihomo_running(snapshot, processes):
+    ready = snapshot.get("takeover_ready")
+    if isinstance(ready, dict) and "mihomo_absent" in ready:
+        absent = ready.get("mihomo_absent")
+        if absent is None:
+            return None
+        return not bool(absent)
+    return bool(processes.get("mihomo"))
+
+
 def summarize_snapshot(snapshot, path=None):
-    """The public, redacted view: statuses, counts, booleans, fingerprints."""
+    """The public, redacted view: statuses, counts, booleans, fingerprints.
+
+    ``mihomo_running`` is null when the ps read failed. That null is not a
+    ready signal and is not rewritten to false.
+    """
     prefs = (snapshot.get("tailscale") or {}).get("prefs") or {}
     dns = snapshot.get("dns") or {}
     processes = snapshot.get("processes") or {}
@@ -734,7 +752,9 @@ def summarize_snapshot(snapshot, path=None):
         "exit_node_id_fingerprint": hashlib.sha256(
             exit_node.encode()).hexdigest()[:16] if isinstance(exit_node, str) and exit_node else None,
         "has_198_18": dns.get("has_198_18"),
-        "mihomo_running": bool(processes.get("mihomo")),
+        # null when ps was not observed. An empty list is "not running" only
+        # after a successful read; a failed read must not look like ready.
+        "mihomo_running": _summary_mihomo_running(snapshot, processes),
         "tailscale": {"status": ((snapshot.get("tailscale") or {}).get("status") or {}).get("availability"),
                       "prefs": prefs.get("status")},
         "dns": {"status": dns.get("status"), "service_count": len(dns.get("services") or [])},

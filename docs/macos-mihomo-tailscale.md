@@ -258,7 +258,7 @@ PYTHONPATH=scripts python3 scripts/macos_prepare.py config \
 
 - 快照文件保留真实值（exit node id、解析器、网关、代理端点），写在默认 `~/.local/state/nmd-monitor/`（尊重绝对 XDG_STATE_HOME；与来源注册表同一私有信任域）的 `pre-start-<UTC时间戳>.json`，目录 0700、文件 0600 原子写；检查与写入都作用在解析后的真实路径上，符号链接无法把文件重定向进仓库。
 - stdout 只输出 `summarize_snapshot` 的脱敏视图：各段 status、计数、布尔和 exit node id 的 sha256 指纹，不回显任何地址。
-- `takeover_ready` 记录三个前置判断：scutil 无 198.18、无 mihomo 进程、是否选定 exit node；缺哪段读不到就进 notes，不猜。
+- `takeover_ready` 记录三个前置判断：scutil 无 198.18、无 mihomo 进程、是否选定 exit node；缺哪段读不到就进 notes，不猜。`ps` 超时、超限或非零退出时 `mihomo_absent` 是 null，notes 含 `ps_unavailable`。null 不是「没有 mihomo」，不能当作 ready。stdout 摘要的 `mihomo_running` 这时也是 null，不会写成 false。只有 `ps` 成功且列表里没有 mihomo 时，`mihomo_absent` 才是 true。
 - 后续阶段的回退只消费这份文件：复验 scutil 无 198.18 后按 prefs 恢复 exit node / allow-lan / accept-dns，按 services 恢复网卡 DNS（空列表即 Automatic）；系统代理与 bypass 始终只读不回写。同秒重复回退的幂等风险继续由回退约束承担。
 - 非 macOS 平台返回 `not_applicable` 且零命令。新的 config/snapshot 代码没有在实机运行。
 

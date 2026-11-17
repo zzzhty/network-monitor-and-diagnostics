@@ -2,6 +2,7 @@
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -114,6 +115,11 @@ NMD_LAN_HOST=192.0.2.1 diagnostics''')
         self.assertIn('mocked-ping', result.stdout)
 
     def vps(self, failure='', existing=False, active=True, enabled=None, restore_failure=False):
+        # vps-setup.sh is the Linux VPS installer. It exits on any uname other
+        # than x86_64 or aarch64, which includes Darwin arm64, before the mocks
+        # run. That refusal is the product boundary; these cases stay Linux-only.
+        if sys.platform != 'linux':
+            self.skipTest('vps-setup.sh is a Linux VPS installer and rejects this uname')
         binary = self.base / 'bin/mihomo'
         config = self.base / 'config/config.yaml'
         unit = self.base / 'systemd/mihomo.service'

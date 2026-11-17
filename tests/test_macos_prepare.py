@@ -300,7 +300,29 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["routes"]["inet"]["tailnet"], {"interface": "utun7", "status": "observed"})
         self.assertEqual(snapshot["processes"]["mihomo"], [{"pid": 456, "comm": "mihomo"}])
         self.assertFalse(snapshot["takeover_ready"]["mihomo_absent"])
+        self.assertNotIn("ps_unavailable", snapshot["takeover_ready"]["notes"])
+        self.assertTrue(mod.summarize_snapshot(snapshot)["mihomo_running"])
         self.assertTrue(snapshot["takeover_ready"]["exit_node_selected"])
+
+    def test_observed_empty_ps_means_mihomo_is_absent(self):
+        table = fixtures()
+        table[("/bin/ps", "-axo", "pid=,comm=")] = (0, "  1 /sbin/launchd\n", None)
+        snapshot = self.build(table)
+        self.assertEqual(snapshot["processes"]["mihomo"], [])
+        self.assertTrue(snapshot["takeover_ready"]["mihomo_absent"])
+        self.assertNotIn("ps_unavailable", snapshot["takeover_ready"]["notes"])
+        self.assertFalse(mod.summarize_snapshot(snapshot)["mihomo_running"])
+
+    def test_failed_ps_is_unknown_and_not_a_ready_signal(self):
+        table = fixtures()
+        table[("/bin/ps", "-axo", "pid=,comm=")] = (None, "", "output_too_large")
+        snapshot = self.build(table)
+        ready = snapshot["takeover_ready"]
+        self.assertIsNone(ready["mihomo_absent"])
+        self.assertIn("ps_unavailable", ready["notes"])
+        self.assertEqual(snapshot["processes"]["mihomo"], [])
+        self.assertIsNone(mod.summarize_snapshot(snapshot)["mihomo_running"])
+        self.assertIsNot(ready["mihomo_absent"], True)
 
     def test_services_wire_first_starred_skipped_automatic_empty(self):
         services = self.build()["dns"]["services"]
