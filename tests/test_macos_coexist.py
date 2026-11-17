@@ -5,6 +5,7 @@ fixture marks, not a copy of a database or of the user machine.
 """
 import json
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 
@@ -142,6 +143,8 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(profile["dns_mode"]["scoped_dns_covers_all_queries"])
         self.assertFalse(profile["ipv6"]["real_ipv6_path_verified"])
         self.assertEqual(profile["domain_fix"]["live_short_test"], "not_run")
+        self.assertEqual(profile["domain_fix"]["user_isolated_short_test"],
+                         "observed_outside_this_repository")
         self.assertFalse(profile["rollback_policy"]["implemented_in_this_repository"])
         self.assertTrue(all(value is False for value in profile["unverified_claims"].values()))
         text = m.dump_profile(profile)
@@ -206,6 +209,8 @@ class TunProbeTests(unittest.TestCase):
         self.assertEqual(result["tls_status"], "valid")
         self.assertEqual(result["http_application"], "2xx")
         self.assertFalse(result["legacy_blanket_review"])
+        self.assertTrue(result["fully_ok"])
+        self.assertEqual(result["notes"], [])
         self.assertNotEqual(result["classification"], "needs_manual_tls_review")
 
     def test_rc_28_with_success_status_and_valid_tls_is_incomplete(self):
@@ -217,6 +222,8 @@ class TunProbeTests(unittest.TestCase):
         self.assertFalse(result["whole_network_critical"])
         self.assertEqual(result["tls_status"], "valid")
         self.assertEqual(result["http_application"], "2xx")
+        self.assertFalse(result["fully_ok"])
+        self.assertEqual(result["notes"], ["chatgpt_incomplete_transfer"])
         redirected = m.classify_tun_sample(tun_sample(rc=28, http_status=302))
         self.assertEqual(redirected["classification"], result["classification"])
         self.assertEqual(redirected["http_application"], "3xx")
@@ -430,10 +437,152 @@ class EvidenceBoundaryTests(unittest.TestCase):
             "App 实际发送",
             "睡眠唤醒",
             "Linux CI 通过不能标成 macOS 运行通过",
-            "尚未实机短测",
+            "本 PR 代码尚未在实机运行",
             "本仓库没有实验启动器",
+            "用户隔离配置",
+            "不是本 PR 的代码或安装包",
+            "RESTORED",
+            "12:14:30",
+            "仓库实现尚未验证",
+            "55/55",
+            "2000",
+            "23 秒",
+            "mihomo -f",
+            "python3 scripts/macos_coexist.py profile",
             "不构成必须修复",
             "不是用户机器的完整配置",
         ):
             self.assertIn(phrase, text, phrase)
         self.assertNotIn("/Users/", text)
+
+
+def status_document(**overrides):
+    document = {
+        "BackendState": "Running",
+        "Self": {"Online": True, "HostName": "hidden-host", "TailscaleIPs": ["100.64.0.2"]},
+        "Peer": {
+            "node-a": {"Online": True, "DNSName": "a.example.ts.net", "TailscaleIPs": ["100.64.0.3"]},
+            "node-b": {"Online": False, "HostName": "other-host", "PublicKey": "secret-key"},
+        },
+    }
+    document.update(overrides)
+    return document
+
+
+class TailscaleStatusTests(unittest.TestCase):
+    def document_text(self, **overrides):
+        body = status_document(**overrides)
+        body["Padding"] = "x" * 2500
+        return json.dumps(body)
+
+    def test_complete_document_over_2000_bytes_keeps_only_the_whitelist(self):
+        text = self.document_text()
+        self.assertGreater(len(text), 2000)
+        result = m.normalize_tailscale_status(text, returncode=0)
+        self.assertEqual(result, {
+            "availability": "healthy",
+            "reason": None,
+            "backend_state": "Running",
+            "self_online": True,
+            "peer_summary": "known",
+            "peer_count": 2,
+            "peers_online": 1,
+        })
+        rendered = json.dumps(result)
+        for secret in ("hidden-host", "other-host", "a.example.ts.net", "100.64.0.2",
+                       "100.64.0.3", "secret-key", "Padding"):
+            self.assertNotIn(secret, rendered)
+        self.assertLess(len(rendered), 500)
+
+    def test_slice_invalid_json_and_failed_command_are_not_healthy(self):
+        text = self.document_text()
+        sliced = m.normalize_tailscale_status(text[:2000], returncode=0)
+        self.assertEqual(sliced["availability"], "unavailable")
+        self.assertEqual(sliced["reason"], "invalid_json")
+        self.assertIsNone(sliced["backend_state"])
+        self.assertIsNone(sliced["self_online"])
+        self.assertEqual(sliced["peer_summary"], "unknown")
+        declared = m.normalize_tailscale_status(text, returncode=0, truncated=True)
+        self.assertEqual(declared["reason"], "pre_parse_truncation")
+        self.assertNotEqual(declared["availability"], "healthy")
+        failed = m.normalize_tailscale_status(text, returncode=1)
+        self.assertEqual(failed["availability"], "unavailable")
+        self.assertEqual(failed["reason"], "command_failed")
+        self.assertIsNone(failed["backend_state"])
+        missing = m.normalize_tailscale_status(
+            json.dumps({"Self": {"Online": True, "HostName": "hidden-host"}, "Padding": "y" * 2500}),
+            returncode=0)
+        self.assertEqual(missing["availability"], "unknown")
+        self.assertEqual(missing["reason"], "missing_field")
+        self.assertIsNone(missing["backend_state"])
+        self.assertTrue(missing["self_online"])
+        self.assertNotEqual(missing["availability"], "offline")
+        stopped = m.normalize_tailscale_status(
+            json.dumps({"BackendState": "Stopped", "Self": {"Online": False}}), returncode=0)
+        self.assertEqual(stopped["availability"], "offline")
+        self.assertEqual(stopped["reason"], "not_running")
+        huge = "x" * (m.TAILSCALE_STATUS_PARSE_LIMIT + 1)
+        self.assertEqual(m.normalize_tailscale_status(huge, returncode=0)["reason"], "output_too_large")
+        with self.assertRaises(ValueError):
+            m.normalize_tailscale_status(text, returncode=0, limit=m.BROKEN_COLLECTOR_SLICE)
+        self.assertNotIn("[:2000]", (ROOT / "scripts/macos_coexist.py").read_text(encoding="utf-8"))
+
+    def test_offline_cli_prints_the_whitelist_and_refuses_unknown_commands(self):
+        script = ROOT / "scripts/macos_coexist.py"
+        profile = subprocess.run([sys.executable, str(script), "profile"],
+                                 check=False, capture_output=True, text=True)
+        self.assertEqual(profile.returncode, 0, profile.stderr)
+        loaded = json.loads(profile.stdout)
+        self.assertFalse(loaded["nmd_experiment"]["directly_loadable_by_mihomo"])
+        self.assertFalse(m.mihomo_would_load(loaded))
+        status = subprocess.run([sys.executable, str(script), "normalize-status", "--returncode", "0"],
+                                input=self.document_text(), check=False, capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["availability"], "healthy")
+        self.assertNotIn("hidden-host", status.stdout)
+        unknown = subprocess.run([sys.executable, str(script), "restore"],
+                                 check=False, capture_output=True, text=True)
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("no cutover or restore command", unknown.stdout)
+        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["id"], "cutover-controller")
+        self.assertEqual(m.DEVELOPMENT_STEPS[-1]["status"], "not_in_product")
+
+
+class ProbeBatchTests(unittest.TestCase):
+    def test_one_incomplete_transfer_keeps_the_batch_from_being_fully_ok(self):
+        ok = m.classify_tun_sample(tun_sample(label="tun-baidu"))
+        incomplete = m.classify_tun_sample(tun_sample(
+            label="tun-chatgpt", rc=28, http_status=200))
+        recovered = m.classify_tun_sample(tun_sample(label="tun-google"))
+        batch = m.summarize_probe_batch([ok, incomplete, recovered])
+        self.assertFalse(batch["fully_ok"])
+        self.assertFalse(batch["critical"])
+        self.assertEqual(batch["app_status"], "not_inferred")
+        self.assertEqual(batch["notes"], ["chatgpt_incomplete_transfer"])
+        self.assertEqual(batch["counts"]["tun_network_ok_needs_app_confirm"], 2)
+        self.assertEqual(batch["counts"]["tun_network_incomplete_transfer_needs_app_confirm"], 1)
+        wide = [ok] * 39 + [incomplete]
+        summary = m.summarize_probe_batch(wide)
+        self.assertEqual(summary["requests"], 40)
+        self.assertFalse(summary["fully_ok"])
+        self.assertFalse(summary["critical"])
+        self.assertEqual(m.summarize_probe_batch([])["fully_ok"], False)
+
+    def test_isolated_short_test_numbers_stay_outside_this_repository(self):
+        observed = m.USER_ISOLATED_SHORT_TEST
+        self.assertFalse(observed["this_repository_ran_it"])
+        self.assertFalse(observed["repo_restore_implementation_verified"])
+        self.assertEqual(observed["restore_mark"], "RESTORED")
+        self.assertEqual(observed["restore_at"], "12:14:30")
+        self.assertEqual(observed["restore_calls_in_deadline_second"], 2)
+        self.assertTrue(observed["both_restore_calls_succeeded"])
+        self.assertEqual(observed["tcp_1080_ok"], observed["tcp_1080_attempts"])
+        self.assertEqual(sum(observed["suffix_hits"].values()), 55)
+        self.assertEqual(observed["ws_geoip_direct_hits"], 0)
+        self.assertEqual(observed["probe_ok"] + observed["probe_incomplete_transfer"], 40)
+        self.assertEqual(observed["probe_transport_fail"], 0)
+        self.assertEqual(observed["probe_critical"], 0)
+        self.assertFalse(observed["overnight_23s_root_cause_fixed"])
+        self.assertFalse(observed["vps_collection"])
+        self.assertIn("2000", observed["tailscale_status_fields"])
+        self.assertTrue(all(value is False for value in m.UNVERIFIED_CLAIMS.values()))

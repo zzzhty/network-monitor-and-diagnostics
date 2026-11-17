@@ -15,6 +15,7 @@ from collections.abc import Sequence
 import ipaddress
 import json
 import re
+import sys
 
 EXPERIMENT_ID = "macos-mihomo-official-tailscale"
 DEFAULT_EXIT_GROUP = "NMD-EXIT"
@@ -79,7 +80,75 @@ UNVERIFIED_CLAIMS = {
     "sleep_wake_verified": False,
     "rollback_after_short_test_verified": False,
     "watchdog_unhealthy_required_fix": False,
+    "pr_code_ran_on_real_machine": False,
+    "repo_restore_verified": False,
+    "overnight_23s_root_cause_fixed": False,
+    "tailscale_status_series_recovered": False,
+    "vps_log_collected": False,
 }
+
+# Numbers from the user's isolated 10-minute run. They are not results of this
+# repository's code. Host names, addresses and the machine path stay out.
+USER_ISOLATED_SHORT_TEST = {
+    "scope": "user_isolated_config",
+    "this_repository_ran_it": False,
+    "date": "2026-11-17",
+    "timezone": "Asia/Shanghai",
+    "watchdog_start": "12:04:28",
+    "mihomo_start": "12:04:29",
+    "deadline": "12:14:28",
+    "restore_rc": 0,
+    "restore_mark": "RESTORED",
+    "restore_at": "12:14:30",
+    "post_check_at": "12:17:43",
+    "test_processes_remaining": False,
+    "experimental_tun_left": False,
+    "scutil_198_18_left": False,
+    "system_proxies_left_enabled": False,
+    "official_tailscale_default_route": True,
+    "exit_allow_lan_corpdns_restored": True,
+    "restore_calls_in_deadline_second": 2,
+    "both_restore_calls_succeeded": True,
+    "repo_restore_implementation_verified": False,
+    "tcp_1080_attempts": 55,
+    "tcp_1080_ok": 55,
+    "tcp_1080_ms_min": 75,
+    "tcp_1080_ms_max": 164,
+    "suffix_hits": {"chatgpt": 42, "openai": 8, "oaiusercontent": 3, "oaistatic": 2},
+    "ws_proxy_hits": 7,
+    "ws_geoip_direct_hits": 0,
+    "warnings": 2,
+    "errors": 0,
+    "probe_rounds": 10,
+    "probe_requests": 40,
+    "probe_ok": 39,
+    "probe_incomplete_transfer": 1,
+    "probe_transport_fail": 0,
+    "probe_critical": 0,
+    "user_confirmed_apps_and_web_at": "12:07",
+    "tailscale_status_samples": 55,
+    "tailscale_status_fields": "unavailable_after_2000_byte_slice",
+    "vps_collection": False,
+    "overnight_23s_reproduced": False,
+    "overnight_23s_root_cause_fixed": False,
+}
+
+# Later macOS work starts at the pure checks. Nothing here turns a network on.
+DEVELOPMENT_STEPS = (
+    {"id": "pure-checks", "status": "in_this_pr", "mutates_network": False},
+    {"id": "read-only-status-adapter", "status": "not_started", "mutates_network": False},
+    {"id": "opt-in-macos-sample", "status": "not_started", "mutates_network": False},
+    {"id": "cutover-controller", "status": "not_in_product", "mutates_network": True},
+)
+
+# Parse bound for a complete status document. The isolated collector sliced at
+# 2000 bytes before parsing; this module rejects that limit instead of copying it.
+BROKEN_COLLECTOR_SLICE = 2000
+TAILSCALE_STATUS_PARSE_LIMIT = 1024 * 1024
+_STATUS_KEYS = (
+    "availability", "reason", "backend_state", "self_online",
+    "peer_summary", "peer_count", "peers_online",
+)
 
 # One observed window. Root cause stays open; do not fill it in.
 MEASURED_SOCKS_WINDOW = {
@@ -406,6 +475,8 @@ def classify_tun_sample(sample: dict) -> dict:
         "non_faults": non_faults,
         "curl_reads_macos_system_proxy": False,
         "legacy_blanket_review": False,
+        "fully_ok": False,
+        "notes": [],
     }
     if not route_ok or not dns_ok:
         result["classification"] = "tun_route_or_dns_not_ready"
@@ -426,6 +497,7 @@ def classify_tun_sample(sample: dict) -> dict:
         return result
     if rc == 28 and http_status is not None and 200 <= http_status < 400:
         result["classification"] = "tun_network_incomplete_transfer_needs_app_confirm"
+        result["notes"] = [label.removeprefix("tun-") + "_incomplete_transfer"]
         return result
     if rc != 0:
         result["classification"] = "tun_tls_or_transport_issues"
@@ -433,6 +505,7 @@ def classify_tun_sample(sample: dict) -> dict:
         return result
     result["classification"] = "tun_network_ok_needs_app_confirm"
     result["transfer_complete"] = True
+    result["fully_ok"] = True
     return result
 
 
@@ -687,7 +760,9 @@ def validate_experiment_profile(profile: dict) -> list[str]:
     if not isinstance(domain_fix, dict):
         errors.append("missing domain_fix")
     elif domain_fix.get("live_short_test") != "not_run":
-        errors.append("domain fix live short test has not run")
+        errors.append("this profile's live short test has not run")
+    elif domain_fix.get("user_isolated_short_test") != "observed_outside_this_repository":
+        errors.append("user isolated short test must stay outside this repository")
     elif domain_fix.get("isolated_mihomo_check_on_user_machine") != "passed_not_rerun_here":
         errors.append("isolated mihomo check must stay marked as not rerun here")
     errors.extend(f"hardcoded tun interface at {item}" for item in find_hardcoded_utun(profile))
@@ -754,6 +829,7 @@ def build_experiment_profile(rules: list[str] | None = None,
         "domain_fix": {
             "suffixes": list(OVERSEAS_DOMAIN_SUFFIXES),
             "live_short_test": "not_run",
+            "user_isolated_short_test": "observed_outside_this_repository",
             "isolated_mihomo_check_on_user_machine": "passed_not_rerun_here",
         },
         "rules": updated,
@@ -766,8 +842,185 @@ def build_experiment_profile(rules: list[str] | None = None,
     return profile
 
 
+def _status_view(availability: str, reason: str | None, backend_state: str | None = None,
+                 self_online: bool | None = None, peer_summary: str = "unknown",
+                 peer_count: int | None = None, peers_online: int | None = None) -> dict:
+    view = {
+        "availability": availability,
+        "reason": reason,
+        "backend_state": backend_state,
+        "self_online": self_online,
+        "peer_summary": peer_summary,
+        "peer_count": peer_count,
+        "peers_online": peers_online,
+    }
+    if tuple(view) != _STATUS_KEYS:
+        raise RuntimeError("status view drifted from the whitelist")
+    return view
+
+
+def normalize_tailscale_status(stdout: str | bytes, *, returncode: int | None,
+                               truncated: bool = False,
+                               limit: int = TAILSCALE_STATUS_PARSE_LIMIT) -> dict:
+    """Turn one complete status document into a whitelist record.
+
+    Parse only after the caller has kept the whole stdout. A pre-parse slice,
+    a command failure, invalid JSON, or a missing field stays unavailable or
+    unknown. None of those are reported as healthy or offline. The record has
+    no host names, addresses, keys, or the original document.
+    """
+    if not isinstance(truncated, bool):
+        raise ValueError("truncated must be bool")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= BROKEN_COLLECTOR_SLICE:
+        raise ValueError("parse limit must stay above the 2000-byte slice")
+    if truncated:
+        return _status_view("unavailable", "pre_parse_truncation")
+    if returncode is None:
+        return _status_view("unavailable", "command_not_run")
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise ValueError("returncode must be an int or None")
+    if isinstance(stdout, bytes):
+        try:
+            text = stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            return _status_view("unavailable", "invalid_text")
+    elif isinstance(stdout, str):
+        text = stdout
+    else:
+        raise ValueError("stdout must be str or bytes")
+    if len(text.encode("utf-8")) > limit:
+        return _status_view("unavailable", "output_too_large")
+    if returncode != 0:
+        return _status_view("unavailable", "command_failed")
+    try:
+        document = json.loads(text)
+    except (json.JSONDecodeError, UnicodeError):
+        return _status_view("unavailable", "invalid_json")
+    if not isinstance(document, dict):
+        return _status_view("unavailable", "invalid_shape")
+    backend = document.get("BackendState")
+    if not isinstance(backend, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", backend):
+        backend = None
+    self_online = None
+    self_record = document.get("Self")
+    if isinstance(self_record, dict) and isinstance(self_record.get("Online"), bool):
+        self_online = self_record["Online"]
+    peer_summary = "unknown"
+    peer_count = None
+    peers_online = None
+    peers = document.get("Peer")
+    if isinstance(peers, dict):
+        peer_summary = "known"
+        peer_count = len(peers)
+        peers_online = sum(
+            isinstance(peer, dict) and peer.get("Online") is True for peer in peers.values())
+    if backend is None or self_online is None:
+        return _status_view("unknown", "missing_field", backend, self_online,
+                            peer_summary, peer_count, peers_online)
+    if backend == "Running" and self_online is True:
+        return _status_view("healthy", None, backend, self_online,
+                            peer_summary, peer_count, peers_online)
+    return _status_view("offline", "not_running", backend, self_online,
+                        peer_summary, peer_count, peers_online)
+
+
+def summarize_probe_batch(samples: Sequence[dict]) -> dict:
+    """Combine classified probes. One incomplete transfer keeps fully_ok false.
+
+    App confirmation is not inferred from these rows. A batch with no rows is
+    not treated as a clean run.
+    """
+    if isinstance(samples, (str, bytes)) or not isinstance(samples, Sequence):
+        raise ValueError("samples must be a list")
+    counts: dict[str, int] = {}
+    notes: list[str] = []
+    critical = False
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("sample must be a dict")
+        kind = sample.get("classification")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("classification missing")
+        counts[kind] = counts.get(kind, 0) + 1
+        if sample.get("whole_network_critical") is True:
+            critical = True
+        if kind == "tun_network_incomplete_transfer_needs_app_confirm":
+            label = sample.get("label")
+            if isinstance(label, str) and label.startswith("tun-"):
+                notes.append(label.removeprefix("tun-") + "_incomplete_transfer")
+            else:
+                notes.append("incomplete_transfer")
+    fully_ok = bool(samples) and all(
+        sample.get("classification") == "tun_network_ok_needs_app_confirm"
+        and sample.get("transfer_complete") is True
+        for sample in samples)
+    return {"requests": len(samples), "fully_ok": fully_ok, "critical": critical,
+            "counts": counts, "notes": notes, "app_status": "not_inferred"}
+
+
 def dump_profile(profile: dict) -> str:
     return json.dumps(profile, indent=2, ensure_ascii=False) + "\n"
+
+
+HELP = """\
+usage: python3 scripts/macos_coexist.py <command>
+
+commands:
+  profile
+      Print the experiment wrapper JSON. It is not a mihomo config.
+  normalize-status --returncode N [--truncated]
+      Read one complete status document from stdin and print whitelist fields.
+      This command does not run tailscale.
+
+Do not pass the wrapper to mihomo -f. There is no cutover or restore command.
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Offline helpers only. No network and no Tailscale invocation."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in {"-h", "--help", "help"}:
+        sys.stdout.write(HELP)
+        return 0 if args else 2
+    if args == ["profile"]:
+        sys.stdout.write(dump_profile(build_experiment_profile()))
+        return 0
+    if args[0] != "normalize-status":
+        sys.stdout.write(HELP)
+        return 2
+    returncode = None
+    truncated = False
+    rest = args[1:]
+    while rest:
+        item = rest.pop(0)
+        if item == "--truncated":
+            truncated = True
+            continue
+        if item == "--returncode" and rest:
+            raw = rest.pop(0)
+            if not re.fullmatch(r"-?\d+", raw):
+                sys.stdout.write(HELP)
+                return 2
+            returncode = int(raw)
+            continue
+        sys.stdout.write(HELP)
+        return 2
+    if returncode is None:
+        sys.stdout.write(HELP)
+        return 2
+    chunks = []
+    size = 0
+    while size <= TAILSCALE_STATUS_PARSE_LIMIT:
+        block = sys.stdin.read(65536)
+        if not block:
+            break
+        chunks.append(block)
+        size += len(block)
+        if size > TAILSCALE_STATUS_PARSE_LIMIT:
+            break
+    result = normalize_tailscale_status("".join(chunks), returncode=returncode, truncated=truncated)
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return 0
 
 
 def mihomo_would_load(profile: dict) -> bool:
@@ -779,3 +1032,7 @@ def mihomo_would_load(profile: dict) -> bool:
     if not isinstance(profile, dict) or "nmd_experiment" in profile:
         return False
     return profile.get("mode") == "rule" and isinstance(profile.get("rules"), list)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

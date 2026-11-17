@@ -57,6 +57,7 @@
       "oaiusercontent.com"
     ],
     "live_short_test": "not_run",
+    "user_isolated_short_test": "observed_outside_this_repository",
     "isolated_mihomo_check_on_user_machine": "passed_not_rerun_here"
   },
   "rules": [
@@ -106,6 +107,11 @@
     "app_send_path_verified": false,
     "sleep_wake_verified": false,
     "rollback_after_short_test_verified": false,
-    "watchdog_unhealthy_required_fix": false
+    "watchdog_unhealthy_required_fix": false,
+    "pr_code_ran_on_real_machine": false,
+    "repo_restore_verified": false,
+    "overnight_23s_root_cause_fixed": false,
+    "tailscale_status_series_recovered": false,
+    "vps_log_collected": false
   }
 }
