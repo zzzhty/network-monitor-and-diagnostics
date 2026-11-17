@@ -75,6 +75,12 @@ main {shlex.quote(command)}
         for active in (False, True):
             result, events = self.run_manager("apply", active=active)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unbound variable", result.stderr)
+            state = "1" if active else "0"
+            self.assertEqual(
+                result.stdout,
+                f"配置已部署；原运行状态={state}（1=运行，0=停止）。\n",
+            )
             self.assertEqual(events[0], "validate-source")
             self.assertIn("deploy", events)
             self.assertIn("tailscale set --accept-dns=true", events)

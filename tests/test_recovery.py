@@ -112,6 +112,8 @@ main {command}
         (self.base / 'config/config.yaml').write_text('previous')
         result = self.local()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('unbound variable', result.stderr)
+        self.assertEqual(result.stdout, '配置已部署；原运行状态=0（1=运行，0=停止）。\n')
         self.assertNotIn('systemctl start', self.event_log())
         self.assertNotIn('systemctl enable', self.event_log())
 

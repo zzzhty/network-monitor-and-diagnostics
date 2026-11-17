@@ -247,7 +247,9 @@ apply_config() {
     systemctl restart mihomo
     wait_running
   fi
-  echo "配置已部署；原运行状态=$was_active（1=运行，0=停止）。"
+  # Brace the name. Darwin bash 3.2 keeps the next UTF-8 lead byte (U+FF08
+  # is EF BC 88) in an unbraced parameter, so set -u looks up was_active\xEF.
+  echo "配置已部署；原运行状态=${was_active}（1=运行，0=停止）。"
 }
 
 status() {

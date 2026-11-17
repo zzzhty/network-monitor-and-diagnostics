@@ -57,7 +57,9 @@ main() (
       echo '部署失败；已尝试恢复原文件和服务状态，请检查日志。' >&2
     fi
     if (( rollback_failed )); then
-      echo "恢复未完成；原文件备份保留在 $stage，请先恢复后再删除。" >&2
+      # Same bash 3.2 rule as local-setup.sh: U+FF0C is EF BC 8C, so an
+      # unbraced $stage would be looked up as stage plus the lead byte.
+      echo "恢复未完成；原文件备份保留在 ${stage}，请先恢复后再删除。" >&2
       result=1
     else
       rm -rf -- "$stage"
