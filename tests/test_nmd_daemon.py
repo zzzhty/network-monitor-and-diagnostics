@@ -104,6 +104,32 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(d.DaemonError):
                 d.load_daemon_config(path)
 
+    def test_symlink_config_and_shared_parent_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "daemon.json"
+            d.write_daemon_config(real, CONFIG)
+            link = base / "linked.json"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(d.DaemonError, "config_not_regular"):
+                d.load_daemon_config(link)
+            os.chmod(base, 0o755)
+            self.assertEqual(d.load_daemon_config(real)["schema_version"], 1)
+            os.chmod(base, 0o777)
+            with self.assertRaisesRegex(d.DaemonError, "config_group_or_world_writable"):
+                d.load_daemon_config(real)
+            os.chmod(base, 0o755)
+            real_dir = base / "real"
+            real_dir.mkdir(mode=0o755)
+            moved = real_dir / "daemon.json"
+            real.replace(moved)
+            link = base / "via"
+            link.symlink_to(real_dir, target_is_directory=True)
+            with self.assertRaisesRegex(d.DaemonError, "config_not_regular"):
+                d.load_daemon_config(link / "daemon.json")
+            self.assertEqual(d.load_daemon_config(moved)["schema_version"], 1)
+            self.assertIn("schema_version", moved.read_text(encoding="utf-8"))
+
 
 class IPCTests(unittest.TestCase):
     def serve(self, dispatch, peer):
@@ -152,6 +178,44 @@ class IPCTests(unittest.TestCase):
     def test_missing_socket_raises_daemon_unavailable(self):
         with self.assertRaises(d.DaemonError):
             d.DaemonIPCClient(self.socket_path / "missing.sock").status()
+
+    def test_peer_uid_reads_the_connected_process(self):
+        seen = []
+
+        def dispatch(message, uid):
+            seen.append(uid)
+            return {"uid": uid}
+
+        server = d.DaemonIPCServer(self.socket_path, dispatch, group=None,
+                                   peer_uid_fn=d.peer_uid)
+        server.bind()
+        stop = threading.Event()
+        thread = threading.Thread(target=server.serve_forever, args=(stop,), daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(server.close)
+        time.sleep(0.05)
+        reply = d.DaemonIPCClient(self.socket_path).status()
+        self.assertEqual(reply["uid"], os.getuid())
+        self.assertEqual(seen, [os.getuid()])
+
+    def test_darwin_xucred_uid_is_not_a_twelve_byte_triple(self):
+        import struct
+        data = struct.pack("@Ii", 0, 501) + b"\x00" * 64
+        self.assertEqual(d._uid_from_cred("darwin", data), 501)
+        self.assertEqual(d._uid_from_cred("darwin", struct.pack("@Ii", 0, 0)), 0)
+        # The first int is the version. A buffer whose first int is a uid must
+        # not be accepted as that uid.
+        self.assertEqual(d._uid_from_cred("darwin", struct.pack("@iii", 501, 0, 0)), -1)
+        self.assertEqual(d._uid_from_cred("darwin", b"\x00" * 4), -1)
+        self.assertEqual(d._uid_from_cred("linux", struct.pack("@iii", 9, 501, 20)), 501)
+
+    def test_regular_file_at_the_socket_path_is_kept(self):
+        self.socket_path.write_text("keep", encoding="utf-8")
+        server = d.DaemonIPCServer(self.socket_path, lambda message, uid: {}, group=None)
+        with self.assertRaises(d.DaemonError):
+            server.bind()
+        self.assertEqual(self.socket_path.read_text(encoding="utf-8"), "keep")
 
 
 class SupervisorTests(unittest.TestCase):
@@ -243,13 +307,32 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(sup.status()["failures"], 1)
         self.assertTrue(sup._watchdog_once())  # cycle 2
         self.assertEqual(sup.status()["failures"], 2)
+        table.dns_dirty_window = (1, 1)  # native DNS already gone, restore can finish
         self.assertFalse(sup._watchdog_once())  # cycle 3 → rollback
         status = sup.status()
         self.assertEqual((status["phase"], status["result"]),
                          (d.PHASE_ROLLED_BACK, "critical_failures"))
-        # No auto-retry: further cycles stay quiet, and a manual start works.
+        # No auto-retry of the takeover: further cycles stay quiet.
         self.assertTrue(sup._watchdog_once())
         self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
+        self.assertFalse(sup.status()["takeover_active"])
+
+    def test_dirty_dns_stays_needs_rollback_until_a_later_retry(self):
+        table = Table(dns_dirty_window=(1, 40), tcp_ok=False)
+        sup = make_supervisor(self.state, table)
+        self.assertEqual(sup.start_takeover()["result"], "takeover_active")
+        sup._watchdog_once()
+        sup._watchdog_once()
+        self.assertFalse(sup._watchdog_once())
+        self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        self.assertEqual(sup.status()["result"], "critical_failures")
+        self.assertEqual(sup.start_takeover(), {"error": "rollback_pending"})
+        self.assertFalse(sup._retry_rollback())
+        self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        self.assertFalse(sup.status()["takeover_active"])
+        self.assertTrue(sup._retry_rollback())
+        self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
+        self.assertFalse(sup.status()["takeover_active"])
 
     def test_a_passing_cycle_resets_the_failure_streak(self):
         table = Table(dns_dirty_window=(1, 10 ** 9))
@@ -272,6 +355,7 @@ class SupervisorTests(unittest.TestCase):
         sup = make_supervisor(self.state, table)
         sup.start_takeover()
         table.process_alive = False
+        table.dns_dirty_window = (1, 1)  # process stopped: native DNS cleared
         self.assertFalse(sup._watchdog_once())
         self.assertEqual(sup.status()["result"], "mihomo_exited")
         self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
@@ -298,6 +382,9 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(sup.dispatch({"cmd": "takeover.start"}, 501),
                          {"error": "not_authorized"})
         self.assertEqual(sup.dispatch({"cmd": "nonsense"}, 0), {"error": "invalid_command"})
+        self.assertEqual(sup.dispatch({"cmd": "status", "path": "/etc/passwd"}, 0),
+                         {"error": "invalid_command"})
+        self.assertEqual(sup.dispatch({"cmd": 1}, 0), {"error": "invalid_command"})
 
     def test_takeover_stop_cli_relay_matches_the_panel_action(self):
         table = Table(dns_dirty_window=(1, 10 ** 9))
@@ -381,6 +468,124 @@ class SupervisorTests(unittest.TestCase):
         table.dns_dirty_window = (1, 10 ** 9)
         sup._boot_policy()
         self.assertEqual(sup.status()["phase"], d.PHASE_ACTIVE)  # resumed on true boot
+
+    def test_starting_crash_restores_the_pinned_snapshot(self):
+        pinned = "pre-start-20261117T000000Z.json"
+        self.state.joinpath(pinned).write_text(json.dumps({
+            "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+            "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:pinned",
+                                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                     "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+            "dns": {"services": []}}), encoding="utf-8")
+        self.state.joinpath("pre-start-20261118T000000Z.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+            "tailscale": {"prefs": {"status": "observed", "ExitNodeID": None,
+                                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                     "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+            "dns": {"services": []}}), encoding="utf-8")
+        session = {"schema_version": 1, "label": d.LABEL, "boot_id": 111,
+                   "phase": d.PHASE_STARTING, "result": None, "snapshot_name": pinned,
+                   "started_at": None}
+        (self.state / d.SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
+        table = Table(dns_dirty_window=(1, 1))
+        table.exit_node_cleared = True
+        sup = make_supervisor(self.state, table, on_boot=True, boottime=lambda: 111)
+        sup._recover_leftovers()
+        sup._boot_policy()
+        self.assertIn([TS, "set", "--exit-node=nodekey:pinned"], table.mutations)
+        self.assertFalse(any("evil" in json.dumps(item) for item in table.mutations))
+        status = sup.status()
+        self.assertEqual((status["phase"], status["result"]),
+                         (d.PHASE_ROLLED_BACK, "recovered_leftovers"))
+        self.assertFalse(status["takeover_active"])
+
+    def test_needs_rollback_blocks_a_boot_takeover(self):
+        name = "pre-start-20261117T000000Z.json"
+        self.state.joinpath(name).write_text(json.dumps({
+            "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+            "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:abc",
+                                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                     "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+            "dns": {"services": []}}), encoding="utf-8")
+        session = {"schema_version": 1, "label": d.LABEL, "boot_id": 111,
+                   "phase": d.PHASE_NEEDS_ROLLBACK, "result": "critical_failures",
+                   "snapshot_name": name, "started_at": None}
+        (self.state / d.SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
+        table = Table(dns_dirty_window=(0, 10 ** 9))
+        sup = make_supervisor(self.state, table, on_boot=True, boottime=lambda: 222)
+        sup._recover_leftovers()
+        sup._boot_policy()
+        self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        self.assertEqual(sup.status()["result"], "critical_failures")
+        self.assertFalse(sup.status()["takeover_active"])
+        self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_finished_pending_rollback_keeps_the_failure_and_does_not_restart(self):
+        name = "pre-start-20261117T000000Z.json"
+        self.state.joinpath(name).write_text(json.dumps({
+            "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+            "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:abc",
+                                     "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                     "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+            "dns": {"services": []}}), encoding="utf-8")
+        session = {"schema_version": 1, "label": d.LABEL, "boot_id": 111,
+                   "phase": d.PHASE_NEEDS_ROLLBACK, "result": "critical_failures",
+                   "snapshot_name": name, "started_at": None}
+        (self.state / d.SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
+        table = Table()
+        table.exit_node_cleared = True
+        sup = make_supervisor(self.state, table, on_boot=True, boottime=lambda: 222)
+        sup._recover_leftovers()
+        sup._boot_policy()
+        status = sup.status()
+        self.assertEqual((status["phase"], status["result"]),
+                         (d.PHASE_ROLLED_BACK, "critical_failures"))
+        self.assertFalse(status["takeover_active"])
+        self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+        self.assertFalse(any(item[2:3] == ["--exit-node="] for item in table.mutations
+                             if item[0] == TS))
+
+    def test_state_dir_ancestor_symlink_and_shared_parent_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real"
+            real.mkdir()
+            link = base / "link"
+            link.symlink_to(real, target_is_directory=True)
+            state = link / "state"
+            state.mkdir(mode=0o700)
+            with self.assertRaisesRegex(d.DaemonError, "state_dir_symlink"):
+                make_supervisor(state, Table())
+            base.chmod(0o777)
+            nested = base / "nested"
+            nested.mkdir(mode=0o700)
+            with self.assertRaisesRegex(d.DaemonError, "unsafe_state_dir"):
+                make_supervisor(nested, Table())
+
+    def test_state_dir_symlink_is_rejected(self):
+        real = self.state / "real"
+        real.mkdir()
+        link = self.state / "link"
+        link.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(d.DaemonError, "state_dir_symlink"):
+            make_supervisor(link, Table())
+
+    def test_supervisor_records_vps_tcp_without_dialing_during_start(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("dialed")
+
+        config = json.loads(json.dumps(CONFIG))
+        with patch("macos_readonly.tcp_connect", side_effect=boom):
+            sup = d.RootSupervisor(
+                config, self.state, runner=table.runner, mutator=table.mutator,
+                spawner=table.spawner, tcp=None, exists=lambda path: path == TS,
+                sleep=table.sleep, now=lambda: table.clock, boottime=lambda: 111,
+                socket_path=self.state / "tcp.sock",
+                validator=lambda *_args: (True, ""))
+        self.assertEqual(sup.start_takeover()["result"], "takeover_active")
+        self.assertIn("vps_socks_tcp", [name for name, _critical, _check in sup.checks])
 
 
 class UserDaemonTests(unittest.TestCase):
@@ -498,12 +703,26 @@ class DaemonInstallTests(unittest.TestCase):
             " *) echo '{}';; esac\n", encoding="utf-8")
         (self.bin / "sudo").chmod(0o755)
         self.manager = manager
+        self.launchctl = []
+        real_run = d.subprocess.run
+
+        def fake_launchctl(argv, **kwargs):
+            if argv and argv[0] == "/bin/launchctl":
+                self.launchctl.append(list(argv))
+                class R:
+                    returncode = 0
+                    stderr = ""
+                    stdout = ""
+                return R()
+            return real_run(argv, **kwargs)
+
         patches = [
             patch.object(d, "USER_PLIST_DIR", self.user_agents),
             patch.object(d, "ROOT_PLIST_DIR", self.root_daemons),
             patch.object(d, "SOCKET_PATH", self.base / "nmd.sock"),
             patch.object(manager, "ROOT", self.checkout),
             patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + os.environ["PATH"]}),
+            patch.object(d.subprocess, "run", side_effect=fake_launchctl),
         ]
         for item in patches:
             item.start()
@@ -555,6 +774,9 @@ class DaemonInstallTests(unittest.TestCase):
         self.assertIsNone(d.daemon_receipt(self.checkout))
         self.assertEqual(self.manager.setting(self.checkout, "daemonInstalled"), "false")
         self.assertEqual(self.run_cli("uninstall")[0], 0)  # repeat is a no-op
+        self.assertTrue(any(
+            call[:2] == ["/bin/launchctl", "bootout"] and call[2].startswith("gui/")
+            for call in self.launchctl))
 
     def test_foreign_user_plist_blocks_install(self):
         self.user_agents.mkdir(parents=True)
@@ -593,6 +815,51 @@ class DaemonInstallTests(unittest.TestCase):
                 patch.object(d.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(d.DaemonError):
                 d.install_root_plist(self.config_dir / "daemon.json", self.state_dir)
+
+    def test_start_bootstraps_when_kickstart_finds_the_job_unloaded(self):
+        plist = self.root_daemons / f"{d.LABEL}.plist"
+        plist.write_text("plist", encoding="utf-8")
+        calls = []
+        kicks = {"n": 0}
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            class R:
+                stdout = ""
+                stderr = ""
+                returncode = 0
+            result = R()
+            if argv[1] == "kickstart" and kicks["n"] == 0:
+                kicks["n"] += 1
+                result.returncode = 1
+                result.stderr = "Could not find service"
+            return result
+
+        with patch.object(d.os, "geteuid", return_value=0), \
+                patch.object(d.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(d._root_control("start"), {"result": "start"})
+        self.assertEqual([call[1] for call in calls], ["kickstart", "bootstrap", "kickstart"])
+
+    def test_start_refuses_a_symlink_plist(self):
+        target = self.root_daemons / "other.plist"
+        target.write_text("foreign", encoding="utf-8")
+        link = self.root_daemons / f"{d.LABEL}.plist"
+        link.symlink_to(target)
+
+        def fake_run(argv, **kwargs):
+            class R:
+                returncode = 1
+                stderr = "Could not find service"
+                stdout = ""
+            return R()
+
+        with patch.object(d.os, "geteuid", return_value=0), \
+                patch.object(d.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(d.DaemonError):
+                d._root_control("start")
+            with self.assertRaises(d.DaemonError):
+                d.install_root_plist(self.config_dir / "daemon.json", self.state_dir)
+        self.assertEqual(target.read_text(encoding="utf-8"), "foreign")
 
     def test_root_helpers_refuse_without_euid_zero(self):
         with patch.object(d.os, "geteuid", return_value=501):

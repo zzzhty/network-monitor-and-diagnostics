@@ -385,10 +385,23 @@
     $('daemon-card').hidden = !daemonOn;
     if (daemonOn) {
       const status = daemonStatus || {};
-      const active = capabilities.takeover_active === true || status.takeover_active === true;
-      text('daemon-state', active ? '接管中' : status.phase === 'rolled_back' ? '已回退 · 直连' : '直连');
-      text('daemon-detail', `开机策略：${status.on_boot ? '自动接管' : '保持直连'}${status.result ? ` · 上次结果：${status.result}` : ''}${status.failures ? ` · 连续故障周期 ${status.failures}` : ''}`);
-      $('daemon-stop').hidden = !active;
+      const unreachable = capabilities.daemon_available === false || daemonStatus == null
+        || typeof status.error === 'string';
+      // Trust the supervisor status once it has loaded. A stale capabilities
+      // bit must not keep the card saying 接管中 after a stop.
+      const active = status.takeover_active === true
+        || (status.takeover_active == null && capabilities.takeover_active === true);
+      if (unreachable) {
+        text('daemon-state', '守护不可达');
+        text('daemon-detail', '连不上 root 管理器。这不是健康直连；若接管还在，用另一终端执行 sudo nmd macos rollback。');
+        $('daemon-stop').hidden = false;
+      } else {
+        const phaseText = active ? '接管中' : status.phase === 'rolled_back' ? '已回退 · 直连'
+          : status.phase === 'needs_rollback' ? '回退未完成' : '直连';
+        text('daemon-state', phaseText);
+        text('daemon-detail', `开机策略：${status.on_boot ? '自动接管' : '保持直连'}${status.result ? ` · 上次结果：${status.result}` : ''}${status.failures ? ` · 连续故障周期 ${status.failures}` : ''}`);
+        $('daemon-stop').hidden = !(active || status.phase === 'needs_rollback');
+      }
     }
     $('config-card').hidden = !configManagementEnabled();
     $('config-unavailable').hidden = configManagementEnabled() || capabilities === null;

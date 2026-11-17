@@ -177,15 +177,37 @@ class SafeMacOSCLITests(unittest.TestCase):
         self.assertNotIn('config_file', observe.call_args.kwargs)
 
     def test_macos_installed_gui_edits_recorded_config_file(self):
-        # Manager-only install: the dashboard edits the recorded config file.
-        settings = {'home': str(manager.ROOT), 'configDir': str(Path(self.temp.name) / 'config/nmd')}
-        with patch.object(manager, 'source_directory', side_effect=AssertionError('private registry')), \
+        # Install state lives in .git/config. A portable run builds that checkout
+        # itself; the test process's own tree (a git archive has none) is not it.
+        checkout = Path(self.temp.name) / 'installed'
+        checkout.mkdir()
+        subprocess.run(['git', 'init', '-q', str(checkout)], check=True, capture_output=True)
+        self.assertTrue((checkout / '.git').is_dir())
+        settings = {'home': str(checkout), 'configDir': str(Path(self.temp.name) / 'config/nmd')}
+        with patch.object(manager, 'ROOT', checkout), \
+                patch.object(manager, 'source_directory', side_effect=AssertionError('private registry')), \
                 patch.object(manager, 'setting', side_effect=lambda root, key, value=None: settings[key]), \
                 patch.object(observability, 'main') as observe:
             manager.main(['gui', '--port', '0'])
         kwargs = observe.call_args.kwargs
         self.assertIsNone(kwargs['sources_dir'])
         self.assertEqual(Path(kwargs['config_file']), Path(settings['configDir']) / 'monitor.json')
+
+    def test_macos_source_archive_does_not_edit_a_recorded_config(self):
+        # git archive / a release tarball has no .git, so it is an uninstalled
+        # tree. Matching home settings must not inject the recorded config file.
+        archive = Path(self.temp.name) / 'archive'
+        archive.mkdir()
+        self.assertFalse((archive / '.git').exists())
+        settings = {'home': str(archive), 'configDir': str(Path(self.temp.name) / 'config/nmd')}
+        with patch.object(manager, 'ROOT', archive), \
+                patch.object(manager, 'source_directory', side_effect=AssertionError('private registry')), \
+                patch.object(manager, 'setting', side_effect=lambda root, key, value=None: settings[key]), \
+                patch.object(observability, 'main') as observe:
+            manager.main(['gui', '--port', '0'])
+        kwargs = observe.call_args.kwargs
+        self.assertIsNone(kwargs['sources_dir'])
+        self.assertNotIn('config_file', kwargs)
 
 
 class ConfigEditAPITests(unittest.TestCase):

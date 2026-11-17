@@ -2,6 +2,9 @@
 import http.server
 import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -193,6 +196,217 @@ class ReviewRegressions(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     nmd_monitor.Store(state, {})
             self.assertEqual(len(os.listdir(fd_directory)), before)
+
+    def test_bash32_parameter_names_stop_before_utf8(self):
+        # Darwin bash 3.2.57 keeps a UTF-8 lead byte that isalnum() accepts.
+        # U+FF08 / U+FF0C start with EF, so unbraced `$was_active（` is the name
+        # was_active plus 0xEF and `set -u` exits before the echo. glibc does
+        # not classify 0xEF as alnum; Linux reproduces that ctype with LD_PRELOAD.
+        scripts = _setup_shell_scripts()
+        hits = [hit for path in scripts for hit in _expansions_before_non_ascii(path)]
+        unbraced = [hit for hit in hits if not hit.braced]
+        self.assertEqual(unbraced, [], unbraced)
+        braced = {(hit.name, hit.lead) for hit in hits if hit.braced}
+        self.assertIn(('was_active', 0xEF), braced)
+        self.assertIn(('stage', 0xEF), braced)
+        lines = _braced_source_lines(hits)
+        locales, utf8_locales = _shell_locales()
+        self.assertTrue(utf8_locales, 'UTF-8 locale required to match the Darwin failure')
+        for locale in locales:
+            completed = _run_bash(_positive_script(lines), locale)
+            self._assert_expanded(completed, locale, preload=False)
+        if sys.platform == 'linux':
+            with tempfile.TemporaryDirectory() as tmp:
+                preload = _darwin_ctype_preload(Path(tmp))
+                for locale in locales:
+                    bad = _run_bash(_UNBRACED_BANNER, locale, preload=preload)
+                    self.assertNotEqual(bad.returncode, 0, bad.stdout)
+                    self.assertIn(b'was_active\xef', bad.stderr)
+                    good = _run_bash(_positive_script(lines), locale, preload=preload)
+                    self._assert_expanded(good, locale, preload=True)
+        elif sys.platform == 'darwin':
+            for locale in utf8_locales:
+                bad = _run_bash(_UNBRACED_BANNER, locale)
+                self.assertNotEqual(bad.returncode, 0, bad.stdout)
+                self.assertIn(b'was_active\xef', bad.stderr)
+
+    def _assert_expanded(self, completed, locale, preload):
+        label = f'locale={locale} preload={preload} stderr={completed.stderr!r}'
+        self.assertEqual(completed.returncode, 0, label)
+        stdout = completed.stdout.decode('utf-8')
+        stderr = completed.stderr.decode('utf-8')
+        self.assertIn('原运行状态=0（1=运行，0=停止）。', stdout)
+        self.assertIn('原文件备份保留在 stage-marker，请先恢复后再删除。', stderr)
+        self.assertNotIn('unbound variable', stderr)
+
+
+_UNBRACED_BANNER = (
+    'set -u\n'
+    'was_active=0\n'
+    'echo "配置已部署；原运行状态=$was_active（1=运行，0=停止）。"\n'
+)
+
+_CTYPE_EF = r"""
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <dlfcn.h>
+#include <string.h>
+const unsigned short **__ctype_b_loc(void) {
+  static const unsigned short **(*real)(void);
+  static unsigned short table[384];
+  static const unsigned short *mid;
+  static int ready;
+  if (!real)
+    real = (const unsigned short **(*)(void))dlsym(RTLD_NEXT, "__ctype_b_loc");
+  if (!ready) {
+    const unsigned short *orig = *real();
+    memcpy(table, orig - 128, sizeof table);
+    table[128 + 0xEF] = (unsigned short)(table[128 + 0xEF] | _ISalnum | _ISalpha);
+    mid = table + 128;
+    ready = 1;
+  }
+  return &mid;
+}
+"""
+
+
+class _Expansion:
+    def __init__(self, path, line, name, braced, lead, source):
+        self.path = path
+        self.line = line
+        self.name = name
+        self.braced = braced
+        self.lead = lead
+        self.source = source
+
+    def __repr__(self):
+        kind = "braced" if self.braced else "unbraced"
+        return f"{self.path.name}:{self.line} {kind} ${{{self.name}}} lead=0x{self.lead:02x}"
+
+
+def _setup_shell_scripts():
+    paths = [
+        ROOT / "local-setup.sh",
+        ROOT / "vps-setup.sh",
+        ROOT / "install.sh",
+        ROOT / "fetch-assets.sh",
+        ROOT / "nmd",
+    ]
+    paths.extend(sorted((ROOT / "scripts").rglob("*.sh")))
+    return [path for path in paths if path.is_file()]
+
+
+def _name_start(value):
+    return 65 <= value <= 90 or 97 <= value <= 122 or value == 95
+
+
+def _name_byte(value):
+    return _name_start(value) or 48 <= value <= 57
+
+
+def _expansions_before_non_ascii(path):
+    data = path.read_bytes()
+    hits = []
+    line = 1
+    index = 0
+    while index < len(data):
+        if data[index] == 10:
+            line += 1
+            index += 1
+            continue
+        if data[index] == ord("$") and index + 1 < len(data):
+            nxt = data[index + 1]
+            if nxt == ord("{") and index + 2 < len(data) and _name_start(data[index + 2]):
+                cursor = index + 3
+                while cursor < len(data) and _name_byte(data[cursor]):
+                    cursor += 1
+                if (cursor + 1 < len(data) and data[cursor] == ord("}")
+                        and data[cursor + 1] >= 0x80):
+                    name = data[index + 2:cursor].decode("ascii")
+                    hits.append(_hit(path, data, line, name, True, data[cursor + 1]))
+            elif _name_start(nxt):
+                cursor = index + 2
+                while cursor < len(data) and _name_byte(data[cursor]):
+                    cursor += 1
+                if cursor < len(data) and data[cursor] >= 0x80:
+                    name = data[index + 1:cursor].decode("ascii")
+                    hits.append(_hit(path, data, line, name, False, data[cursor]))
+        index += 1
+    return hits
+
+
+def _hit(path, data, line, name, braced, lead):
+    source = data.splitlines()[line - 1].decode("utf-8")
+    return _Expansion(path, line, name, braced, lead, source)
+
+
+def _braced_source_lines(hits):
+    seen = []
+    for hit in hits:
+        if hit.braced and hit.source not in seen:
+            seen.append(hit.source)
+    return seen
+
+
+def _positive_script(lines):
+    names = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", "\n".join(lines)))
+    assignments = []
+    for name in sorted(names):
+        if name == "was_active":
+            assignments.append("was_active=0")
+        elif name == "stage":
+            assignments.append("stage=stage-marker")
+        else:
+            assignments.append(f"{name}=marker")
+    body = "\n".join(assignments + [line.strip() for line in lines])
+    return "set -u\n" + body + "\n"
+
+
+def _shell_locales():
+    raw = subprocess.check_output(["locale", "-a"], text=True, errors="replace")
+    have = [line.strip() for line in raw.splitlines() if line.strip()]
+    present = set(have)
+    utf8 = [name for name in ("C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8") if name in present]
+    if not utf8:
+        for name in have:
+            if "utf8" in name.lower().replace("-", ""):
+                utf8.append(name)
+                break
+    return ["C", *utf8], utf8
+
+
+def _bash_executable():
+    if sys.platform == "darwin" and Path("/bin/bash").is_file():
+        return "/bin/bash"
+    return "bash"
+
+
+def _run_bash(script, locale, preload=None):
+    env = os.environ.copy()
+    for key in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "POSIXLY_CORRECT", "LD_PRELOAD"):
+        env.pop(key, None)
+    env["LC_ALL"] = locale
+    env["LANG"] = locale
+    if preload is not None:
+        env["LD_PRELOAD"] = str(preload)
+    return subprocess.run(
+        [_bash_executable(), "-c", script],
+        capture_output=True, env=env, timeout=10)
+
+
+def _darwin_ctype_preload(directory):
+    compiler = shutil.which("gcc") or shutil.which("cc")
+    if compiler is None:
+        raise AssertionError("linux needs gcc or cc to simulate Darwin isalnum(0xEF)")
+    source = directory / "ctype-ef.c"
+    library = directory / "ctype-ef.so"
+    source.write_text(_CTYPE_EF, encoding="ascii")
+    compiled = subprocess.run(
+        [compiler, "-shared", "-fPIC", "-o", str(library), str(source), "-ldl"],
+        capture_output=True, text=True, timeout=30)
+    if compiled.returncode != 0:
+        raise AssertionError(compiled.stderr)
+    return library
 
 
 if __name__ == '__main__':

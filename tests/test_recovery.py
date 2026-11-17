@@ -1,11 +1,27 @@
 """Isolated shell fault injection: temporary paths, mocked system/network tools only."""
+import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _bash(text, timeout=15):
+    """Run bash -c without host startup files. Invalid UTF-8 becomes visible escapes."""
+    env = os.environ.copy()
+    for key in ('BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS', 'POSIXLY_CORRECT', 'MIHOMO'):
+        env.pop(key, None)
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['PYTHONUTF8'] = '1'
+    completed = subprocess.run(['bash', '-c', text], capture_output=True, env=env, timeout=timeout)
+    return subprocess.CompletedProcess(
+        completed.args, completed.returncode,
+        completed.stdout.decode('utf-8', errors='backslashreplace'),
+        completed.stderr.decode('utf-8', errors='backslashreplace'))
 
 
 class RecoveryTests(unittest.TestCase):
@@ -16,14 +32,32 @@ class RecoveryTests(unittest.TestCase):
         self.events = self.base / 'events'
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return _bash(text)
+
+    def event_log(self):
+        if not self.events.exists():
+            return ''
+        return self.events.read_bytes().decode('utf-8', errors='backslashreplace')
 
     def local(self, command='deploy', failure='', active=False, package_failure=False):
+        # Exit 48 comes only from this dpkg stub, and the stub runs only when
+        # `[[ ! -x "$MIHOMO" ]]`. The success path therefore needs a file whose
+        # mode we set. Pointing MIHOMO at /bin/true still returned 48 on the
+        # Darwin recheck, so that path is not the fixture.
+        if package_failure:
+            mihomo = self.base / 'missing-mihomo'
+        else:
+            mihomo = self.base / 'mihomo'
+            mihomo.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+            mihomo.chmod(0o755)
+        absent = self.base / 'absent-nmd-local.env'
         return self.shell(f'''
+unset MIHOMO || true
+NMD_LOCAL_ENV={shlex.quote(str(absent))}
 source {shlex.quote(str(ROOT / 'local-setup.sh'))}
 VPS_TS_IP=100.64.0.2 # TEST_ONLY; all network/service operations below are mocked.
 CONFIG_DIR={shlex.quote(str(self.base / 'config'))}
-MIHOMO={shlex.quote(str(self.base / 'missing-mihomo')) if package_failure else '/bin/true'}
+MIHOMO={shlex.quote(str(mihomo))}
 dpkg() {{
  mkdir -p "$CONFIG_DIR"
  echo package-config > "$CONFIG_DIR/config.yaml"
@@ -55,7 +89,7 @@ main {command}
                 self.events.write_text('')
                 result = self.local('apply')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                events = self.events.read_text()
+                events = self.event_log()
                 self.assertIn('systemctl start mihomo', events)
                 self.assertIn('systemctl enable mihomo', events)
                 self.assertIn('verify running', events)
@@ -69,17 +103,19 @@ main {command}
         self.assertTrue((self.base / 'config/.initial-deploy-pending').exists())
         result = self.local('deploy')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('systemctl start mihomo', self.events.read_text())
-        self.assertIn('systemctl enable mihomo', self.events.read_text())
-        self.assertIn('verify running', self.events.read_text())
+        self.assertIn('systemctl start mihomo', self.event_log())
+        self.assertIn('systemctl enable mihomo', self.event_log())
+        self.assertIn('verify running', self.event_log())
 
     def test_existing_stopped_deploy_stays_stopped(self):
         (self.base / 'config').mkdir()
         (self.base / 'config/config.yaml').write_text('previous')
         result = self.local()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn('systemctl start', self.events.read_text())
-        self.assertNotIn('systemctl enable', self.events.read_text())
+        self.assertNotIn('unbound variable', result.stderr)
+        self.assertEqual(result.stdout, '配置已部署；原运行状态=0（1=运行，0=停止）。\n')
+        self.assertNotIn('systemctl start', self.event_log())
+        self.assertNotIn('systemctl enable', self.event_log())
 
     def test_verify_running_cannot_skip_inactive_service(self):
         result = self.shell(f'''source {ROOT / 'local-setup.sh'}
@@ -114,6 +150,11 @@ NMD_LAN_HOST=192.0.2.1 diagnostics''')
         self.assertIn('mocked-ping', result.stdout)
 
     def vps(self, failure='', existing=False, active=True, enabled=None, restore_failure=False):
+        # vps-setup.sh is the Linux VPS installer. It exits on any uname other
+        # than x86_64 or aarch64, which includes Darwin arm64, before the mocks
+        # run. That refusal is the product boundary; these cases stay Linux-only.
+        if sys.platform != 'linux':
+            self.skipTest('vps-setup.sh is a Linux VPS installer and rejects this uname')
         binary = self.base / 'bin/mihomo'
         config = self.base / 'config/config.yaml'
         unit = self.base / 'systemd/mihomo.service'
@@ -196,7 +237,7 @@ main
     def test_vps_validation_failure_does_not_activate(self):
         result, paths = self.vps('validate', existing=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn('systemctl', self.events.read_text())
+        self.assertNotIn('systemctl', self.event_log())
         self.assertTrue(all(p.read_text().startswith('old-') for p in paths))
 
     def test_vps_probe_failure_rolls_back_and_fails(self):
@@ -204,7 +245,7 @@ main
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('完成 ✓', result.stdout)
         self.assertTrue(all(p.read_text().startswith('old-') for p in paths))
-        events = self.events.read_text()
+        events = self.event_log()
         self.assertEqual(events.count('systemctl restart mihomo'), 2)
         self.assertEqual(events.count('--max-time 5'), 10)
 
@@ -214,7 +255,7 @@ main
                 self.events.write_text('')
                 result, paths = self.vps('probe', existing=existing, active=False)
                 self.assertNotEqual(result.returncode, 0)
-                events = self.events.read_text()
+                events = self.event_log()
                 self.assertIn('systemctl stop mihomo', events)
                 self.assertIn('systemctl disable mihomo', events)
                 if existing:
@@ -230,7 +271,7 @@ main
         self.assertEqual((stages[0] / 'old-binary').read_text(), 'old-mihomo')
         self.assertEqual(stages[0].stat().st_mode & 0o777, 0o700)
         self.assertIn(str(stages[0]), result.stderr)
-        self.assertIn('systemctl restart mihomo', self.events.read_text())
+        self.assertIn('systemctl restart mihomo', self.event_log())
 
     def test_vps_failure_restores_independent_enabled_state(self):
         for active, enabled in ((True, False), (False, True)):
@@ -238,7 +279,7 @@ main
                 self.events.write_text('')
                 result, paths = self.vps('probe', existing=True, active=active, enabled=enabled)
                 self.assertNotEqual(result.returncode, 0)
-                events = self.events.read_text().splitlines()
+                events = self.event_log().splitlines()
                 # mihomo keeps its own prior state; the fresh watchdog timer
                 # (not previously installed) is stood down after it.
                 self.assertEqual(events[-3:-1], [
@@ -250,7 +291,7 @@ main
     def test_vps_repeat_deploy_restarts_running_service(self):
         result, paths = self.vps(existing=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        events = self.events.read_text()
+        events = self.event_log()
         self.assertIn('systemctl restart mihomo', events)
         self.assertNotIn('enable --now', events)
         self.assertIn('--max-time 120', events)
@@ -270,7 +311,8 @@ class LocalOverrideTests(unittest.TestCase):
         self.base = Path(self.temp.name)
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def env_file(self, body=None):
         path = self.base / 'nmd-local.env'
@@ -290,17 +332,18 @@ printf 'VPS_PUB=%s\\n' "$VPS_PUB"''')
         dest = self.base / 'rendered.yaml'
         result = self.render_with(self.env_file(), dest)
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = (ROOT / 'config.yaml').read_text().replace(
+        expected = (ROOT / 'config.yaml').read_text(encoding='utf-8').replace(
             self.PLACEHOLDER, self.FAKE_PUB)
-        self.assertEqual(dest.read_text(), expected)
-        self.assertNotIn(self.PLACEHOLDER, dest.read_text())
+        self.assertEqual(dest.read_text(encoding='utf-8'), expected)
+        self.assertNotIn(self.PLACEHOLDER, dest.read_text(encoding='utf-8'))
         self.assertIn(f'VPS_PUB={self.FAKE_PUB}', result.stdout)
 
     def test_default_without_override_keeps_placeholder(self):
         dest = self.base / 'rendered.yaml'
         result = self.render_with(self.base / 'absent.env', dest)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(dest.read_text(), (ROOT / 'config.yaml').read_text())
+        self.assertEqual(dest.read_text(encoding='utf-8'),
+                         (ROOT / 'config.yaml').read_text(encoding='utf-8'))
         self.assertIn(f'VPS_PUB={self.PLACEHOLDER}', result.stdout)
 
     def test_invalid_override_refuses_to_load(self):
@@ -362,7 +405,8 @@ class VerifyRetryTests(unittest.TestCase):
         self.env.write_text(f'NMD_VPS_PUB={self.FAKE_PUB}\n')
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def verify(self, cloudflare_body):
         calls = self.base / 'calls'
@@ -423,7 +467,8 @@ class PeerProbeTests(unittest.TestCase):
         self.env.write_text('NMD_VPS_PUB=198.51.100.77\n')
 
     def shell(self, text):
-        return subprocess.run(['bash', '-c', text], capture_output=True, text=True, timeout=15)
+        return subprocess.run(['bash', '-c', text], capture_output=True, text=True,
+                              encoding='utf-8', timeout=15)
 
     def probe(self, ping_output, ping_status):
         out = self.base / 'ping.out'

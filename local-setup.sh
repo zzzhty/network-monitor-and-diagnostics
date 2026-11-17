@@ -105,7 +105,7 @@ render_config() {
   python3 - "$SETUP_DIR/config.yaml" "$VPS_PUB_DEFAULT" "$VPS_PUB" "$VPS_TS_DEFAULT" "$VPS_TS_IP" > "$dest" <<'PY' || return 1
 from pathlib import Path
 import re, sys
-text = Path(sys.argv[1]).read_text()
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
 public_default, public, server_default, server = sys.argv[2:]
 if public != public_default and public_default not in text:
     raise SystemExit('config.yaml 缺少公网出口占位字段；未部署。')
@@ -119,7 +119,8 @@ PY
 }
 
 check_source() (
-  local stage
+  # Not local: bash 3.2 drops locals before this EXIT trap, and set -u then
+  # aborts while removing the stage directory.
   stage=$(mktemp -d)
   stage=$(cd "$stage" && pwd -P)
   trap 'rm -rf -- "$stage"' EXIT
@@ -151,7 +152,7 @@ check_installed() {
 
 deploy_files() (
   # Call only after check_source succeeds. Keep one inspectable previous config.
-  local stage
+  # Not local: bash 3.2 drops locals before this EXIT trap.
   stage=$(mktemp -d)
   stage=$(cd "$stage" && pwd -P)
   trap 'rm -rf -- "$stage"' EXIT
@@ -246,7 +247,9 @@ apply_config() {
     systemctl restart mihomo
     wait_running
   fi
-  echo "配置已部署；原运行状态=$was_active（1=运行，0=停止）。"
+  # Brace the name. Darwin bash 3.2 keeps the next UTF-8 lead byte (U+FF08
+  # is EF BC 88) in an unbraced parameter, so set -u looks up was_active\xEF.
+  echo "配置已部署；原运行状态=${was_active}（1=运行，0=停止）。"
 }
 
 status() {
@@ -441,7 +444,9 @@ diagnostics() {
 }
 
 test_stop() (
-  local was_active=0
+  # Already a subshell. bash 3.2 drops `local` before the EXIT trap, so
+  # `set -u` reports was_active unbound at the restore check below.
+  was_active=0
   ensure_no_exit_node
   systemctl is-active --quiet mihomo && was_active=1
   # Restore even when a probe fails or the operator interrupts the test.

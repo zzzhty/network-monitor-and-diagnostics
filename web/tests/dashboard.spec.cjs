@@ -515,7 +515,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('#daemon-stop').isVisible(), true);
     const daemonPostsBefore = posts.length;
     await page.locator('#daemon-stop').click();
-    await page.waitForFunction(() => document.querySelector('#daemon-state').textContent().includes('直连'));
+    await page.waitForFunction(() => document.querySelector('#daemon-state').textContent.includes('直连'));
     assert.deepEqual(posts.slice(daemonPostsBefore).map(([url]) => url), ['/api/daemon/takeover/stop']);
     assert.deepEqual(JSON.parse(posts.at(-1)[1]), {});
     assert.equal(await page.locator('#daemon-stop').isVisible(), false);

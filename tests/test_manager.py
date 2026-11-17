@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -12,10 +13,21 @@ ROOT = Path(__file__).resolve().parents[1]
 class ManagerTests(unittest.TestCase):
     def run_manager(self, command, overrides="", active=True):
         with tempfile.TemporaryDirectory() as tmp:
-            events = Path(tmp) / "events"
+            root = Path(tmp)
+            events = root / "events"
+            # Own executable and config dir: do not use /bin/true or /etc/mihomo.
+            # Darwin has failed `[[ -x /bin/true ]]`, and a host pending file would
+            # fall into the real dpkg/install path.
+            mihomo = root / "mihomo"
+            mihomo.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            mihomo.chmod(0o755)
             script = f"""
+unset MIHOMO || true
+NMD_LOCAL_ENV={shlex.quote(str(root / 'absent.env'))}
 source {shlex.quote(str(ROOT / 'local-setup.sh'))}
 VPS_TS_IP=100.64.0.2 # TEST_ONLY; service and network commands are recorded below.
+CONFIG_DIR={shlex.quote(str(root / 'config'))}
+MIHOMO={shlex.quote(str(mihomo))}
 events={shlex.quote(str(events))}
 record() {{ echo "$*" >> "$events"; }}
 require_root() {{ :; }}
@@ -37,9 +49,9 @@ tailscale_checks() {{ record probes; }}
 {overrides}
 main {shlex.quote(command)}
 """
-            result = subprocess.run(["bash", "-c", script], text=True,
-                                    capture_output=True, timeout=10)
-            return result, events.read_text().splitlines() if events.exists() else []
+            result = _bash(script)
+            text = events.read_bytes().decode("utf-8", errors="backslashreplace") if events.exists() else ""
+            return result, text.splitlines()
 
     def test_start_and_stop_preserve_tailscale_and_autostart(self):
         for cmd in ("start", "stop", "restart"):
@@ -63,6 +75,12 @@ main {shlex.quote(command)}
         for active in (False, True):
             result, events = self.run_manager("apply", active=active)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unbound variable", result.stderr)
+            state = "1" if active else "0"
+            self.assertEqual(
+                result.stdout,
+                f"配置已部署；原运行状态={state}（1=运行，0=停止）。\n",
+            )
             self.assertEqual(events[0], "validate-source")
             self.assertIn("deploy", events)
             self.assertIn("tailscale set --accept-dns=true", events)
@@ -111,20 +129,52 @@ tailscale_checks() {{ record probes-failed; return 42; }}
 
     def test_unknown_command_and_sudo_failure_propagate(self):
         result = subprocess.run([str(ROOT / "nmd"), "typo"], capture_output=True)
-        self.assertEqual(result.returncode, 2)
-        if os.geteuid() != 0:
-            with tempfile.TemporaryDirectory() as tmp:
-                # Never invoke real sudo/service mutations from the test suite.
-                sudo = Path(tmp) / "sudo"
-                sudo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >&2\nexit 42\n')
-                sudo.chmod(0o755)
-                env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"])
-                result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), "stop"], capture_output=True,
-                                        text=True, env=env)
-                self.assertEqual(result.returncode, 42)
-                self.assertEqual(result.stderr.splitlines(),
-                                 ["--", "bash", str(ROOT / "local-setup.sh"), "stop"])
+        stderr = result.stderr.decode("utf-8", errors="backslashreplace")
+        if sys.platform == "linux":
+            self.assertEqual(result.returncode, 2, stderr)
+            self.assertIn("未知命令", stderr)
+        else:
+            # The manager rejects this before local-setup.sh. Exit 1 is the
+            # platform error, not the Linux "unknown command" exit 2.
+            self.assertEqual(result.returncode, 1, stderr)
+            self.assertIn("仅支持 Linux", stderr)
+            self.assertNotIn("未知命令", stderr)
+        if os.name == "nt" or os.geteuid() == 0:
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            # Never invoke real sudo/service mutations from the test suite.
+            sudo = Path(tmp) / "sudo"
+            sudo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >&2\nexit 42\n', encoding="utf-8")
+            sudo.chmod(0o755)
+            env = _bash_env()
+            env["PATH"] = tmp + os.pathsep + env.get("PATH", "")
+            env["NMD_LOCAL_ENV"] = str(Path(tmp) / "absent.env")
+            result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), "stop"],
+                                    capture_output=True, env=env)
+            err = result.stderr.decode("utf-8", errors="backslashreplace")
+            self.assertEqual(result.returncode, 42, err)
+            self.assertEqual(err.splitlines(),
+                             ["--", "bash", str(ROOT / "local-setup.sh"), "stop"])
 
+
+
+def _bash_env():
+    """Drop host shell startup files so bash -c sees only the test script."""
+    env = os.environ.copy()
+    for key in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "POSIXLY_CORRECT", "MIHOMO"):
+        env.pop(key, None)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def _bash(text, env=None):
+    completed = subprocess.run(["bash", "-c", text], capture_output=True, timeout=10,
+                               env=env or _bash_env())
+    return subprocess.CompletedProcess(
+        completed.args, completed.returncode,
+        completed.stdout.decode("utf-8", errors="backslashreplace"),
+        completed.stderr.decode("utf-8", errors="backslashreplace"))
 
 
 if __name__ == "__main__":

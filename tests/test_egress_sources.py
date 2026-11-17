@@ -32,6 +32,18 @@ TAIL = {"kind": "tailnet", "server": "100.64.0.10", "port": 1080,
         "expected_egress_ip": "198.51.100.10"}
 
 
+def _linux_source_cli(test):
+    """Skip a case whose success requires the Linux source CLI or an egress write.
+
+    macOS rejects ``nmd source`` in the manager and answers those POSTs with
+    405 read_only. That is the product boundary, not a failed read of sources.
+    Registry, render, and controller tests in this file do not go through it.
+    """
+    if sys.platform != "linux":
+        test.skipTest(
+            "Linux-only: macOS rejects nmd source and egress POST returns 405 read_only")
+
+
 class SourceFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -425,7 +437,7 @@ verify
 '''
         result = subprocess.run(["bash", "-c", script], env=dict(os.environ, NMD_SOURCES_DIR=str(self.directory),
                                 NMD_LOCAL_ENV=str(self.base / "missing.env"), NMD_VPS_PUB="203.0.113.99"),
-                                text=True, capture_output=True, timeout=10)
+                                text=True, encoding="utf-8", capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("verified_expected_ip", result.stdout)
         self.assertNotIn("PASS VPS", result.stdout)
@@ -590,22 +602,61 @@ class DashboardSourceTests(LocalControllerFixture):
         dashboard = self.start_dashboard()
         status, body = self.dashboard_request(dashboard)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["active"], self.current)
+        view = json.loads(body)
         for secret in (b"SYNTHETIC_URL_SECRET", b"SYNTHETIC_PASSWORD", b"SYNTHETIC_CONTROLLER_SECRET"):
             self.assertNotIn(secret, body)
         for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
             self.assertEqual(self.dashboard_request(dashboard, method)[0], 405)
         for headers in ({"Host": "evil.invalid"}, {"Origin": "https://evil.invalid"}, {"Origin": "null"}):
             self.assertEqual(self.dashboard_request(dashboard, headers=headers)[0], 403)
-        with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
-            status, body = self.dashboard_request(dashboard)
-            self.assertEqual(status, 503)
-            self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
-            self.assertIsNone(json.loads(body)["active"])
+        if sys.platform == "linux":
+            # Linux wires the same source backend the CLI uses.
+            self.assertEqual(view["active"], self.current)
+            with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
+                status, body = self.dashboard_request(dashboard)
+                self.assertEqual(status, 503)
+                self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
+                self.assertIsNone(json.loads(body)["active"])
+            self.assertTrue(all(method == "GET" for method, *_ in self.requests))
+        else:
+            # macOS/Windows drop sources_dir. The panel stays read-only and does
+            # not call the controller or treat "no backend" as a selected node.
+            self.assertEqual(view, {"schema_version": 1, "sources": [], "active": None,
+                                    "controller": "not_configured"})
+            self.assertEqual(self.requests, [])
+            status, denied = self.dashboard_request(
+                dashboard, "POST", "/api/egress/select", {"node": self.current})
+            self.assertEqual(status, 405)
+            self.assertEqual(json.loads(denied), {"error": "read_only"})
+            self.assertEqual(self.current, self.node("tail-a"))
+            with patch.object(e, "public_status", side_effect=PermissionError("SYNTHETIC_PRIVATE_SECRET")):
+                status, body = self.dashboard_request(dashboard)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["active"], None)
+                self.assertNotIn(b"SYNTHETIC_PRIVATE_SECRET", body)
+            self.assertEqual(self.requests, [])
         self.assertFalse((self.base / "unused-state").exists())
-        self.assertTrue(all(method == "GET" for method, *_ in self.requests))
+
+    def test_non_linux_dashboard_never_opens_the_source_backend(self):
+        # Same contract as a real macOS process: sources_dir is dropped even
+        # when the caller passes one. Linux CI runs this via the platform stub.
+        with patch.object(observability.nmd_platform, "name", return_value="macos"):
+            dashboard = self.start_dashboard()
+            status, body = self.dashboard_request(dashboard)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {
+                "schema_version": 1, "sources": [], "active": None,
+                "controller": "not_configured"})
+            self.assertNotIn(b"SYNTHETIC", body)
+            self.assertEqual(self.requests, [])
+            status, denied = self.dashboard_request(
+                dashboard, "POST", "/api/egress/select", {"node": self.current})
+            self.assertEqual((status, json.loads(denied)), (405, {"error": "read_only"}))
+            self.assertEqual(self.current, self.node("tail-a"))
+            self.assertEqual(self.requests, [])
 
     def test_write_endpoints_switch_test_and_configure_auto(self):
+        _linux_source_cli(self)
         dashboard = self.start_dashboard()
         chosen = self.node("sub-a")
         status, body = self.dashboard_request(dashboard, "POST", "/api/egress/select", {"node": chosen})
@@ -641,9 +692,10 @@ class DashboardSourceTests(LocalControllerFixture):
 class CLITests(SourceFixture):
     def invoke(self, *args):
         return subprocess.run([sys.executable, str(ROOT / "scripts/manager.py"), "source", "--sources-dir", str(self.directory), *args],
-                              env=dict(os.environ, NMD_LOCAL_ENV=str(self.base / "unused.env")), capture_output=True, text=True, timeout=10)
+                              env=dict(os.environ, NMD_LOCAL_ENV=str(self.base / "unused.env")), capture_output=True, text=True, encoding="utf-8", timeout=10)
 
     def test_cli_workflow_needs_no_install_or_service(self):
+        _linux_source_cli(self)
         definition = self.base / "input.json"
         definition.write_bytes(e.encode(TAIL))
         definition.chmod(0o600)
@@ -657,12 +709,14 @@ class CLITests(SourceFixture):
         self.assertEqual(self.invoke("select", nodes[0]["id"]).returncode, 1)
 
     def test_nodes_cli_shows_display_but_export_stays_shareable(self):
+        _linux_source_cli(self)
         self.populate()
         nodes = json.loads(self.invoke("nodes").stdout)["nodes"]
         self.assertTrue(nodes and all(node["display"] for node in nodes))
         self.assertNotIn("SYNTHETIC_LABEL_SECRET", self.invoke("export").stdout)
 
     def test_delay_cli_without_controller_reports_sanitized_failure(self):
+        _linux_source_cli(self)
         self.populate()
         nodes = json.loads(self.invoke("nodes").stdout)["nodes"]
         result = self.invoke("delay", nodes[0]["id"])
@@ -670,6 +724,7 @@ class CLITests(SourceFixture):
         self.assertIn("delay_test_failed", result.stderr)
 
     def test_auto_cli_configure_and_status(self):
+        _linux_source_cli(self)
         self.populate()
         nodes = json.loads(self.invoke("nodes").stdout)["nodes"]
         tail = next(node["id"] for node in nodes if node["source"] == "tail-a")
@@ -702,11 +757,12 @@ class CLITests(SourceFixture):
             self.assertNotIn("Traceback", result.stderr)
 
     def test_source_checkout_accepts_split_and_equals_directory_options(self):
+        _linux_source_cli(self)
         self.populate()
         self.assertEqual(self.invoke("list").returncode, 0)
         result = subprocess.run([sys.executable, str(ROOT / "scripts/manager.py"), "source",
                                  "--sources-dir=" + str(self.directory), "list"],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(json.loads(result.stdout)["sources"]), 3)
 
@@ -716,7 +772,7 @@ class CLITests(SourceFixture):
             for option in ([prefix, str(self.directory)], [prefix + "=" + str(self.directory)]):
                 with self.subTest(option=option):
                     result = subprocess.run([sys.executable, str(ROOT / "scripts/manager.py"), "source", *option, "list"],
-                                            capture_output=True, text=True, timeout=5)
+                                            capture_output=True, text=True, encoding="utf-8", timeout=5)
                     self.assertEqual(result.returncode, 1)
         result = self.invoke("status", "--off")
         self.assertEqual(result.returncode, 1)
@@ -725,7 +781,7 @@ class CLITests(SourceFixture):
         self.populate()
         for command in ("cutover", "rollback"):
             result = subprocess.run(["bash", str(ROOT / "local-setup.sh"), command, "--sources-dir", str(self.directory)],
-                                    env=dict(os.environ, NMD_LOCAL_ENV=str(self.base / "missing.env")), capture_output=True, text=True, timeout=5)
+                                    env=dict(os.environ, NMD_LOCAL_ENV=str(self.base / "missing.env")), capture_output=True, text=True, encoding="utf-8", timeout=5)
             self.assertEqual(result.returncode, 2)
             self.assertIn("多来源模式", result.stderr)
 
@@ -750,9 +806,10 @@ class InstalledCLITests(SourceFixture):
     def invoke(self, *args):
         return subprocess.run([sys.executable, str(self.checkout / "scripts/manager.py"), "source", *args],
                               env=dict(os.environ, HOME=str(self.base), XDG_CONFIG_HOME=str(self.base / "changed-xdg")),
-                              capture_output=True, text=True, timeout=5)
+                              capture_output=True, text=True, encoding="utf-8", timeout=5)
 
     def test_installed_default_uses_recorded_scope_directory(self):
+        _linux_source_cli(self)
         result = self.invoke("list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([source["id"] for source in json.loads(result.stdout)["sources"]], ["recorded"])
@@ -791,7 +848,7 @@ if check_installed; then exit 99; else exit 1; fi
         result = subprocess.run(["bash", "-c", script],
                                 env=dict(os.environ, NMD_SOURCES_DIR=str(self.directory),
                                          NMD_LOCAL_ENV=str(self.base / "absent.env")),
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("CORE-MUST-NOT-RUN", result.stdout + result.stderr)
 
@@ -833,7 +890,7 @@ check_installed
                     result = subprocess.run(["bash", "-c", script],
                                             env=dict(os.environ, TMPDIR=str(private_temp), NMD_SOURCES_DIR=str(self.directory),
                                                      NMD_LOCAL_ENV=str(self.base / "absent.env")),
-                                            capture_output=True, text=True, timeout=5)
+                                            capture_output=True, text=True, encoding="utf-8", timeout=5)
                     self.assertEqual(result.returncode, core_status, result.stderr)
                     self.assertNotIn("SYNTHETIC_VALIDATION_SECRET", result.stdout + result.stderr)
                     self.assertEqual(json.loads(capture.read_text())["mode"], 0o600)
@@ -875,7 +932,7 @@ systemctl() {{ echo "$*" >> {shlex.quote(str(events))}; }}
 deploy_files
 '''
         result = subprocess.run(["bash", "-c", script], env=dict(os.environ, NMD_SOURCES_DIR=str(self.directory),
-                                NMD_LOCAL_ENV=str(self.base / "absent.env")), capture_output=True, text=True, timeout=10)
+                                NMD_LOCAL_ENV=str(self.base / "absent.env")), capture_output=True, text=True, encoding="utf-8", timeout=10)
         return result, config, events
 
     def test_validated_staging_deploys_private_provider_files_without_activation(self):

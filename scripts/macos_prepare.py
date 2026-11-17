@@ -65,12 +65,15 @@ _HEADER = (
 
 # --- snapshot: read-only commands, allowlisted before any spawn -------------
 
+# All users, full `comm` paths. Short names (`ucomm`, `-c`) truncate or are a
+# different field; a current-uid filter misses root and still grows past a cap.
+_PS_SNAPSHOT_ARGV = ("/bin/ps", "-axo", "pid=,comm=")
 _SNAPSHOT_COMMANDS = (
     (("/usr/sbin/netstat", "-rn", "-f", "inet"), 2),
     (("/usr/sbin/netstat", "-rn", "-f", "inet6"), 2),
     (("/usr/sbin/scutil", "--dns"), 2),
     (("/usr/sbin/scutil", "--proxy"), 2),
-    (("/bin/ps", "-axo", "pid=,comm="), 2),
+    (_PS_SNAPSHOT_ARGV, 2),
 )
 _SETUP = "/usr/sbin/networksetup"
 # Read forms only. A write flag is absent here, so it cannot match.
@@ -81,6 +84,13 @@ _TAILSCALE_TIMEOUT = 3
 _TAILSCALE_STATUS_LIMIT = macos_coexist.TAILSCALE_STATUS_PARSE_LIMIT
 _PREFS_LIMIT = 65536
 _FIXED_LIMIT = 65536
+# A busy Darwin 27 host printed 78965 bytes / 853 lines of full paths (median
+# comm 84 bytes, max 220) in about 20ms, exit 0, empty stderr, valid UTF-8.
+# The 64KiB cap read 65537 bytes, discarded the body, and the snapshot became
+# unknown. 1MiB is the shared reader's ceiling and about 13x that table.
+# Past it the body is dropped whole: a prefix is not a complete observation.
+# Other snapshot commands stay at 64KiB.
+_PS_SNAPSHOT_LIMIT = 1024 * 1024
 _PREFS_KEYS = ("ExitNodeID", "ExitNodeIP", "CorpDNS", "RouteAll",
                "ExitNodeAllowLANAccess", "WantRunning")
 
@@ -363,6 +373,8 @@ def write_config(text, out_path, *, repo_root=REPO_ROOT):
 
 
 def _limit_for(key):
+    if key == _PS_SNAPSHOT_ARGV:
+        return _PS_SNAPSHOT_LIMIT
     for argv, _ in _SNAPSHOT_COMMANDS:
         if key == argv:
             return _FIXED_LIMIT
@@ -376,6 +388,15 @@ def _limit_for(key):
             return _TAILSCALE_STATUS_LIMIT
         if key[1:] == ("debug", "prefs"):
             return _PREFS_LIMIT
+    # One process's start time and argv. The pid is a canonical integer, so
+    # this cannot become ``ps`` with a free-form selector.
+    if (len(key) == 5 and key[0:2] == ("/bin/ps", "-p")
+            and key[3:] == ("-o", "lstart=,args=")):
+        pid_text = key[2]
+        if pid_text.isdigit():
+            pid = int(pid_text)
+            if 1 < pid <= 2 ** 31 - 1 and str(pid) == pid_text:
+                return _FIXED_LIMIT
     return None
 
 
@@ -535,10 +556,36 @@ def _parse_scutil_proxy(code, text, error):
     return {"status": "observed", "reason": None, "protocols": protocols, "bypass": bypass}
 
 
+def _ps_failure(error, code):
+    """Why this ps read cannot decide absence. None means the listing is complete."""
+    if not error and code == 0:
+        return None
+    if error == "timeout":
+        return "timeout"
+    if error == "output_too_large":
+        return "output_too_large"
+    if error == "invalid_text":
+        return "invalid_text"
+    # Non-zero exit and command_failed are one class. tool_missing,
+    # permission_denied, and launch_error stay the generic unknown.
+    if error == "command_failed" or (error is None and code not in (0, None)):
+        return "command_failed"
+    return "unavailable"
+
+
+_PS_NOTES = {
+    "timeout": "ps_timeout",
+    "output_too_large": "ps_output_too_large",
+    "invalid_text": "ps_invalid_text",
+    "command_failed": "ps_command_failed",
+}
+
+
 def _parse_ps(code, text, error):
     result = {"mihomo": [], "sing_tun": [], "tailscale": []}
-    if error or code != 0:
-        return result, "unavailable"
+    reason = _ps_failure(error, code)
+    if reason is not None:
+        return result, reason
     for line in text.splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit():
@@ -681,12 +728,21 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
         notes.append("scutil_dns_unavailable")
     if prefs["status"] != "observed":
         notes.append("tailscale_prefs_unavailable")
+    if ps_reason is not None:
+        # A failed or truncated ps is unknown. null is not "mihomo is absent".
+        # The specific token names timeout / non-zero / over-limit / bad text.
+        # Neither token carries process text.
+        notes.append("ps_unavailable")
+        specific = _PS_NOTES.get(ps_reason)
+        if specific:
+            notes.append(specific)
 
     has_198_18 = dns["has_198_18"]
     exit_node_selected = bool(prefs.get("ExitNodeID") or prefs.get("ExitNodeIP"))
     takeover_ready = {
         "scutil_has_no_198_18": None if has_198_18 is None else not has_198_18,
-        "mihomo_absent": not processes["mihomo"] if ps_reason is None else None,
+        # None means the ps read did not succeed. It must not be used as ready.
+        "mihomo_absent": None if ps_reason is not None else not processes["mihomo"],
         "exit_node_selected": exit_node_selected,
         "notes": notes,
     }
@@ -706,8 +762,22 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
     )
 
 
+def _summary_mihomo_running(snapshot, processes):
+    ready = snapshot.get("takeover_ready")
+    if isinstance(ready, dict) and "mihomo_absent" in ready:
+        absent = ready.get("mihomo_absent")
+        if absent is None:
+            return None
+        return not bool(absent)
+    return bool(processes.get("mihomo"))
+
+
 def summarize_snapshot(snapshot, path=None):
-    """The public, redacted view: statuses, counts, booleans, fingerprints."""
+    """The public, redacted view: statuses, counts, booleans, fingerprints.
+
+    ``mihomo_running`` is null when the ps read failed. That null is not a
+    ready signal and is not rewritten to false.
+    """
     prefs = (snapshot.get("tailscale") or {}).get("prefs") or {}
     dns = snapshot.get("dns") or {}
     processes = snapshot.get("processes") or {}
@@ -725,7 +795,9 @@ def summarize_snapshot(snapshot, path=None):
         "exit_node_id_fingerprint": hashlib.sha256(
             exit_node.encode()).hexdigest()[:16] if isinstance(exit_node, str) and exit_node else None,
         "has_198_18": dns.get("has_198_18"),
-        "mihomo_running": bool(processes.get("mihomo")),
+        # null when ps was not observed. An empty list is "not running" only
+        # after a successful read; a failed read must not look like ready.
+        "mihomo_running": _summary_mihomo_running(snapshot, processes),
         "tailscale": {"status": ((snapshot.get("tailscale") or {}).get("status") or {}).get("availability"),
                       "prefs": prefs.get("status")},
         "dns": {"status": dns.get("status"), "service_count": len(dns.get("services") or [])},

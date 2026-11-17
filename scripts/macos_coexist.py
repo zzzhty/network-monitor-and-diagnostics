@@ -225,6 +225,11 @@ DAEMON_POLICY = {
     "changes_power_management": False,
     "panel_may_start_takeover": False,
     "requires_explicit_install": True,
+    # An unfinished restore is retried. A finished one does not start again.
+    "retries_incomplete_rollback": True,
+    "vps_tcp_is_critical_health_check": True,
+    "independent_rollback_stops_recorded_mihomo": True,
+    "startup_validation_confined_to_workdir": True,
     "implemented_in_this_repository": True,
 }
 

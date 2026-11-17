@@ -402,6 +402,10 @@ class EvidenceBoundaryTests(unittest.TestCase):
         # re-takes-over after a rollback and the panel cannot start one.
         self.assertFalse(m.DAEMON_POLICY["absolute_deadline"])
         self.assertFalse(m.DAEMON_POLICY["auto_retry_after_rollback"])
+        self.assertTrue(m.DAEMON_POLICY["retries_incomplete_rollback"])
+        self.assertTrue(m.DAEMON_POLICY["vps_tcp_is_critical_health_check"])
+        self.assertTrue(m.DAEMON_POLICY["independent_rollback_stops_recorded_mihomo"])
+        self.assertTrue(m.DAEMON_POLICY["startup_validation_confined_to_workdir"])
         self.assertFalse(m.DAEMON_POLICY["panel_may_start_takeover"])
         self.assertTrue(m.DAEMON_POLICY["snapshot_before_every_start_including_boot"])
         self.assertEqual(m.ROLLBACK_POLICY["short_test_minutes"], 10)

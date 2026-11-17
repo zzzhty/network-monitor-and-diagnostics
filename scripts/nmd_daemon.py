@@ -15,6 +15,7 @@ unchanged; this module is macOS-only.
 from __future__ import annotations
 
 import contextlib
+import errno
 import grp
 import json
 import os
@@ -123,12 +124,35 @@ def default_daemon_config_path(root=None):
     return base / "nmd" / "daemon.json"
 
 
-def load_daemon_config(path):
+def load_daemon_config(path, *, expected_uid=None):
+    """Read a regular, non-symlink config and reject a writable parent.
+
+    ``open()`` follows the final symlink, so a check after the read can be
+    shown a different inode than the one that was parsed. The fd is fstat'd
+    before the bytes are trusted.
+    """
+    path = Path(path)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with open(Path(path), "rb") as handle:
-            data = handle.read(65537)
+        fd = os.open(path, flags)
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise DaemonError("config_not_regular") from exc
         raise DaemonError("config_unreadable") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise DaemonError("config_not_regular")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise DaemonError("config_group_or_world_writable")
+        if expected_uid is not None and info.st_uid != expected_uid:
+            raise DaemonError("config_owner_changed")
+        _require_trusted_path(path)
+        data = os.read(fd, 65537)
+    finally:
+        os.close(fd)
     if len(data) > 65536:
         raise DaemonError("config_too_large")
     try:
@@ -147,8 +171,19 @@ def write_daemon_config(path, value):
     return path
 
 
+def _require_trusted_path(path):
+    """Reject a symlink or a replaceable ancestor. The leaf may be the file."""
+    try:
+        macos_takeover.assert_private_ancestors(path)
+    except macos_takeover.TakeoverError as exc:
+        if str(exc) == "unsafe_path_parent":
+            raise DaemonError("config_group_or_world_writable") from exc
+        raise DaemonError("config_not_regular") from exc
+
+
 def check_private_config(path, *, expected_uid=None):
     """The root supervisor re-checks this user-owned file before trusting it."""
+    _require_trusted_path(path)
     info = os.lstat(path)
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise DaemonError("config_group_or_world_writable")
@@ -162,23 +197,47 @@ def check_private_config(path, *, expected_uid=None):
 # --- IPC: one JSON line per connection ----------------------------------------
 
 
-def peer_uid(conn):
-    """Peer credentials: LOCAL_PEERCRED on Darwin, SO_PEERCRED on Linux.
+def _uid_from_cred(platform, data):
+    """Parse a uid from one platform's peer-credential buffer.
 
-    Both structures put the uid second (Darwin: version, uid, ngids; Linux:
-    pid, uid, gid), so index 1 is the uid on either platform.
+    Darwin ``struct xucred`` starts with ``u_int cr_version`` then ``uid_t
+    cr_uid``. ``cr_ngroups`` is a short, so the buffer is not three ints, and
+    a 12-byte ``getsockopt`` is rejected by the kernel. Linux ``struct ucred``
+    is pid, uid, gid.
     """
+    if not data:
+        return -1
+    if platform == "darwin":
+        if len(data) < 8:
+            return -1
+        version, uid = struct.unpack_from("@Ii", data)
+        if version != 0 or uid < 0:
+            return -1
+        return uid
+    width = struct.calcsize("@iii")
+    if len(data) < width:
+        return -1
+    _pid, uid, _gid = struct.unpack_from("@iii", data)
+    return uid if uid >= 0 else -1
+
+
+def peer_uid(conn):
+    """Peer credentials: LOCAL_PEERCRED on Darwin, SO_PEERCRED on Linux."""
     try:
         if sys.platform == "darwin":
             option = getattr(socket, "LOCAL_PEERCRED", 0x001)
             level = getattr(socket, "SOL_LOCAL", 0)
+            # sizeof(struct xucred) is 76 on LP64; ask for more and parse the prefix.
+            data = conn.getsockopt(level, option, 256)
+            platform = "darwin"
         else:
             option = getattr(socket, "SO_PEERCRED", 17)
             level = socket.SOL_SOCKET
-        data = conn.getsockopt(level, option, struct.calcsize("@3i"))
-        return struct.unpack("@3i", data)[1]
+            data = conn.getsockopt(level, option, struct.calcsize("@iii"))
+            platform = "linux"
     except OSError:
         return -1
+    return _uid_from_cred(platform, data)
 
 
 class DaemonIPCServer:
@@ -194,8 +253,17 @@ class DaemonIPCServer:
         self._socket = None
 
     def bind(self):
-        with contextlib.suppress(OSError):
-            self.socket_path.unlink()
+        try:
+            info = self.socket_path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            # unlink() removes a symlink itself. A regular file at this path
+            # is not ours to delete.
+            if stat.S_ISLNK(info.st_mode) or stat.S_ISSOCK(info.st_mode):
+                self.socket_path.unlink()
+            else:
+                raise DaemonError("socket_path_not_socket")
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(self.socket_path))
         if self.group is not None:
@@ -333,8 +401,11 @@ class DaemonIPCClient:
 
 SESSION_FILE = "daemon-session.json"
 PHASE_DIRECT = "direct"
+PHASE_STARTING = "starting"
 PHASE_ACTIVE = "active"
+PHASE_NEEDS_ROLLBACK = "needs_rollback"
 PHASE_ROLLED_BACK = "rolled_back"
+_PHASES = (PHASE_DIRECT, PHASE_STARTING, PHASE_ACTIVE, PHASE_NEEDS_ROLLBACK, PHASE_ROLLED_BACK)
 
 
 def _darwin_boot_id():
@@ -363,43 +434,14 @@ def boot_id():
     return _linux_boot_id()
 
 
-GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
-
-
 def stage_geodata(target_dir, source_dir=None):
-    """Copy any existing geodata next to the config so `-t` and `-f` are
-    self-contained; missing files are reported, never downloaded here."""
-    import shutil
-    source_dir = Path(source_dir) if source_dir is not None else Path.home() / ".config/mihomo"
-    staged, missing = [], []
-    for name in GEODATA_FILES:
-        target = Path(target_dir) / name
-        if target.exists():
-            staged.append(name)
-            continue
-        source = source_dir / name
-        if source.is_file():
-            shutil.copy2(source, target)
-            staged.append(name)
-        else:
-            missing.append(name)
-    return staged, missing
+    """Delegate to the shared no-follow copy used by the foreground controller."""
+    return macos_takeover.stage_geodata(target_dir, source_dir)
 
 
 def run_mihomo_validate(mihomo, config_path, work_dir, timeout=30):
-    """Gate + run `mihomo -t` with stderr captured; bounded_run drops stderr,
-    and for validation the failure text is the whole point."""
-    argv = [mihomo, "-t", "-d", str(work_dir), "-f", str(config_path)]
-    if not macos_takeover.mutating_allowlisted(argv, mihomo_path=mihomo):
-        raise DaemonError("mutation_not_allowlisted")
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "validate timeout"
-    except OSError:
-        return False, "mihomo not executable"
-    tail = (result.stderr or result.stdout or "").strip()[-400:]
-    return result.returncode == 0, tail
+    """Delegate to the shared allowlisted ``-d`` validation."""
+    return macos_takeover.run_mihomo_validate(mihomo, config_path, work_dir, timeout)
 
 
 class RootSupervisor:
@@ -411,7 +453,18 @@ class RootSupervisor:
                  geodata_dir=None):
         self.config = validate_daemon_config(config)
         takeover = self.config["takeover"]
-        self.state_dir = Path(state_dir)
+        state_dir = Path(state_dir)
+        if not state_dir.is_absolute():
+            state_dir = Path.cwd() / state_dir
+        if state_dir.is_symlink():
+            raise DaemonError("state_dir_symlink")
+        try:
+            macos_takeover.assert_private_ancestors(state_dir)
+        except macos_takeover.TakeoverError as exc:
+            if str(exc) == "unsafe_path_symlink":
+                raise DaemonError("state_dir_symlink") from exc
+            raise DaemonError("unsafe_state_dir") from exc
+        self.state_dir = state_dir
         self.runner = runner or macos_prepare.execute
         self.sleep = sleep or time.sleep
         self.now = now or time.monotonic
@@ -424,14 +477,22 @@ class RootSupervisor:
                 return macos_takeover.execute_mutating(argv, mihomo_path=mihomo)
         self.mutator = mutator
         self.spawner = spawner
+        if tcp is None:
+            import macos_readonly
+            tcp = macos_readonly.tcp_connect
         self.tcp = tcp
         self.exists = exists or (lambda path: Path(path).is_file() and os.access(path, os.X_OK))
         self.mihomo = mihomo
         self.tailscale = macos_takeover.first_tailscale(self.exists)
         self.socket_path = socket_path
         self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._settled = threading.Event()
+        self._settled.set()
         self.phase = PHASE_DIRECT
         self.result = None
+        self.snapshot_name = None
+        self.last_rollback = None
         self.boot = None
         self.started_at = None
         self.failures = 0
@@ -448,7 +509,7 @@ class RootSupervisor:
     def _persist_session(self):
         payload = {"schema_version": DAEMON_SCHEMA_VERSION, "label": LABEL,
                    "boot_id": self.boot, "phase": self.phase, "result": self.result,
-                   "started_at": self.started_at,
+                   "snapshot_name": self.snapshot_name, "started_at": self.started_at,
                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())}
         macos_prepare._create_private_parents(self.state_dir)
         macos_prepare._atomic_private_write(
@@ -496,19 +557,30 @@ class RootSupervisor:
         self.boot = session.get("boot_id")
         self.result = session.get("result")
         self.started_at = session.get("started_at")
-        self.phase = session.get("phase") if session.get("phase") in (
-            PHASE_DIRECT, PHASE_ACTIVE, PHASE_ROLLED_BACK) else PHASE_DIRECT
-        if session.get("phase") == PHASE_ACTIVE:
+        name = session.get("snapshot_name")
+        self.snapshot_name = name if isinstance(name, str) else None
+        self.phase = session.get("phase") if session.get("phase") in _PHASES else PHASE_DIRECT
+        if session.get("phase") in (PHASE_ACTIVE, PHASE_STARTING, PHASE_NEEDS_ROLLBACK):
+            # starting: we may already have cleared the exit node. active: the
+            # takeover is still logically on. needs_rollback: a previous
+            # restore did not finish. All three use the pinned snapshot.
+            # A pending rollback already has an outcome (critical_failures and
+            # the other boot-suppressing results). Replacing that with
+            # recovered_leftovers would let on_boot start another takeover
+            # the moment the restore succeeds.
+            pending = session.get("phase") == PHASE_NEEDS_ROLLBACK
+            prior = self.result if pending and self.result in SUPPRESS_BOOT_RESULTS else None
             try:
-                rollback = macos_takeover.rollback(
-                    self.state_dir, runner=self.runner, mutator=self.mutator,
-                    sleep=self.sleep, now=self.now, tailscale_path=self.tailscale)
-            except macos_takeover.TakeoverError as exc:
-                rollback = {"result": f"rollback_error:{exc}"}
-            self.phase = PHASE_ROLLED_BACK
-            self.result = "recovered_leftovers"
+                rollback = self._rollback_now()
+            except Exception as exc:
+                rollback = {"result": f"rollback_error:{type(exc).__name__}"}
+            self.last_rollback = rollback
+            self.phase = (PHASE_ROLLED_BACK if rollback.get("result") == "rollback_restored"
+                          else PHASE_NEEDS_ROLLBACK)
+            self.result = prior if prior is not None else "recovered_leftovers"
+            self.process = None
             self._persist_session()
-            self._record_run("recovered_leftovers", rollback)
+            self._record_run(self.result, rollback)
 
     def _boot_policy(self):
         """True boot with on_boot and a healthy history resumes takeover.
@@ -521,10 +593,15 @@ class RootSupervisor:
             return
         same_boot = current == self.boot
         self.boot = current
+        if self.phase == PHASE_NEEDS_ROLLBACK:
+            # Do not take a fresh snapshot, and do not start, while the
+            # previous cutover is only partly undone.
+            self._persist_session()
+            return
         takeover = self.config["takeover"]
         should = (takeover["on_boot"] and not same_boot
                   and self.result not in SUPPRESS_BOOT_RESULTS
-                  and self.phase != PHASE_ACTIVE)
+                  and self.phase not in (PHASE_ACTIVE, PHASE_STARTING))
         if should:
             self.start_takeover(reason="boot")
         else:
@@ -534,106 +611,207 @@ class RootSupervisor:
 
     def start_takeover(self, reason="manual"):
         """Fresh snapshot before every start — including boot. Then cutover."""
-        with self._lock:
-            if self.phase == PHASE_ACTIVE:
-                return {"result": "already_active"}
-            takeover = self.config["takeover"]
-            inputs = takeover["inputs"]
-            if inputs["server"] == macos_coexist.PLACEHOLDER_SOCKS_HOST:
-                return {"error": "placeholder_inputs"}
-            profile = takeover["profile"] or json.loads(
-                (Path(__file__).resolve().parents[1]
-                 / "examples/macos-mihomo-coexist.experiment.json").read_text(encoding="utf-8"))
-            mutations = []
-            process = None
-            try:
-                text = macos_prepare.render_config(profile, inputs)
-                config_dir = self.state_dir / "takeover"
-                macos_prepare._create_private_parents(config_dir)
-                macos_prepare._atomic_private_write(config_dir, "config.yaml", text.encode())
-                staged, missing = stage_geodata(config_dir, self.geodata_dir)
-                ok, detail = self.validator(self.mihomo, config_dir / "config.yaml", config_dir)
-                if not ok:
-                    self._record_failed_start("mihomo_t_failed",
-                                              {"detail": detail, "geodata_staged": staged,
-                                               "geodata_missing": missing})
-                    return {"error": "mihomo_t_failed", "detail": detail,
-                            "geodata_staged": staged, "geodata_missing": missing}
-                _, summary, _ = macos_prepare.collect_snapshot(
-                    "macos", self.state_dir, runner=self.runner, exists=self.exists)
-                if summary.get("has_198_18") is True or summary.get("mihomo_running") is True:
-                    return {"error": "preflight_failed",
-                            "has_198_18": summary.get("has_198_18"),
-                            "mihomo_running": summary.get("mihomo_running")}
-                try:
-                    self.mutator([self.tailscale, "set", "--exit-node="])
-                except macos_takeover.TakeoverError as exc:
-                    self._record_failed_start("exit_node_clear_failed", {"detail": str(exc)})
-                    return {"error": "exit_node_clear_failed", "detail": str(exc)}
-                mutations.append([self.tailscale, "set", "--exit-node="])
-                process = macos_takeover.MihomoProcess(
-                    [self.mihomo, "-d", str(config_dir), "-f", str(config_dir / "config.yaml")],
-                    str(config_dir / "mihomo.log"))
-                process.start(spawner=self.spawner)
-                ready_by = self.now() + macos_takeover.READY_TIMEOUT_SECONDS
-                while self.now() < ready_by:
-                    _, dns_text = macos_takeover.read_state(
-                        ["/usr/sbin/scutil", "--dns"], runner=self.runner)
-                    parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
-                    if parsed["has_198_18"] is True:
-                        break
-                    if not process.alive():
-                        self._finish_locked("mihomo_exited_early", process, mutations)
-                        return {"error": "mihomo_exited_early"}
-                    self.sleep(macos_takeover.READY_POLL_SECONDS)
-                else:
-                    self._finish_locked("ready_timeout", process, mutations)
-                    return {"error": "ready_timeout"}
-            except macos_takeover.TakeoverError as exc:
-                if process is not None:
-                    self._finish_locked(f"takeover_error:{exc}", process, mutations)
-                else:
-                    self.phase, self.result = PHASE_ROLLED_BACK, f"takeover_error:{exc}"
-                    self._persist_session()
-                return {"error": str(exc)}
-            self.process = process
-            self.mutations = mutations
-            self.checks = macos_takeover._watch_checks(
-                inputs, runner=self.runner, tcp=self.tcp, exists=self.exists)
-            self.failures = 0
-            self.phase = PHASE_ACTIVE
-            self.result = None
-            self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        self._lock.acquire()
+        try:
+            return self._start_takeover_locked(reason)
+        finally:
+            self._lock.release()
+
+    def _start_takeover_locked(self, reason):
+        if self.phase == PHASE_NEEDS_ROLLBACK:
+            return {"error": "rollback_pending"}
+        if self.phase == PHASE_ACTIVE:
+            return {"result": "already_active"}
+        takeover = self.config["takeover"]
+        inputs = takeover["inputs"]
+        if inputs["server"] == macos_coexist.PLACEHOLDER_SOCKS_HOST:
+            return {"error": "placeholder_inputs"}
+        profile = takeover["profile"] or json.loads(
+            (Path(__file__).resolve().parents[1]
+             / "examples/macos-mihomo-coexist.experiment.json").read_text(encoding="utf-8"))
+        text = macos_prepare.render_config(profile, inputs)
+        try:
+            config_dir = macos_takeover.ensure_workdir(self.state_dir / "takeover")
+        except macos_takeover.TakeoverError as exc:
+            return {"error": str(exc)}
+        config_path = config_dir / "config.yaml"
+        macos_prepare._atomic_private_write(config_dir, "config.yaml", text.encode())
+        if not macos_takeover.config_is_direct_regular(config_dir, config_path):
+            return {"error": "mihomo_t_failed", "detail": "config_not_confined"}
+        staged, missing = stage_geodata(config_dir, self.geodata_dir)
+        ok, detail = self.validator(self.mihomo, config_path, config_dir)
+        if not ok:
+            self._record_failed_start("mihomo_t_failed",
+                                      {"detail": detail, "geodata_staged": staged,
+                                       "geodata_missing": missing})
+            return {"error": "mihomo_t_failed", "detail": detail,
+                    "geodata_staged": staged, "geodata_missing": missing}
+        _, summary, snapshot_path = macos_prepare.collect_snapshot(
+            "macos", self.state_dir, runner=self.runner, exists=self.exists)
+        if summary.get("has_198_18") is True or summary.get("mihomo_running") is True:
+            return {"error": "preflight_failed",
+                    "has_198_18": summary.get("has_198_18"),
+                    "mihomo_running": summary.get("mihomo_running")}
+        self.snapshot_name = Path(snapshot_path).name if snapshot_path is not None else None
+        try:
+            macos_takeover.write_pin(self.state_dir, self.snapshot_name)
+        except macos_takeover.TakeoverError as exc:
+            return {"error": "snapshot_failed", "detail": str(exc)}
+        self._settled.clear()
+        self.phase = PHASE_STARTING
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        self._persist_session()
+        if self._cancel.is_set():
+            self.phase = PHASE_DIRECT
+            self._cancel.clear()
             self._persist_session()
-            return {"result": "takeover_active", "reason": reason,
-                    "geodata_staged": staged}
+            self._settled.set()
+            return {"result": "stopped", "reason": "manual_stop"}
+        mutations = []
+        process = None
+        try:
+            try:
+                self.mutator([self.tailscale, "set", "--exit-node="])
+            except macos_takeover.TakeoverError as exc:
+                self.phase = PHASE_DIRECT
+                self._record_failed_start("exit_node_clear_failed", {"detail": str(exc)})
+                return {"error": "exit_node_clear_failed", "detail": str(exc)}
+            mutations.append([self.tailscale, "set", "--exit-node="])
+            if not macos_takeover.config_is_direct_regular(config_dir, config_path):
+                self._finish_locked("config_not_confined", None, mutations)
+                return {"error": "config_not_confined"}
+            process = macos_takeover.MihomoProcess(
+                macos_takeover.launch_argv(self.mihomo, config_dir, config_path),
+                str(config_dir / "mihomo.log"))
+            process.start(spawner=self.spawner)
+            macos_takeover.write_owner(
+                self.state_dir, process.pid, self.mihomo, str(config_dir),
+                runner=self.runner)
+            ready_by = self.now() + macos_takeover.READY_TIMEOUT_SECONDS
+            while self.now() < ready_by:
+                if self._cancel.is_set():
+                    rollback = self._finish_locked("manual_stop", process, mutations)
+                    return {"result": rollback.get("result", "stopped"), "reason": "manual_stop"}
+                _, dns_text = macos_takeover.read_state(
+                    ["/usr/sbin/scutil", "--dns"], runner=self.runner)
+                parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
+                if parsed["has_198_18"] is True:
+                    break
+                if not process.alive():
+                    self._finish_locked("mihomo_exited_early", process, mutations)
+                    return {"error": "mihomo_exited_early"}
+                # Let stop/status run during the wait. Reacquire before touching state.
+                self._lock.release()
+                try:
+                    self.sleep(macos_takeover.READY_POLL_SECONDS)
+                finally:
+                    self._lock.acquire()
+                # Supervisor shutdown can finish the run while this lock is dropped.
+                if self.phase != PHASE_STARTING:
+                    rollback = self.last_rollback or {}
+                    return {"result": rollback.get("result", "stopped"),
+                            "reason": self.result or "stopped"}
+            else:
+                if self._cancel.is_set():
+                    rollback = self._finish_locked("manual_stop", process, mutations)
+                    return {"result": rollback.get("result", "stopped"), "reason": "manual_stop"}
+                self._finish_locked("ready_timeout", process, mutations)
+                return {"error": "ready_timeout"}
+            if self._cancel.is_set():
+                rollback = self._finish_locked("manual_stop", process, mutations)
+                return {"result": rollback.get("result", "stopped"), "reason": "manual_stop"}
+        except Exception as exc:
+            if process is not None or mutations:
+                self._finish_locked(f"takeover_error:{type(exc).__name__}", process, mutations)
+            else:
+                self.phase, self.result = PHASE_DIRECT, f"takeover_error:{type(exc).__name__}"
+                self._persist_session()
+            if isinstance(exc, macos_takeover.TakeoverError):
+                return {"error": str(exc)}
+            return {"error": type(exc).__name__}
+        finally:
+            self._settled.set()
+        if self.phase != PHASE_STARTING:
+            rollback = self.last_rollback or {}
+            return {"result": rollback.get("result", "stopped"),
+                    "reason": self.result or "stopped"}
+        self.process = process
+        self.mutations = mutations
+        self.checks = macos_takeover._watch_checks(
+            inputs, runner=self.runner, tcp=self.tcp, exists=self.exists)
+        self.failures = 0
+        self.phase = PHASE_ACTIVE
+        self.result = None
+        self._persist_session()
+        return {"result": "takeover_active", "reason": reason,
+                "geodata_staged": staged}
+
+    def _rollback_now(self):
+        return macos_takeover.rollback(
+            self.state_dir, runner=self.runner, mutator=self.mutator,
+            sleep=self.sleep, now=self.now, tailscale_path=self.tailscale,
+            snapshot_name=self.snapshot_name)
 
     def _finish_locked(self, outcome, process, mutations):
-        """Shared teardown+rollback for every exit path; caller holds the lock."""
+        """Shared teardown+rollback for every exit path; caller holds the lock.
+
+        A restore that did not actually put the snapshot values back stays
+        ``needs_rollback``. Calling that ``rolled_back`` would make the next
+        launchd restart skip it.
+        """
         if process is not None:
             process.terminate_group()
         self.mutations = list(mutations)
         try:
-            rollback = macos_takeover.rollback(
-                self.state_dir, runner=self.runner, mutator=self.mutator,
-                sleep=self.sleep, now=self.now, tailscale_path=self.tailscale)
+            rollback = self._rollback_now()
         except Exception as exc:  # keep the supervisor alive on rollback crashes
             rollback = {"result": f"rollback_error:{type(exc).__name__}"}
-        self.phase = PHASE_ROLLED_BACK
+        self.last_rollback = rollback
+        self.phase = (PHASE_ROLLED_BACK if rollback.get("result") == "rollback_restored"
+                      else PHASE_NEEDS_ROLLBACK)
         self.result = outcome
         self.failures = 0
         self.process = None
         self.checks = []
+        self._cancel.clear()
         self._persist_session()
         self._record_run(outcome, rollback)
         return rollback
 
-    def stop_takeover(self, reason="manual_stop"):
+    def _retry_rollback(self):
+        """One more attempt at an unfinished restore. Does not start a takeover."""
         with self._lock:
-            if self.phase != PHASE_ACTIVE:
+            if self.phase != PHASE_NEEDS_ROLLBACK:
+                return True
+            try:
+                rollback = self._rollback_now()
+            except Exception as exc:
+                rollback = {"result": f"rollback_error:{type(exc).__name__}"}
+            self.last_rollback = rollback
+            if rollback.get("result") != "rollback_restored":
+                return False
+            self.phase = PHASE_ROLLED_BACK
+            self._persist_session()
+            self._record_run(self.result or "rollback_retried", rollback)
+            return True
+
+    def stop_takeover(self, reason="manual_stop"):
+        self._cancel.set()
+        with self._lock:
+            if self.phase == PHASE_ACTIVE:
+                rollback = self._finish_locked(reason, self.process, self.mutations)
+                return {"result": rollback.get("result", "rollback_restored"),
+                        "reason": reason}
+            if self.phase != PHASE_STARTING:
+                self._cancel.clear()
                 return {"result": "not_active"}
-            rollback = self._finish_locked(reason, self.process, self.mutations)
-            return {"result": rollback.get("result", "rollback_restored"),
+        # The starter owns the teardown and clears the cancel when it finishes.
+        if not self._settled.wait(macos_takeover.READY_TIMEOUT_SECONDS
+                                  + macos_takeover.CLEANUP_TIMEOUT_SECONDS):
+            return {"result": "stop_pending", "reason": reason}
+        with self._lock:
+            rollback = self.last_rollback or {}
+            return {"result": rollback.get("result", self.result or "stopped"),
                     "reason": reason}
 
     # -- health ---------------------------------------------------------------
@@ -667,7 +845,10 @@ class RootSupervisor:
     # -- interface ------------------------------------------------------------
 
     def dispatch(self, message, uid):
-        cmd = message.get("cmd")
+        if (not isinstance(message, dict) or set(message) != {"cmd"}
+                or not isinstance(message.get("cmd"), str)):
+            return {"error": "invalid_command"}
+        cmd = message["cmd"]
         if cmd == "status":
             return self.status()
         if cmd == "takeover.stop":
@@ -702,6 +883,9 @@ class RootSupervisor:
                 if self.phase == PHASE_ACTIVE:
                     self._watchdog_once()
                     interval = self.config["takeover"]["check_interval_seconds"]
+                elif self.phase == PHASE_NEEDS_ROLLBACK:
+                    self._retry_rollback()
+                    interval = self.config["takeover"]["check_interval_seconds"]
                 else:
                     interval = IDLE_POLL_SECONDS
                 stop_event.wait(interval)
@@ -710,7 +894,7 @@ class RootSupervisor:
             self._ipc.close()
             thread.join(timeout=2)
             with self._lock:
-                if self.phase == PHASE_ACTIVE:
+                if self.phase in (PHASE_ACTIVE, PHASE_STARTING, PHASE_NEEDS_ROLLBACK):
                     self._finish_locked("supervisor_stopping", self.process, self.mutations)
 
 
@@ -913,6 +1097,8 @@ def install_root_plist(config_path, state_dir):
                            config_path, state_dir)
     ROOT_PLIST_DIR.mkdir(parents=True, exist_ok=True)
     path = ROOT_PLIST_DIR / f"{LABEL}.plist"
+    if path.is_symlink():
+        raise DaemonError("daemon_file_not_owned")
     if path.exists():
         try:
             if _fingerprint(path) != _fingerprint_of_text(text):
@@ -1040,6 +1226,7 @@ def cli_daemon(argv):
             check_daemon_file(path, receipt["files"][key], expected_uid)
         with contextlib.suppress(DaemonError):
             DaemonIPCClient(SOCKET_PATH, timeout=1.5).stop_takeover()
+        _bootout_user_agent()
         helper = _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
                               "uninstall-root"])
         if "error" in helper:
@@ -1067,17 +1254,55 @@ def cli_daemon(argv):
     return 2
 
 
+def _launchctl_ok(result):
+    if result.returncode == 0:
+        return True
+    text = result.stderr or ""
+    return any(token in text for token in ("already", "not loaded", "No such", "not found"))
+
+
 def _root_control(action):
-    """euid-0 helpers for start/stop without touching the plist."""
+    """euid-0 helpers for start/stop without rewriting the plist.
+
+    ``stop`` bootouts the job, so ``start`` cannot assume kickstart still has
+    a loaded service. A reload after ``nmd update`` is stop && start: start
+    bootstraps the installed plist when kickstart says it is not loaded.
+    """
     if os.geteuid() != 0:
         raise DaemonError("root_required")
-    argv = {"start": ["/bin/launchctl", "kickstart", "-k", f"system/{LABEL}"],
-            "stop": ["/bin/launchctl", "bootout", f"system/{LABEL}"]}[action]
-    result = subprocess.run(argv, capture_output=True, text=True)
-    if result.returncode != 0 and "already" not in (result.stderr or "") \
-            and "not loaded" not in (result.stderr or "") and "No such" not in (result.stderr or ""):
-        raise DaemonError(f"launchctl_{action}_failed")
-    return {"result": action}
+    if action == "stop":
+        result = subprocess.run(["/bin/launchctl", "bootout", f"system/{LABEL}"],
+                                capture_output=True, text=True)
+        if not _launchctl_ok(result):
+            raise DaemonError("launchctl_stop_failed")
+        return {"result": "stop"}
+    if action != "start":
+        raise DaemonError("invalid_command")
+    kick = subprocess.run(["/bin/launchctl", "kickstart", "-k", f"system/{LABEL}"],
+                          capture_output=True, text=True)
+    if kick.returncode == 0:
+        return {"result": "start"}
+    plist = ROOT_PLIST_DIR / f"{LABEL}.plist"
+    if not plist.is_file() or plist.is_symlink():
+        raise DaemonError("launchctl_start_failed")
+    boot = subprocess.run(["/bin/launchctl", "bootstrap", "system", str(plist)],
+                          capture_output=True, text=True)
+    if not _launchctl_ok(boot):
+        raise DaemonError("launchctl_start_failed")
+    again = subprocess.run(["/bin/launchctl", "kickstart", "-k", f"system/{LABEL}"],
+                           capture_output=True, text=True)
+    if again.returncode != 0:
+        raise DaemonError("launchctl_start_failed")
+    return {"result": "start"}
+
+
+def _bootout_user_agent():
+    """Best-effort unload of the user LaunchAgent. Missing launchctl is fine."""
+    try:
+        subprocess.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+                       capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def cli_root_helper(argv):
@@ -1159,9 +1384,16 @@ def main(argv=None):
         check_private_config(config_path)
         state_dir = Path(state_dir if config["takeover"]["state_dir"] is None
                          else config["takeover"]["state_dir"])
+        # launchd does not set SUDO_USER, and sudo's HOME is /var/root.
+        # The account that owns the config is the one whose geodata we copy.
+        try:
+            owner_uid = os.lstat(config_path).st_uid
+        except OSError as exc:
+            raise DaemonError("config_unreadable") from exc
         stopped = threading.Event()
         _install_signal_stop(stopped)
-        RootSupervisor(config, state_dir).run(stopped)
+        RootSupervisor(config, state_dir,
+                       geodata_dir=macos_takeover.geodata_dir_for_uid(owner_uid)).run(stopped)
         return 0
     if argv[0] == "run-user":
         config_path = None
