@@ -1524,6 +1524,35 @@ class PowerAndSentinelTests(unittest.TestCase):
         self.assertEqual(unknown["action"], "rollback")
         self.assertIn("dns_unknown", unknown["reasons"])
         self.assertIn("proxy_unknown", unknown["reasons"])
+        self.assertIsNone(unknown["proxy"]["live_enabled"])
+        off = {"HTTP": False, "HTTPS": False, "SOCKS": False}
+        same = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True,
+            observed=dict(healthy, proxy_enabled=off, proxy_status="observed"),
+            expected_proxy={}, expected_proxy_status="observed")
+        self.assertEqual(same["action"], "continue")
+        self.assertEqual(same["reasons"], [])
+        self.assertEqual(same["proxy"]["expected_enabled"], {})
+        self.assertEqual(same["proxy"]["live_enabled"], off)
+        self.assertNotIn("bypass", same["proxy"])
+        turned_on = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True,
+            observed=dict(healthy, proxy_enabled={"HTTP": True}, proxy_status="observed"),
+            expected_proxy={"HTTP": False}, expected_proxy_status="observed")
+        self.assertEqual(turned_on["reasons"], ["proxy_drift"])
+        self.assertEqual(turned_on["proxy"]["live_enabled"], {"HTTP": True})
+        no_baseline = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True, observed=healthy,
+            expected_proxy=None, expected_proxy_status="unavailable",
+            expected_proxy_reason="command_failed")
+        self.assertEqual(no_baseline["reasons"], ["proxy_unknown"])
+        self.assertEqual(no_baseline["proxy"]["expected_reason"], "command_failed")
+        self.assertIsNone(mod.expected_proxy_from_snapshot({
+            "proxy": {"status": "observed", "protocols": {"HTTP": {"server": "127.0.0.1"}}}}))
+        self.assertEqual(mod.expected_proxy_from_snapshot({
+            "proxy": {"status": "observed", "protocols": {}}}), {})
+        self.assertIsNone(mod.proxy_enabled_names(None))
+        self.assertEqual(mod.proxy_enabled_names(off), [])
 
     def test_sentinel_restores_the_pinned_exit_when_the_watchdog_dies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1839,8 +1868,96 @@ class PowerAndSentinelTests(unittest.TestCase):
             arm_watchdog=self._arm)
         self.assertEqual(record["result"], "wake_restore")
         self.assertIn("proxy_drift", record["wake"]["reasons"])
+        self.assertEqual(record["wake"]["proxy"]["expected_enabled"], {})
+        self.assertEqual(record["wake"]["proxy"]["live_enabled"], {"HTTP": True})
+        self.assertNotIn("127.0.0.1", json.dumps(record["wake"]))
+        self.assertNotIn("bypass", record["wake"]["proxy"])
         self.assertNotIn("proxy", json.dumps(table.mutations))
         self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+
+    def test_explicit_disable_on_wake_is_not_a_proxy_change(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        clocks = {"wall": 10_000.0}
+        jumps = {"n": 0}
+
+        def wall():
+            return clocks["wall"]
+
+        def sleeping(_seconds):
+            table.clock += 1
+            jumps["n"] += 1
+            if jumps["n"] == 1:
+                clocks["wall"] += 15
+                table.proxy_text = (
+                    "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n"
+                    "  SOCKSEnable : 0\n  FTP passive : 1\n}\n")
+            else:
+                clocks["wall"] += 600
+                table.dns_dirty_window = None
+
+        record = TakeoverFlowTests().record(
+            table, minutes=10, wall=wall, sleep=sleeping, external_rollback=True,
+            arm_watchdog=self._arm)
+        self.assertEqual(record["result"], "deadline_reached")
+        self.assertIn("wake:continue", record["steps"])
+        self.assertNotIn("wake:restore", record["steps"])
+        self.assertEqual(record["wake"]["action"], "continue")
+        self.assertEqual(record["wake"]["proxy"]["expected_enabled"], {})
+        self.assertEqual(
+            record["wake"]["proxy"]["live_enabled"],
+            {"HTTP": False, "HTTPS": False, "SOCKS": False})
+        self.assertNotIn("bypass", json.dumps(record["wake"]))
+
+    def test_failed_or_flagless_proxy_read_is_unknown_not_disabled(self):
+        def runner(argv, _timeout):
+            argv = tuple(argv)
+            if argv == ("/usr/sbin/scutil", "--proxy"):
+                return 0, "not a proxy document\n", None
+            if argv == ("/usr/sbin/scutil", "--dns"):
+                return 0, "DNS configuration\n", None
+            if argv[:4] == ("/usr/sbin/netstat", "-rn", "-f", "inet"):
+                return 0, "Destination Gateway Flags Netif Expire\ndefault 192.0.2.1 UGScg en0\n", None
+            return 0, "", None
+
+        observed = mod.observe_takeover_state(runner, tailscale_path=None)
+        self.assertIsNone(observed["proxy_enabled"])
+        self.assertEqual(observed["proxy_status"], "unknown")
+        self.assertEqual(observed["proxy_reason"], "invalid_proxy_output")
+
+        def flagless(argv, _timeout):
+            argv = tuple(argv)
+            if argv == ("/usr/sbin/scutil", "--proxy"):
+                return 0, "<dictionary> {\n  HTTPProxy : 127.0.0.1\n  HTTPPort : 8080\n}\n", None
+            return runner(argv, _timeout)
+
+        observed = mod.observe_takeover_state(flagless, tailscale_path=None)
+        self.assertIsNone(observed["proxy_enabled"])
+        self.assertEqual(observed["proxy_status"], "unknown")
+        self.assertEqual(observed["proxy_reason"], "proxy_flags_unreadable")
+        odd = macos_prepare._parse_scutil_proxy(
+            0, "<dictionary> {\n  HTTPEnable : 2\n}\n", None)
+        self.assertEqual(odd["status"], "observed")
+        self.assertIsNone(mod.proxy_enabled_map(odd))
+        decision = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True,
+            observed={"has_198_18": True, "exit_cleared": True,
+                      "default_route_present": True, "proxy_enabled": None,
+                      "proxy_status": "unknown", "proxy_reason": "proxy_flags_unreadable"},
+            expected_proxy={}, expected_proxy_status="observed")
+        self.assertEqual(decision["reasons"], ["proxy_unknown"])
+        self.assertIsNone(decision["proxy"]["live_enabled"])
+        self.assertNotIn("127.0.0.1", json.dumps(decision))
+
+        def failed(argv, _timeout):
+            argv = tuple(argv)
+            if argv == ("/usr/sbin/scutil", "--proxy"):
+                return 1, "", None
+            return runner(argv, _timeout)
+
+        observed = mod.observe_takeover_state(failed, tailscale_path=None)
+        self.assertIsNone(observed["proxy_enabled"])
+        self.assertEqual(observed["proxy_status"], "unavailable")
+        self.assertEqual(observed["proxy_reason"], "command_failed")
 
     def test_a_healthy_wake_keeps_the_absolute_wall_deadline(self):
         table = Table(dns_dirty_window=(1, 10 ** 9))

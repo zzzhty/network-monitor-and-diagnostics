@@ -397,8 +397,21 @@ def classify_power_gap(previous_wall, wall, previous_mono, mono, *,
     return None
 
 
+_PROXY_STATUSES = frozenset({"observed", "unavailable", "unknown"})
+_PROXY_REASONS = frozenset({
+    "command_failed", "read_failed", "invalid_proxy_output",
+    "proxy_flags_unreadable", "timeout", "unavailable",
+})
+
+
 def proxy_enabled_map(proxy):
-    """Protocol name to enabled flag. Missing or unparsed input is None."""
+    """Protocol name to enabled flag from an observed proxy document.
+
+    ``None`` means the document cannot be trusted: it is not a dict,
+    ``protocols`` is not a dict, or any protocol row has no boolean
+    ``enabled``. An empty dict means the read succeeded and named no
+    protocol. A missing row is not stored as ``False``.
+    """
     if not isinstance(proxy, dict):
         return None
     protocols = proxy.get("protocols")
@@ -406,28 +419,82 @@ def proxy_enabled_map(proxy):
         return None
     found = {}
     for name, row in protocols.items():
-        if isinstance(row, dict) and isinstance(row.get("enabled"), bool):
-            found[str(name)] = row["enabled"]
+        if not isinstance(name, str) or not name or not isinstance(row, dict):
+            return None
+        enabled = row.get("enabled")
+        if not isinstance(enabled, bool):
+            return None
+        found[name] = enabled
     return found
 
 
+def proxy_enabled_names(mapping):
+    """Sorted names that are on. ``None`` if the map itself is unusable."""
+    if not isinstance(mapping, dict):
+        return None
+    names = []
+    for name, enabled in mapping.items():
+        if not isinstance(name, str) or not isinstance(enabled, bool):
+            return None
+        if enabled:
+            names.append(name)
+    names.sort()
+    return names
+
+
+def _proxy_token(value, allowed):
+    if value is None:
+        return None
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "unspecified"
+
+
 def expected_proxy_from_snapshot(snapshot):
-    """The pre-takeover proxy flags, or None when the snapshot did not observe them."""
+    """The pre-takeover proxy flags, or None when they were not observed.
+
+    An observed document with no protocol rows is ``{}``. A document that
+    says observed but has a protocol row without a boolean ``enabled`` is
+    ``None``: that is not an empty disabled map.
+    """
     if not isinstance(snapshot, dict):
         return None
     proxy = snapshot.get("proxy")
     if not isinstance(proxy, dict) or proxy.get("status") != "observed":
         return None
-    mapped = proxy_enabled_map(proxy)
-    return mapped if mapped is not None else {}
+    return proxy_enabled_map(proxy)
+
+
+def _snapshot_proxy_meta(snapshot):
+    proxy = snapshot.get("proxy") if isinstance(snapshot, dict) else None
+    if not isinstance(proxy, dict):
+        return None, None
+    return (_proxy_token(proxy.get("status"), _PROXY_STATUSES),
+            _proxy_token(proxy.get("reason"), _PROXY_REASONS))
+
+
+def _proxy_wake_evidence(expected, live, observed, expected_status, expected_reason):
+    """Bool maps and status tokens only. No servers, ports, or bypass values."""
+    observed = observed if isinstance(observed, dict) else {}
+    return {
+        "expected_status": _proxy_token(expected_status, _PROXY_STATUSES),
+        "expected_reason": _proxy_token(expected_reason, _PROXY_REASONS),
+        "expected_enabled": dict(expected) if isinstance(expected, dict) else None,
+        "live_status": _proxy_token(observed.get("proxy_status"), _PROXY_STATUSES),
+        "live_reason": _proxy_token(observed.get("proxy_reason"), _PROXY_REASONS),
+        "live_enabled": dict(live) if isinstance(live, dict) else None,
+    }
 
 
 def wake_decision(*, woke, deadline_due, mihomo_alive, observed,
-                  expected_proxy, require_native_dns=True):
+                  expected_proxy, require_native_dns=True,
+                  expected_proxy_status=None, expected_proxy_reason=None):
     """Continue only when the managed takeover still matches the cutover.
 
-    System proxy is compared and never written. A drift is a reason to restore
-    exit node, DNS, and our mihomo through the existing rollback. An absolute
+    System proxy is compared and never written. Drift is a change in which
+    protocols are enabled. After a successful read, a missing protocol and an
+    explicit ``False`` are the same: nothing is on. A failed, non-dictionary,
+    or flag-less read is ``proxy_unknown`` and still restores. An absolute
     deadline that has already passed is a rollback even when the state looks
     fine. ``require_native_dns`` is false while native DNS is still coming up.
     """
@@ -455,14 +522,17 @@ def wake_decision(*, woke, deadline_due, mihomo_alive, observed,
     elif default_route is not True:
         reasons.append("default_route_missing")
     live_proxy = observed.get("proxy_enabled")
-    if expected_proxy is not None:
-        if live_proxy is None:
-            reasons.append("proxy_unknown")
-        elif live_proxy != expected_proxy:
-            reasons.append("proxy_drift")
+    expected_names = proxy_enabled_names(expected_proxy)
+    live_names = proxy_enabled_names(live_proxy)
+    if expected_names is None or live_names is None:
+        reasons.append("proxy_unknown")
+    elif expected_names != live_names:
+        reasons.append("proxy_drift")
+    evidence = _proxy_wake_evidence(
+        expected_proxy, live_proxy, observed, expected_proxy_status, expected_proxy_reason)
     if reasons:
-        return {"action": "rollback", "reasons": reasons}
-    return {"action": "continue", "reasons": []}
+        return {"action": "rollback", "reasons": reasons, "proxy": evidence}
+    return {"action": "continue", "reasons": [], "proxy": evidence}
 
 
 # --- path trust --------------------------------------------------------------
@@ -993,14 +1063,24 @@ def observe_takeover_state(runner, *, tailscale_path):
         has_198_18 = macos_prepare._parse_scutil_dns(0, text, None).get("has_198_18")
 
     proxy_enabled = None
+    proxy_status = "unavailable"
+    proxy_reason = "read_failed"
     try:
         code, text = read_state(["/usr/sbin/scutil", "--proxy"], runner=runner)
     except TakeoverError:
-        code, text = None, ""
-    if code == 0:
-        parsed = macos_prepare._parse_scutil_proxy(0, text, None)
-        if parsed.get("status") == "observed":
-            proxy_enabled = proxy_enabled_map(parsed) or {}
+        code = None
+    else:
+        if code != 0:
+            proxy_reason = "command_failed"
+        else:
+            parsed = macos_prepare._parse_scutil_proxy(0, text, None)
+            proxy_status = parsed.get("status") if isinstance(parsed.get("status"), str) else "unknown"
+            proxy_reason = parsed.get("reason") if isinstance(parsed.get("reason"), str) else None
+            if proxy_status == "observed":
+                proxy_enabled = proxy_enabled_map(parsed)
+                if proxy_enabled is None:
+                    proxy_status = "unknown"
+                    proxy_reason = "proxy_flags_unreadable"
 
     default_route_present = None
     try:
@@ -1024,7 +1104,9 @@ def observe_takeover_state(runner, *, tailscale_path):
             exit_cleared = not exit_id and exit_ip is None
     return {"has_198_18": has_198_18, "exit_cleared": exit_cleared,
             "default_route_present": default_route_present,
-            "proxy_enabled": proxy_enabled}
+            "proxy_enabled": proxy_enabled,
+            "proxy_status": _proxy_token(proxy_status, _PROXY_STATUSES),
+            "proxy_reason": _proxy_token(proxy_reason, _PROXY_REASONS)}
 
 
 def assess_managed_takeover(state_dir, snapshot_name, *, runner, tailscale_path,
@@ -1044,10 +1126,12 @@ def assess_managed_takeover(state_dir, snapshot_name, *, runner, tailscale_path,
         if observed.get("has_198_18") is None:
             reasons.append("dns_unknown")
         return {"action": "rollback", "reasons": reasons}
+    expected_status, expected_reason = _snapshot_proxy_meta(snapshot)
     return wake_decision(
         woke=True, deadline_due=False, mihomo_alive=mihomo_alive,
         observed=observed, expected_proxy=expected_proxy_from_snapshot(snapshot),
-        require_native_dns=require_native_dns)
+        require_native_dns=require_native_dns,
+        expected_proxy_status=expected_status, expected_proxy_reason=expected_reason)
 
 
 def _read_regular(path, limit):

@@ -344,7 +344,23 @@ sudo ./nmd macos accept --inputs /PATH/TO/inputs.json \
   --geodata-dir /PATH/TO/isolated-geodata-copy
 ```
 
-`1b8cc38` 上的两分钟 accept 已在实机跑过。截止后的自动回退，以及随后的手动 rollback，都停在 `tailscale set --exit-node=<StableNodeID>`：官方 CLI 1.104.6 只接受 IP、基名或 `auto:any`，空字符串才是清除。清除本身在同一条 sudo 路径上成功过。当时 stderr 被丢掉，用户只看见 `mutation_failed`，后面的恢复步骤没有继续。上面的修正把参数改成对端 IP 或基名，并在失败时留下原因。这次修正还没有在实机复跑。离线测试覆盖握手前零变更、控制器消失、deadline、取消、部分失败、重复回退、身份不符、ready 未知、exit node 必须用 CLI 接受的参数恢复、watchdog 异常退出时 sentinel 回退，以及注入时钟下的唤醒复查。不启用常驻切网，不安装 launchd，不改 `on_boot`。睡眠唤醒有了离线行为，还没有实机验收。
+`1b8cc38` 上的两分钟 accept 已在实机跑过。截止后的自动回退，以及随后的手动 rollback，都停在 `tailscale set --exit-node=<StableNodeID>`：官方 CLI 1.104.6 只接受 IP、基名或 `auto:any`，空字符串才是清除。清除本身在同一条 sudo 路径上成功过。当时 stderr 被丢掉，用户只看见 `mutation_failed`，后面的恢复步骤没有继续。上面的修正把参数改成对端 IP 或基名，并在失败时留下原因。这次修正还没有在实机复跑。离线测试覆盖握手前零变更、控制器消失、deadline、取消、部分失败、重复回退、身份不符、ready 未知、exit node 必须用 CLI 接受的参数恢复、watchdog 异常退出时 sentinel 回退，以及注入时钟下的唤醒复查。不启用常驻切网，不安装 launchd，不改 `on_boot`。睡眠唤醒有了离线行为。下面的实机记录不是通过：`sleep_wake_verified` 仍是 false，常驻 residency 没有测。
+
+### 2026-11-18 实机记录（`b83d27a`）
+
+已观察，不是假设：
+
+- 23:38:55（Asia/Shanghai）杀掉 watchdog 和控制器之后，只剩 sentinel。结果 `trigger` 为 `watchdog_dead`，steps 非空，没有 `rollback-watch-result.json`。网络回到 `utun5` 上的 `vm-vmiss`，没有残留测试进程。`guarantees_restore_if_watchdog_dies` 仍是 false：watchdog 和 sentinel 一起死的情况没有覆盖。
+- 23:54:18 开始 accept，绝对截止 23:56:18。`pmset -g log` 和 `log show` 的 powerd 记录：23:54:24 因 Software Sleep（pid 21904）进入睡眠，23:54:44 从 Deep Idle（rtc/HID）唤醒，这个窗口里没有 DarkWake。睡眠发生时 mihomo 已就绪（scutil DNS 里有 198.18）。23:54:59 控制器以 `wake_restore` / `rollback_restored` 退出，`wake.reasons` 只有 `proxy_drift`。随后网络回到 `utun5` / `vm-vmiss`，系统代理关闭，MagicDNS 在，测试进程清掉，生产 run-user 没有被动过。
+- 快照 `pre-start-20261118T155418Z.json` 模式 0600。`proxy.status` 为 `observed`，`protocols` 为 `{}`，`bypass` 为 `[]`（空内容的 sha256 前 16 位是 `e3b0c44298fc1c14`）。顶层键是 bypass、protocols、reason、status。对应的 enabled 表是 `{}`。
+- `takeover-20261118T155459Z.json` 的 `wake` 只有 `action=rollback` 和 `reasons=['proxy_drift']`，没有当时的 expected/live 表。`restore_sentinel_armed` 为 true。
+- 23:59:26，也就是回退大约五分钟之后，再读 `scutil --proxy` 只有 `FTP passive : 1`，没有 `*Enable` 键，enabled 表是 `{}`。三个接口的 networksetup HTTP/HTTPS/SOCKS/自动代理都是 Enabled: No。这不是 23:54:59 那次判定用的读数。
+
+代码能确定的只有这些：当时 `proxy_drift` 只在两边的表都不是未知、而且用整表 `!=` 比不相等时出现。快照的表是 `{}`，所以判定当时的现场表是另一个字典。现场表本身没有留下来。
+
+未证实，不能当成原因：现场表可能是一组显式 `Enable : 0`（和缺键一样，没有协议在启用），也可能是一次短暂的 `Enable : 1`，到 23:59:26 已经消失，也可能是解析出了没有布尔标志的行。这三种都会在旧比较里走出不同的路，现有文件分不开。这次睡眠验收因此不算通过。
+
+这次代码改的是比较本身，不是补写当时的现场表：成功读到的缺键和显式 false 都不当成启用变化；读失败或标志不可读仍是 `proxy_unknown` 并回退。新的 `wake.proxy` 会留下两边的布尔表。要在新的 head 上再做一次真睡眠才能验收，常驻 residency 也还没有测。
 
 ## 回退约束
 
@@ -354,10 +370,10 @@ Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前�
 - 绝对截止时间。短测 10 分钟，过夜最长 8 小时，到期不续期。截止按墙钟，睡眠不把会话延长
 - STOP 或到期都回退。只结束自己的进程
 - 清掉 native 动态 DNS 后，确认 scutil 里不再有 198.18，再恢复原来的 Tailscale exit node、allow-lan、accept-dns 和网卡 DNS
-- 不改系统代理，也不改 bypass。代理相对快照的漂移只触发托管状态回退，不写代理
+- 不改系统代理，也不改 bypass。比较的是已经启用的协议。一次成功的 `scutil --proxy` 里，缺键和显式 `Enable : 0` 都表示没有启用；读失败、输出不是 dictionary，或某一行没有布尔 `enabled`，记 `proxy_unknown` 并回退，不把它们当成 false。真正从关到开、或从开到关，仍是 `proxy_drift`。唤醒记录只留两边的 enabled 布尔表和 status/reason，不写服务器、端口或 bypass
 - 连续 3 次关键故障才回退
 - 不自愈循环，不安装 daemon 或自动启动，不改电源设置
-- 睡眠唤醒之后仍按绝对截止时间计算。唤醒后重读 native DNS、IPv4 默认路由、exit node 和 scutil proxy；托管状态仍正确就继续，不对就按 pin 回退
+- 睡眠唤醒之后仍按绝对截止时间计算。唤醒后重读 native DNS、IPv4 默认路由、exit node 和 scutil proxy；托管状态仍正确就继续，不对就按 pin 回退。`takeover-*.json` 的 `wake.proxy` 只含 enabled 布尔表和 status/reason
 - 不保证 watchdog 自己死掉之后一定能恢复：sentinel 还活着时会回退，sentinel 也死掉则没有保证
 - 不保证 watchdog 和采样进程都被杀掉之后还能恢复
 
@@ -369,7 +385,7 @@ Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前�
 
 1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
 2. 只读采集在 `4044472` 上做过一次部分验收；代理交叉读取还没有复跑。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
-3. 睡眠唤醒的实机验收。代码会在墙钟相对单调钟向前跳时复查或回退，CI 用注入时钟和注入观测覆盖这条路径。这不能代替一次真正的睡眠和唤醒：还要在真 Mac 上，于 accept 会话中和常驻 residency 中睡眠再唤醒，核对路由、DNS、系统代理（只观察、不写回）和 exit node。`sleep_wake_verified` 仍是 false。
+3. 睡眠唤醒的实机验收。2026-11-18 的那次睡眠是真的，但控制器因 `proxy_drift` 回退，而判定当时的代理表没有留下，所以不算通过。CI 仍只覆盖注入时钟。还要在写入 `wake.proxy` 的新 head 上，于 accept 会话中和常驻 residency 中再睡眠再唤醒，核对路由、DNS、系统代理（只观察、不写回）和 exit node。`sleep_wake_verified` 仍是 false。常驻 residency 还没有测。
 4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
 5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。
 

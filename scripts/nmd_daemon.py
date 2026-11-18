@@ -830,11 +830,14 @@ class RootSupervisor:
             self.runner, tailscale_path=self.tailscale)
         if snapshot is None:
             return {"action": "rollback", "reasons": ["snapshot_unreadable"]}
+        expected_status, expected_reason = macos_takeover._snapshot_proxy_meta(snapshot)
         return macos_takeover.wake_decision(
             woke=True, deadline_due=False, mihomo_alive=mihomo_alive,
             observed=observed,
             expected_proxy=macos_takeover.expected_proxy_from_snapshot(snapshot),
-            require_native_dns=require_native_dns)
+            require_native_dns=require_native_dns,
+            expected_proxy_status=expected_status,
+            expected_proxy_reason=expected_reason)
 
     def _on_wake_locked(self):
         """Re-validate or restore. Never starts a takeover and never changes on_boot."""

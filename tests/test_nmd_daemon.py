@@ -921,7 +921,11 @@ class WakeResidencyTests(unittest.TestCase):
         before = len(table.mutations)
         clocks["wall"] += 25
         decision = sup.observe_power()
-        self.assertEqual(decision, {"action": "continue", "reasons": []})
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reasons"], [])
+        self.assertEqual(decision["proxy"]["expected_enabled"], {})
+        self.assertEqual(decision["proxy"]["live_enabled"], {})
+        self.assertNotIn("bypass", decision["proxy"])
         self.assertTrue(sup.status()["takeover_active"])
         self.assertEqual(len(table.mutations), before)
         self.assertFalse(sup.status()["on_boot"])
