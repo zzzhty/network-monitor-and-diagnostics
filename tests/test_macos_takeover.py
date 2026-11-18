@@ -56,13 +56,15 @@ class Table:
         self.fail_mutations = fail_mutations
         self.process_alive = process_alive
         self.clock = 0.0
+        self.proxy_text = "<dictionary> {\n}\n"
+        self.route_text = ("Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
+                           "default 192.0.2.1 UGScg en0\n")
 
     # -- read-only side ------------------------------------------------------
     def runner(self, argv, timeout):
         argv = tuple(argv)
         if argv == ("/usr/sbin/netstat", "-rn", "-f", "inet"):
-            return 0, ("Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
-                       "default 192.0.2.1 UGScg en0\n"), None
+            return 0, self.route_text, None
         if argv == ("/usr/sbin/netstat", "-rn", "-f", "inet6"):
             return 0, "Routing tables\n\nInternet6:\n", None
         if argv == ("/usr/sbin/scutil", "--dns"):
@@ -70,7 +72,7 @@ class Table:
             dirty = window is not None and window[0] <= self.clock < window[1]
             return 0, DNS_DIRTY if dirty else DNS_CLEAN, None
         if argv == ("/usr/sbin/scutil", "--proxy"):
-            return 0, "<dictionary> {\n}\n", None
+            return 0, self.proxy_text, None
         if argv == ("/bin/ps", "-axo", "pid=,comm="):
             body = "  1 /sbin/launchd\n"
             if self.ps_mihomo:
@@ -1462,6 +1464,332 @@ class CLITests(unittest.TestCase):
         with patch.object(manager.nmd_platform, "name", return_value="linux"):
             with self.assertRaises(SystemExit):
                 manager.main(["macos", "rollback"])
+
+
+class PowerAndSentinelTests(unittest.TestCase):
+    """Watchdog death and sleep/wake. Clocks and observations are injected.
+
+    Nothing here sleeps a Mac or touches a live network. ``sleep_wake_verified``
+    stays false for that reason.
+    """
+
+    def write_snapshot(self, state, **kwargs):
+        return RollbackTests.write_snapshot(self, state, **kwargs)
+
+    def _rollback(self, table):
+        def rollback_fn(state_dir, snapshot_name=None):
+            return mod.rollback(
+                state_dir, snapshot_name=snapshot_name, runner=table.runner,
+                mutator=table.mutator, sleep=lambda _seconds: None, now=lambda: 0.0,
+                tailscale_path=TS)
+        return rollback_fn
+
+    def _arm(self, state, pin, _deadline):
+        return {"ready": True, "pid": 1, "pgid": 2, "pin": pin, "sentinel_ready": True}
+
+    def test_power_gap_is_wake_only_when_wall_time_runs_ahead(self):
+        self.assertIsNone(mod.classify_power_gap(0, 20, 0, 20))
+        self.assertEqual(mod.classify_power_gap(0, 30, 0, 1), "wake")
+        self.assertEqual(mod.classify_power_gap(100, 90, 0, 1), "clock_step")
+        self.assertIsNone(mod.classify_power_gap(0, 1.5, 0, 0))
+        self.assertIsNone(mod.classify_power_gap("nope", 1, 0, 0))
+
+    def test_wake_decision_restores_broken_managed_state_and_keeps_a_good_one(self):
+        healthy = {"has_198_18": True, "exit_cleared": True,
+                   "default_route_present": True, "proxy_enabled": {}}
+        self.assertEqual(mod.wake_decision(
+            woke=False, deadline_due=False, mihomo_alive=True, observed=healthy,
+            expected_proxy={})["action"], "continue")
+        self.assertEqual(mod.wake_decision(
+            woke=True, deadline_due=True, mihomo_alive=True, observed=healthy,
+            expected_proxy={})["reasons"], ["deadline_reached"])
+        broken = dict(healthy, has_198_18=False, exit_cleared=False,
+                      default_route_present=False, proxy_enabled={"HTTP": True})
+        reasons = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=False, observed=broken,
+            expected_proxy={})["reasons"]
+        for reason in ("mihomo_not_alive", "native_dns_missing", "exit_node_not_cleared",
+                       "default_route_missing", "proxy_drift"):
+            self.assertIn(reason, reasons)
+        starting = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True,
+            observed=dict(healthy, has_198_18=False), expected_proxy={},
+            require_native_dns=False)
+        self.assertEqual(starting["action"], "continue")
+        unknown = mod.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=True,
+            observed={"has_198_18": None, "exit_cleared": None,
+                      "default_route_present": None, "proxy_enabled": None},
+            expected_proxy={})
+        self.assertEqual(unknown["action"], "rollback")
+        self.assertIn("dns_unknown", unknown["reasons"])
+        self.assertIn("proxy_unknown", unknown["reasons"])
+
+    def test_sentinel_restores_the_pinned_exit_when_the_watchdog_dies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state)
+            mod.write_pin(state, pinned.name)
+            (state / "pre-start-20261118T000000Z.json").write_text(json.dumps({
+                "schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
+                "tailscale": {"prefs": {"status": "observed", "ExitNodeID": "nodekey:evil",
+                                         "ExitNodeIP": None, "CorpDNS": True, "RouteAll": False,
+                                         "ExitNodeAllowLANAccess": False, "WantRunning": True}},
+                "dns": {"services": []}}), encoding="utf-8")
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            table.service_dns["Wi-Fi"] = []
+            result = mod.run_restore_sentinel(
+                state, pin=pinned.name, deadline_unix=10 ** 12, watchdog_pid=4242,
+                parent_pid=7, now=lambda: 0, sleep=lambda _seconds: None,
+                alive=lambda _pid: False, rollback_fn=self._rollback(table))
+            self.assertEqual(result["trigger"], "watchdog_dead")
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertFalse(result["guarantees_restore_if_watchdog_dies"])
+            self.assertFalse(mod.GUARANTEES_RESTORE_IF_WATCHDOG_DIES)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+            rendered = json.dumps(table.mutations)
+            self.assertNotIn("nodekey:", rendered)
+            self.assertNotIn("auto:any", rendered)
+            self.assertEqual((state / mod.SENTINEL_RESULT_FILE).is_file(), True)
+
+    def test_sentinel_does_not_mutate_after_the_watchdog_already_restored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state)
+            mod.write_pin(state, pinned.name)
+            (state / mod.WATCH_RESULT_FILE).write_text(
+                json.dumps({"result": "rollback_restored"}), encoding="utf-8")
+
+            def boom(*_args, **_kwargs):
+                raise AssertionError("rollback")
+
+            result = mod.run_restore_sentinel(
+                state, pin=pinned.name, deadline_unix=50, watchdog_pid=4242,
+                parent_pid=7, now=lambda: 0, sleep=lambda _seconds: None,
+                alive=lambda _pid: False, rollback_fn=boom)
+            self.assertEqual(result["trigger"], "watchdog_restored")
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertFalse(result["guarantees_restore_if_watchdog_dies"])
+
+    def test_sentinel_takes_over_when_the_watchdog_stays_silent_past_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state, services=(("Wi-Fi", []),))
+            mod.write_pin(state, pinned.name)
+            table = Table(services=(("Wi-Fi", []),))
+            table.exit_node_cleared = True
+            clock = {"now": 0}
+
+            def sleeping(_seconds):
+                clock["now"] = 10 + mod.SENTINEL_GRACE_SECONDS
+
+            result = mod.run_restore_sentinel(
+                state, pin=pinned.name, deadline_unix=10, watchdog_pid=4242,
+                parent_pid=7, now=lambda: clock["now"], sleep=sleeping,
+                alive=lambda _pid: True, rollback_fn=self._rollback(table))
+            self.assertEqual(result["trigger"], "watchdog_stuck")
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+            self.assertNotIn("nodekey:", json.dumps(table.mutations))
+
+    def test_controller_rolls_back_when_its_watchdog_dies_after_cutover(self):
+        table = Table()
+        dead = {"value": False}
+
+        def arm(state, pin, _deadline):
+            return {"ready": True, "pid": 4242, "pgid": 9, "pin": pin,
+                    "sentinel_ready": True}
+
+        def mutator(argv):
+            table.mutator(argv)
+            if list(argv[:3]) == [TS, "set", "--exit-node="]:
+                dead["value"] = True
+
+        def alive(_pid):
+            return not dead["value"]
+
+        with patch.object(mod, "_pid_alive", side_effect=alive):
+            record = TakeoverFlowTests().record(
+                table, external_rollback=True, arm_watchdog=arm, mutator=mutator)
+        self.assertEqual(record["result"], "watchdog_died")
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertTrue(record["restore_sentinel_armed"])
+        self.assertFalse(record["guarantees_restore_if_watchdog_dies"])
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+        rendered = json.dumps(table.mutations)
+        self.assertNotIn("nodekey:", rendered)
+        self.assertNotIn("auto:any", rendered)
+
+    def test_sentinel_not_ready_is_zero_change(self):
+        def arm(*_args):
+            return {"ready": False, "reason": "sentinel_not_ready"}
+
+        table = Table()
+        record = TakeoverFlowTests().record(
+            table, external_rollback=True, arm_watchdog=arm)
+        self.assertEqual(record["result"], "watchdog_not_ready")
+        self.assertEqual(record["restore_sentinel_armed"], False)
+        self.assertFalse(record["guarantees_restore_if_watchdog_dies"])
+        self.assertFalse(any(item[0] == TS for item in table.mutations))
+
+    def test_a_live_sentinel_blocks_another_accept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / mod.SENTINEL_READY_FILE).write_text(json.dumps({
+                "ready": True, "pid": os.getpid(), "pgid": 9, "euid": 0,
+                "pin": "pre-start-20260101T000000Z.json",
+                "deadline_unix": int(time.time()) + 120,
+            }), encoding="utf-8")
+            table = Table()
+            with self.assertRaisesRegex(mod.TakeoverError, "sentinel_conflict"):
+                mod.takeover(
+                    inputs=INPUTS, profile=PROFILE, minutes=1, mihomo_path=MIHOMO,
+                    state_dir=state, runner=table.runner, mutator=table.mutator,
+                    spawner=table.spawner, tcp=table.tcp, exists=lambda path: path == TS,
+                    sleep=table.sleep, now=lambda: table.clock, external_rollback=True,
+                    arm_watchdog=lambda *_args: (_ for _ in ()).throw(AssertionError("armed")))
+            self.assertEqual(table.mutations, [])
+
+    def test_arm_accepts_only_after_both_processes_are_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pin = "pre-start-20260101T000000Z.json"
+            stopped = []
+
+            class Child:
+                def __init__(self, pid, polls=None):
+                    self.pid = pid
+                    self._polls = polls
+
+                def poll(self):
+                    if self._polls:
+                        return self._polls.pop(0)
+                    return None
+
+                def wait(self, timeout=None):
+                    stopped.append(self.pid)
+                    return 0
+
+            def write_ready(path, pid):
+                path.write_text(json.dumps({
+                    "ready": True, "pid": pid, "pgid": pid, "euid": 0,
+                    "pin": pin, "deadline_unix": 80,
+                }), encoding="utf-8")
+
+            def spawn_watch(state_dir, _pin, _deadline):
+                write_ready(Path(state_dir) / mod.READY_FILE, 70)
+                return Child(70)
+
+            seen = {}
+
+            def spawn_sentinel(state_dir, _pin, _deadline, watchdog_pid):
+                seen["watchdog"] = watchdog_pid
+                write_ready(Path(state_dir) / mod.SENTINEL_READY_FILE, 71)
+                return Child(71)
+
+            probe = lambda pid: {"alive": True, "pgid": pid, "uid": 0}
+            with patch.object(mod.os, "kill", lambda *_args, **_kwargs: None):
+                armed = mod.arm_external_watchdog(
+                    state, pin, 80, spawn=spawn_watch, spawn_sentinel=spawn_sentinel,
+                    probe=probe, sleep=lambda _seconds: None, now=lambda: 0)
+            self.assertTrue(armed["ready"])
+            self.assertTrue(armed["sentinel_ready"])
+            self.assertEqual(seen["watchdog"], 70)
+            self.assertEqual(armed["sentinel_pid"], 71)
+            self.assertFalse(armed["guarantees_restore_if_watchdog_dies"])
+            self.assertEqual(stopped, [])
+
+            calls = {"n": 0}
+
+            def later():
+                calls["n"] += 1
+                return 0 if calls["n"] < 6 else 1000
+
+            def silent(*_args):
+                return Child(81)
+
+            with patch.object(mod.os, "kill", lambda *_args, **_kwargs: None):
+                failed = mod.arm_external_watchdog(
+                    state, pin, 80, spawn=spawn_watch, spawn_sentinel=silent,
+                    probe=probe, sleep=lambda _seconds: None, now=later)
+            self.assertFalse(failed["ready"])
+            self.assertEqual(failed["reason"], "sentinel_not_ready")
+            self.assertIn(70, stopped)
+            self.assertIn(81, stopped)
+
+    def test_wake_with_broken_dns_restores_the_exit_by_ip(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        clocks = {"wall": 2_000.0}
+
+        def wall():
+            return clocks["wall"]
+
+        def sleeping(_seconds):
+            table.clock += 0.1
+            clocks["wall"] += 30
+            table.dns_dirty_window = None
+
+        record = TakeoverFlowTests().record(
+            table, minutes=10, wall=wall, sleep=sleeping, external_rollback=True,
+            arm_watchdog=self._arm)
+        self.assertEqual(record["result"], "wake_restore")
+        self.assertIn("wake:restore", record["steps"])
+        self.assertIn("native_dns_missing", record["wake"]["reasons"])
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+        rendered = json.dumps(table.mutations)
+        self.assertNotIn("nodekey:", rendered)
+        self.assertNotIn("auto:any", rendered)
+        self.assertNotIn("proxy", rendered)
+        self.assertFalse(record["guarantees_restore_if_watchdog_dies"])
+
+    def test_proxy_drift_on_wake_restores_managed_state_without_writing_proxy(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        clocks = {"wall": 3_000.0}
+
+        def wall():
+            return clocks["wall"]
+
+        def sleeping(_seconds):
+            table.clock += 0.1
+            clocks["wall"] += 20
+            table.proxy_text = (
+                "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n"
+                "  HTTPPort : 8080\n}\n")
+            table.dns_dirty_window = None
+
+        record = TakeoverFlowTests().record(
+            table, minutes=10, wall=wall, sleep=sleeping, external_rollback=True,
+            arm_watchdog=self._arm)
+        self.assertEqual(record["result"], "wake_restore")
+        self.assertIn("proxy_drift", record["wake"]["reasons"])
+        self.assertNotIn("proxy", json.dumps(table.mutations))
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+
+    def test_a_healthy_wake_keeps_the_absolute_wall_deadline(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        clocks = {"wall": 10_000.0}
+        jumps = {"n": 0}
+
+        def wall():
+            return clocks["wall"]
+
+        def sleeping(_seconds):
+            table.clock += 1
+            jumps["n"] += 1
+            if jumps["n"] == 1:
+                clocks["wall"] += 15
+            else:
+                clocks["wall"] += 600
+                table.dns_dirty_window = None
+
+        record = TakeoverFlowTests().record(
+            table, minutes=10, wall=wall, sleep=sleeping, external_rollback=True,
+            arm_watchdog=self._arm)
+        self.assertEqual(record["result"], "deadline_reached")
+        self.assertIn("wake:continue", record["steps"])
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertLess(table.clock, 30)
 
 
 if __name__ == "__main__":

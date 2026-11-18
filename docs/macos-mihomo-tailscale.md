@@ -304,7 +304,11 @@ launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端�
 或启动时没记下启动时间时，不发信号。回退不删除 state 目录里已有的文件，
 也不删除 pin 和快照。管理器进程没了、身份对不上、或者 198.18 一直清不掉时，
 这次回退仍可能停在 `rollback_blocked_dirty_dns`；`ROLLBACK_POLICY` 里
-`guarantees_restore_if_watchdog_and_sampler_die` 仍是 false。
+`guarantees_restore_if_watchdog_dies` 和
+`guarantees_restore_if_watchdog_and_sampler_die` 都仍是 false。常驻 supervisor
+在墙钟相对单调钟向前跳时复查正在进行的接管：native DNS、IPv4 默认路由、exit
+node 或系统代理漂移不对，就按本次 pin 回退。直接或已经回退的阶段不会因此再开
+一轮接管，也不改 `on_boot`。系统代理仍然不写。这不是实机睡眠验收。
 
 ## 接管控制器（Phase B）
 
@@ -328,9 +332,11 @@ sudo nmd macos rollback --state-dir DIR
 
 `nmd macos accept` 是固定 2 分钟的短时入口。它不改变上面默认 10 分钟、最长 8 小时的 takeover，不加载、不安装 launchd，不改 `on_boot`，也不停止已经在跑的 run-user。`--state-dir` 必须指向这次的私有目录，不能是 `~/.local/state/nmd-monitor`。普通用户可以先准备 inputs 和这个目录；sudo 之后核对所有者、权限、祖先符号链接和路径，不从 PATH 找 sudo 或解释器。geodata 只复制普通文件。这次生成的配置把 `geo-auto-update` 写成 false，避免这两分钟里自动联网更新；其它生成路径和示例配置仍是 true。
 
-任何网络变更之前，一个已经是 root、且不在控制器进程组里的 deadline 进程必须写好 ready，并且 ready 里的 pin 就是变更前钉死的快照。watchdog 起不来、握手失败、或 ready 不是明确的 true，就零网络变更退出。控制器被杀掉后，这个进程仍按最初的 pin 调用现有 rollback。回退一开始先记下 engaged；控制器若还想继续清 exit node 或启动 mihomo，会在变更前停住。完成前用现有 rollback 核对恢复。身份对不上的 mihomo 不发信号。重复 rollback 仍是幂等。独立 watchdog 自己也死掉时，恢复没有保证，`guarantees_restore_if_watchdog_and_sampler_die` 保持 false。冲突只看 root supervisor 的 `/var/run/nmd-daemon.sock`：inode 存在或 `lstat` 失败就在改网络前退出。这个套接字由 root `supervise` 监听，不是 run-user 采集器创建的。只读的 user LaunchAgent、以及磁盘上有但未加载的 system plist，都不构成冲突，验收不会停它们。
+任何网络变更之前，一个已经是 root、且不在控制器进程组里的 deadline 进程必须写好 ready，并且 ready 里的 pin 就是变更前钉死的快照。同一个握手还要确认第二个独立进程 restore sentinel。watchdog 或 sentinel 起不来、握手失败、或 ready 不是明确的 true，就零网络变更退出。控制器被杀掉后，watchdog 仍按最初的 pin 调用现有 rollback。watchdog 在回退完成前退出（崩溃、被杀、异常退出，或过了宽限仍没有 `rollback_restored`）时，sentinel 用同一份 pin 调用现有 rollback。控制器若还活着，发现 watchdog 消失也会走这条回退。回退一开始先记下 engaged；控制器若还想继续清 exit node 或启动 mihomo，会在变更前停住。完成前用现有 rollback 核对恢复。身份对不上的 mihomo 不发信号。重复 rollback 仍是幂等。exit node 仍只按官方 CLI 接受的形式恢复：对端 Tailscale IP、MagicDNS 基名、快照里的 `exit_node_cli`，再不行用 prefs 的 ExitNodeIP。StableNodeID、node key 和 `auto:any` 不会传给 `tailscale set`。
 
-验证：读私有 state 里的 `rollback-watch-ready.json`、`rollback-pin.json`、`rollback-watch-result.json` 和 `takeover-*.json`。这些文件不包含 inputs。失败：进程非 0；握手没完成时没有 tailscale 或 networksetup 变更。取消：Ctrl-C，控制器回退，watchdog 发现父进程消失后再做一次幂等回退。回退：`nmd macos rollback --state-dir DIR`。清理：只删除这次的私有 state 目录。
+sentinel 自己也是一个普通进程。accept 不安装、不加载 LaunchDaemon，也没有进程外的 KeepAlive 会在 sentinel 死后把它拉起来。因此 watchdog 和 sentinel 一起死掉时恢复仍没有保证，`guarantees_restore_if_watchdog_dies` 保持 false，`guarantees_restore_if_watchdog_and_sampler_die` 也保持 false。冲突只看 root supervisor 的 `/var/run/nmd-daemon.sock`，以及这份 state 目录里仍在跑的 watchdog 或 sentinel。inode 存在或 `lstat` 失败就在改网络前退出。这个套接字由 root `supervise` 监听，不是 run-user 采集器创建的。只读的 user LaunchAgent、以及磁盘上有但未加载的 system plist，都不构成冲突，验收不会停它们。
+
+验证：读私有 state 里的 `rollback-watch-ready.json`、`rollback-sentinel-ready.json`、`rollback-pin.json`、`rollback-watch-result.json`、`rollback-sentinel-result.json` 和 `takeover-*.json`。这些文件不包含 inputs。失败：进程非 0；握手没完成时没有 tailscale 或 networksetup 变更。取消：Ctrl-C，控制器回退，watchdog 发现父进程消失后再做一次幂等回退。回退：`nmd macos rollback --state-dir DIR`。清理：只删除这次的私有 state 目录。
 
 ```bash
 sudo ./nmd macos accept --inputs /PATH/TO/inputs.json \
@@ -338,20 +344,21 @@ sudo ./nmd macos accept --inputs /PATH/TO/inputs.json \
   --geodata-dir /PATH/TO/isolated-geodata-copy
 ```
 
-`1b8cc38` 上的两分钟 accept 已在实机跑过。截止后的自动回退，以及随后的手动 rollback，都停在 `tailscale set --exit-node=<StableNodeID>`：官方 CLI 1.104.6 只接受 IP、基名或 `auto:any`，空字符串才是清除。清除本身在同一条 sudo 路径上成功过。当时 stderr 被丢掉，用户只看见 `mutation_failed`，后面的恢复步骤没有继续。上面的修正把参数改成对端 IP 或基名，并在失败时留下原因。这次修正还没有在实机复跑。离线测试覆盖握手前零变更、控制器消失、deadline、取消、部分失败、重复回退、身份不符、ready 未知，以及 exit node 必须用 CLI 接受的参数恢复。不启用常驻切网、sleep/wake、launchd 安装或 `on_boot`。
+`1b8cc38` 上的两分钟 accept 已在实机跑过。截止后的自动回退，以及随后的手动 rollback，都停在 `tailscale set --exit-node=<StableNodeID>`：官方 CLI 1.104.6 只接受 IP、基名或 `auto:any`，空字符串才是清除。清除本身在同一条 sudo 路径上成功过。当时 stderr 被丢掉，用户只看见 `mutation_failed`，后面的恢复步骤没有继续。上面的修正把参数改成对端 IP 或基名，并在失败时留下原因。这次修正还没有在实机复跑。离线测试覆盖握手前零变更、控制器消失、deadline、取消、部分失败、重复回退、身份不符、ready 未知、exit node 必须用 CLI 接受的参数恢复、watchdog 异常退出时 sentinel 回退，以及注入时钟下的唤醒复查。不启用常驻切网，不安装 launchd，不改 `on_boot`。睡眠唤醒有了离线行为，还没有实机验收。
 
 ## 回退约束
 
 Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前台控制器，`implemented_in_this_repository` 已为 true。清单本身不变，控制器同样未在实机运行：
 
-- 先做快照，独立 watchdog 确认存活之后才切网
-- 绝对截止时间。短测 10 分钟，过夜最长 8 小时，到期不续期
+- 先做快照，独立 watchdog 确认存活之后才切网。`accept` 还要 sentinel ready，否则零变更
+- 绝对截止时间。短测 10 分钟，过夜最长 8 小时，到期不续期。截止按墙钟，睡眠不把会话延长
 - STOP 或到期都回退。只结束自己的进程
 - 清掉 native 动态 DNS 后，确认 scutil 里不再有 198.18，再恢复原来的 Tailscale exit node、allow-lan、accept-dns 和网卡 DNS
-- 不改系统代理，也不改 bypass
+- 不改系统代理，也不改 bypass。代理相对快照的漂移只触发托管状态回退，不写代理
 - 连续 3 次关键故障才回退
 - 不自愈循环，不安装 daemon 或自动启动，不改电源设置
-- 睡眠唤醒之后仍按绝对截止时间计算
+- 睡眠唤醒之后仍按绝对截止时间计算。唤醒后重读 native DNS、IPv4 默认路由、exit node 和 scutil proxy；托管状态仍正确就继续，不对就按 pin 回退
+- 不保证 watchdog 自己死掉之后一定能恢复：sentinel 还活着时会回退，sentinel 也死掉则没有保证
 - 不保证 watchdog 和采样进程都被杀掉之后还能恢复
 
 ## 合并前与之后
@@ -362,7 +369,7 @@ Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前�
 
 1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
 2. 只读采集在 `4044472` 上做过一次部分验收；代理交叉读取还没有复跑。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
-3. 睡眠唤醒。
+3. 睡眠唤醒的实机验收。代码会在墙钟相对单调钟向前跳时复查或回退，CI 用注入时钟和注入观测覆盖这条路径。这不能代替一次真正的睡眠和唤醒：还要在真 Mac 上，于 accept 会话中和常驻 residency 中睡眠再唤醒，核对路由、DNS、系统代理（只观察、不写回）和 exit node。`sleep_wake_verified` 仍是 false。
 4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
 5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。
 

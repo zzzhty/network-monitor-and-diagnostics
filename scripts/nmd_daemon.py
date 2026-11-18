@@ -449,7 +449,7 @@ class RootSupervisor:
 
     def __init__(self, config, state_dir, *, runner=None, mutator=None,
                  spawner=None, tcp=None, exists=None, sleep=None, now=None,
-                 boottime=None, socket_path=SOCKET_PATH, validator=None,
+                 wall=None, boottime=None, socket_path=SOCKET_PATH, validator=None,
                  geodata_dir=None):
         self.config = validate_daemon_config(config)
         takeover = self.config["takeover"]
@@ -468,6 +468,12 @@ class RootSupervisor:
         self.runner = runner or macos_prepare.execute
         self.sleep = sleep or time.sleep
         self.now = now or time.monotonic
+        # Wall time is what moves across Darwin sleep. Tests that inject
+        # ``now`` pass the same clock as ``wall`` unless they want a wake.
+        self.wall = wall or time.time
+        self._previous_power = None
+        self._wake_pending = False
+        self.last_wake = None
         self.boottime = boottime or boot_id
         self.validator = validator or run_mihomo_validate
         self.geodata_dir = geodata_dir
@@ -658,6 +664,7 @@ class RootSupervisor:
         except macos_takeover.TakeoverError as exc:
             return {"error": "snapshot_failed", "detail": str(exc)}
         self._settled.clear()
+        self._wake_pending = False
         self.phase = PHASE_STARTING
         self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
         self._persist_session()
@@ -688,6 +695,7 @@ class RootSupervisor:
                 self.state_dir, process.pid, self.mihomo, str(config_dir),
                 runner=self.runner)
             ready_by = self.now() + macos_takeover.READY_TIMEOUT_SECONDS
+            self._previous_power = (self.wall(), self.now())
             while self.now() < ready_by:
                 if self._cancel.is_set():
                     rollback = self._finish_locked("manual_stop", process, mutations)
@@ -711,6 +719,9 @@ class RootSupervisor:
                     rollback = self.last_rollback or {}
                     return {"result": rollback.get("result", "stopped"),
                             "reason": self.result or "stopped"}
+                wake_rollback = self._consume_start_wake_locked(process, mutations)
+                if wake_rollback is not None:
+                    return {"result": wake_rollback.get("result"), "reason": "wake_restore"}
             else:
                 if self._cancel.is_set():
                     rollback = self._finish_locked("manual_stop", process, mutations)
@@ -742,6 +753,8 @@ class RootSupervisor:
         self.failures = 0
         self.phase = PHASE_ACTIVE
         self.result = None
+        self._wake_pending = False
+        self._previous_power = (self.wall(), self.now())
         self._persist_session()
         return {"result": "takeover_active", "reason": reason,
                 "geodata_staged": staged}
@@ -781,19 +794,90 @@ class RootSupervisor:
     def _retry_rollback(self):
         """One more attempt at an unfinished restore. Does not start a takeover."""
         with self._lock:
-            if self.phase != PHASE_NEEDS_ROLLBACK:
-                return True
-            try:
-                rollback = self._rollback_now()
-            except Exception as exc:
-                rollback = {"result": f"rollback_error:{type(exc).__name__}"}
-            self.last_rollback = rollback
-            if rollback.get("result") != "rollback_restored":
-                return False
-            self.phase = PHASE_ROLLED_BACK
-            self._persist_session()
-            self._record_run(self.result or "rollback_retried", rollback)
+            return self._retry_rollback_locked()
+
+    def _retry_rollback_locked(self):
+        if self.phase != PHASE_NEEDS_ROLLBACK:
             return True
+        try:
+            rollback = self._rollback_now()
+        except Exception as exc:
+            rollback = {"result": f"rollback_error:{type(exc).__name__}"}
+        self.last_rollback = rollback
+        if rollback.get("result") != "rollback_restored":
+            return False
+        self.phase = PHASE_ROLLED_BACK
+        self._persist_session()
+        self._record_run(self.result or "rollback_retried", rollback)
+        return True
+
+    def _note_power_locked(self):
+        sample = (self.wall(), self.now())
+        previous = self._previous_power
+        self._previous_power = sample
+        if previous is None:
+            return None
+        return macos_takeover.classify_power_gap(
+            previous[0], sample[0], previous[1], sample[1])
+
+    def _wake_decision_locked(self, *, require_native_dns, mihomo_alive):
+        try:
+            snapshot = macos_takeover._load_snapshot(
+                macos_takeover._select_snapshot(self.state_dir, self.snapshot_name))
+        except macos_takeover.TakeoverError:
+            snapshot = None
+        observed = macos_takeover.observe_takeover_state(
+            self.runner, tailscale_path=self.tailscale)
+        if snapshot is None:
+            return {"action": "rollback", "reasons": ["snapshot_unreadable"]}
+        return macos_takeover.wake_decision(
+            woke=True, deadline_due=False, mihomo_alive=mihomo_alive,
+            observed=observed,
+            expected_proxy=macos_takeover.expected_proxy_from_snapshot(snapshot),
+            require_native_dns=require_native_dns)
+
+    def _on_wake_locked(self):
+        """Re-validate or restore. Never starts a takeover and never changes on_boot."""
+        if self.phase == PHASE_STARTING:
+            self._wake_pending = True
+            self.last_wake = {"action": "pending", "reasons": ["starting"]}
+            return self.last_wake
+        if self.phase == PHASE_NEEDS_ROLLBACK:
+            self._retry_rollback_locked()
+            self.last_wake = {"action": "retry_rollback", "reasons": ["needs_rollback"],
+                              "result": (self.last_rollback or {}).get("result")}
+            return self.last_wake
+        if self.phase != PHASE_ACTIVE:
+            self.last_wake = {"action": "none", "reasons": [self.phase]}
+            return self.last_wake
+        alive = self.process.alive() if self.process is not None else False
+        decision = self._wake_decision_locked(require_native_dns=True, mihomo_alive=alive)
+        self.last_wake = decision
+        if decision["action"] == "rollback":
+            self._finish_locked("wake_restore", self.process, self.mutations)
+        return decision
+
+    def observe_power(self):
+        """One power sample. A wake restores a broken residency and does not cut over."""
+        with self._lock:
+            kind = self._note_power_locked()
+            if kind != "wake":
+                return self.last_wake
+            return self._on_wake_locked()
+
+    def _consume_start_wake_locked(self, process, mutations):
+        """Ready-loop hook. Caller holds the lock and still owns ``process``."""
+        kind = self._note_power_locked()
+        pending = self._wake_pending or kind == "wake"
+        self._wake_pending = False
+        if not pending:
+            return None
+        alive = process.alive() if process is not None else False
+        decision = self._wake_decision_locked(require_native_dns=False, mihomo_alive=alive)
+        self.last_wake = decision
+        if decision["action"] != "rollback":
+            return None
+        return self._finish_locked("wake_restore", process, mutations)
 
     def stop_takeover(self, reason="manual_stop"):
         self._cancel.set()
@@ -880,6 +964,7 @@ class RootSupervisor:
         thread.start()
         try:
             while not stop_event.is_set():
+                self.observe_power()
                 if self.phase == PHASE_ACTIVE:
                     self._watchdog_once()
                     interval = self.config["takeover"]["check_interval_seconds"]

@@ -22,6 +22,18 @@ scutil has no 198.18 after the native DNS cleanup, then restore the Tailscale
 exit node, allow-lan, accept-dns, and per-service NIC DNS. Two restores
 racing in the same second serialize on a lock file; the second one sees the
 restored values and does not mutate again.
+
+``accept`` also arms a restore sentinel in its own process group before any
+network change. If the deadline watchdog exits before a completed restore,
+the sentinel calls this same rollback, including the rule that a StableNodeID
+is never passed to ``tailscale set``. The sentinel is not launchd. If it dies
+as well, nothing here restarts it, so ``guarantees_restore_if_watchdog_dies``
+stays false.
+
+Sleep shows up as wall time moving ahead of the monotonic clock. After that
+gap an active takeover is re-read. A still-correct managed state continues;
+a broken route, native DNS, exit node, or system-proxy drift restores the
+pinned snapshot. System proxy settings are never written.
 """
 
 from __future__ import annotations
@@ -81,6 +93,18 @@ PIN_FILE = "rollback-pin.json"
 ENGAGED_FILE = "rollback-engaged"
 READY_FILE = "rollback-watch-ready.json"
 WATCH_RESULT_FILE = "rollback-watch-result.json"
+SENTINEL_READY_FILE = "rollback-sentinel-ready.json"
+SENTINEL_RESULT_FILE = "rollback-sentinel-result.json"
+# Long enough for the watchdog to finish scutil cleanup and the exit-node
+# write. Past this, a still-silent watchdog is treated as stuck.
+SENTINEL_GRACE_SECONDS = 45
+# Same threshold the monitor uses for a sleep or clock jump. Wall time during
+# Darwin sleep keeps moving; CLOCK_MONOTONIC does not.
+SLEEP_GAP_SECONDS = 2.0
+# Honest public claim. The sentinel covers watchdog death only while the
+# sentinel itself is still alive. accept does not install a LaunchDaemon, so
+# a dead sentinel is not restarted. Do not flip this to True.
+GUARANTEES_RESTORE_IF_WATCHDOG_DIES = False
 DAEMON_SOCKET = "/var/run/nmd-daemon.sock"
 GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
 GEODATA_MAX_BYTES = 64 * 1024 * 1024
@@ -95,11 +119,20 @@ usage: nmd macos accept --inputs INPUTS.json --state-dir DIR \
 
 `accept` is the two-minute acceptance run. Before any network change it
 starts an independent root process group that already holds the pre-change
-pin. If that watchdog does not become ready, nothing is changed. STOP or the
-absolute deadline rolls back through the existing rollback. The watchdog
-still rolls back from that same pin if the controller is killed. It does not
-install launchd, change on_boot, or stop an existing daemon. If the watchdog
-process itself also dies, restore is not guaranteed.
+pin, and a second independent restore sentinel. If either does not become
+ready, nothing is changed. STOP or the absolute deadline rolls back through
+the existing rollback. The watchdog still rolls back from that same pin if
+the controller is killed. If the watchdog exits before that restore finishes,
+the sentinel runs the same rollback. The sentinel is another process: if it
+dies too, restore is not guaranteed, and
+guarantees_restore_if_watchdog_dies stays false. accept does not install
+launchd, change on_boot, or stop an existing daemon.
+
+After sleep and wake, wall time is compared with the monotonic clock. A
+correct managed state continues. A broken route, native DNS, exit node, or
+a system-proxy drift restores the pinned snapshot. System proxy and bypass
+are never written. The absolute deadline is wall time, so sleep does not
+extend the session. CI does not perform a real Mac sleep.
 
 `takeover` is the longer foreground session (default 10 minutes, 8 hours at
 most, never renewed). `rollback` restores the pinned snapshot. --help and -h
@@ -339,6 +372,97 @@ def first_tailscale(exists=None):
         if exists(candidate):
             return candidate
     raise TakeoverError("tailscale_missing")
+
+
+def classify_power_gap(previous_wall, wall, previous_mono, mono, *,
+                       threshold=SLEEP_GAP_SECONDS):
+    """``wake`` when wall time jumped ahead of the monotonic clock.
+
+    Darwin suspend stops ``CLOCK_MONOTONIC`` and leaves ``time.time`` moving,
+    which is the gap a process can see once it runs again. A backward wall
+    jump is ``clock_step`` and is not treated as a wake. ``None`` means the
+    samples do not show either.
+    """
+    try:
+        wall_delta = float(wall) - float(previous_wall)
+        mono_delta = float(mono) - float(previous_mono)
+    except (TypeError, ValueError):
+        return None
+    if mono_delta < 0:
+        return None
+    if wall_delta <= -float(threshold):
+        return "clock_step"
+    if wall_delta > 0 and wall_delta - mono_delta >= float(threshold):
+        return "wake"
+    return None
+
+
+def proxy_enabled_map(proxy):
+    """Protocol name to enabled flag. Missing or unparsed input is None."""
+    if not isinstance(proxy, dict):
+        return None
+    protocols = proxy.get("protocols")
+    if not isinstance(protocols, dict):
+        return None
+    found = {}
+    for name, row in protocols.items():
+        if isinstance(row, dict) and isinstance(row.get("enabled"), bool):
+            found[str(name)] = row["enabled"]
+    return found
+
+
+def expected_proxy_from_snapshot(snapshot):
+    """The pre-takeover proxy flags, or None when the snapshot did not observe them."""
+    if not isinstance(snapshot, dict):
+        return None
+    proxy = snapshot.get("proxy")
+    if not isinstance(proxy, dict) or proxy.get("status") != "observed":
+        return None
+    mapped = proxy_enabled_map(proxy)
+    return mapped if mapped is not None else {}
+
+
+def wake_decision(*, woke, deadline_due, mihomo_alive, observed,
+                  expected_proxy, require_native_dns=True):
+    """Continue only when the managed takeover still matches the cutover.
+
+    System proxy is compared and never written. A drift is a reason to restore
+    exit node, DNS, and our mihomo through the existing rollback. An absolute
+    deadline that has already passed is a rollback even when the state looks
+    fine. ``require_native_dns`` is false while native DNS is still coming up.
+    """
+    if deadline_due:
+        return {"action": "rollback", "reasons": ["deadline_reached"]}
+    if not woke:
+        return {"action": "continue", "reasons": []}
+    reasons = []
+    if mihomo_alive is not True:
+        reasons.append("mihomo_not_alive")
+    observed = observed if isinstance(observed, dict) else {}
+    has_198_18 = observed.get("has_198_18")
+    if has_198_18 is None:
+        reasons.append("dns_unknown")
+    elif require_native_dns and has_198_18 is not True:
+        reasons.append("native_dns_missing")
+    exit_cleared = observed.get("exit_cleared")
+    if exit_cleared is None:
+        reasons.append("exit_unknown")
+    elif exit_cleared is not True:
+        reasons.append("exit_node_not_cleared")
+    default_route = observed.get("default_route_present")
+    if default_route is None:
+        reasons.append("route_unknown")
+    elif default_route is not True:
+        reasons.append("default_route_missing")
+    live_proxy = observed.get("proxy_enabled")
+    if expected_proxy is not None:
+        if live_proxy is None:
+            reasons.append("proxy_unknown")
+        elif live_proxy != expected_proxy:
+            reasons.append("proxy_drift")
+    if reasons:
+        return {"action": "rollback", "reasons": reasons}
+    return {"action": "continue", "reasons": []}
 
 
 # --- path trust --------------------------------------------------------------
@@ -854,6 +978,78 @@ def read_prefs(tailscale_path, runner=None):
     return macos_prepare._parse_prefs(0, text, None)
 
 
+def observe_takeover_state(runner, *, tailscale_path):
+    """Read-only picture of the managed takeover. Nothing here is mutated.
+
+    ``None`` fields mean the read could not be trusted. Callers fail closed
+    on those instead of treating them as healthy.
+    """
+    has_198_18 = None
+    try:
+        code, text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
+    except TakeoverError:
+        code, text = None, ""
+    if code == 0:
+        has_198_18 = macos_prepare._parse_scutil_dns(0, text, None).get("has_198_18")
+
+    proxy_enabled = None
+    try:
+        code, text = read_state(["/usr/sbin/scutil", "--proxy"], runner=runner)
+    except TakeoverError:
+        code, text = None, ""
+    if code == 0:
+        parsed = macos_prepare._parse_scutil_proxy(0, text, None)
+        if parsed.get("status") == "observed":
+            proxy_enabled = proxy_enabled_map(parsed) or {}
+
+    default_route_present = None
+    try:
+        code, text = read_state(
+            ["/usr/sbin/netstat", "-rn", "-f", "inet"], runner=runner)
+    except TakeoverError:
+        code, text = None, ""
+    if code == 0:
+        routes = macos_prepare._parse_routes(code, text, None, 4)
+        if routes.get("status") == "observed":
+            default_route_present = bool(routes.get("default"))
+
+    exit_cleared = None
+    if tailscale_path:
+        try:
+            prefs = read_prefs(tailscale_path, runner=runner)
+        except TakeoverError:
+            prefs = None
+        if isinstance(prefs, dict) and prefs.get("status") == "observed":
+            exit_id, exit_ip = macos_prepare.exit_identity(prefs)
+            exit_cleared = not exit_id and exit_ip is None
+    return {"has_198_18": has_198_18, "exit_cleared": exit_cleared,
+            "default_route_present": default_route_present,
+            "proxy_enabled": proxy_enabled}
+
+
+def assess_managed_takeover(state_dir, snapshot_name, *, runner, tailscale_path,
+                            mihomo_alive, require_native_dns, deadline_due=False):
+    """Wake decision from the pinned snapshot and a fresh read-only observation."""
+    if deadline_due:
+        return wake_decision(woke=True, deadline_due=True, mihomo_alive=mihomo_alive,
+                             observed={}, expected_proxy=None,
+                             require_native_dns=require_native_dns)
+    try:
+        snapshot = _load_snapshot(_select_snapshot(state_dir, snapshot_name))
+    except TakeoverError:
+        snapshot = None
+    observed = observe_takeover_state(runner, tailscale_path=tailscale_path)
+    if snapshot is None:
+        reasons = ["snapshot_unreadable"]
+        if observed.get("has_198_18") is None:
+            reasons.append("dns_unknown")
+        return {"action": "rollback", "reasons": reasons}
+    return wake_decision(
+        woke=True, deadline_due=False, mihomo_alive=mihomo_alive,
+        observed=observed, expected_proxy=expected_proxy_from_snapshot(snapshot),
+        require_native_dns=require_native_dns)
+
+
 def _read_regular(path, limit):
     """Read a regular file without following a final symlink."""
     flags = os.O_RDONLY | os.O_CLOEXEC
@@ -1251,9 +1447,9 @@ def assert_acceptance_state(path):
     return path
 
 
-def _watchdog_still_running(state_dir):
-    """True when a previous acceptance watchdog may still roll this directory back."""
-    document = _read_ready_document(Path(state_dir) / READY_FILE)
+def _ready_process_running(state_dir, filename):
+    """True when a ready file names a process that may still restore this directory."""
+    document = _read_ready_document(Path(state_dir) / filename)
     if not isinstance(document, dict) or document.get("ready") is not True:
         return False
     pid = document.get("pid")
@@ -1262,6 +1458,16 @@ def _watchdog_still_running(state_dir):
         return True
     # Deadline starts the restore. It does not mean the process has exited.
     return _pid_alive(pid) is not False
+
+
+def _watchdog_still_running(state_dir):
+    """True when a previous acceptance watchdog may still roll this directory back."""
+    return _ready_process_running(state_dir, READY_FILE)
+
+
+def _sentinel_still_running(state_dir):
+    """True when a previous restore sentinel may still roll this directory back."""
+    return _ready_process_running(state_dir, SENTINEL_READY_FILE)
 
 
 def _daemon_conflict(path=DAEMON_SOCKET):
@@ -1359,13 +1565,20 @@ def _pid_alive(pid):
     return True
 
 
+def _watch_result_restored(state_dir):
+    """True only when the watchdog already recorded a completed restore."""
+    document = _read_ready_document(Path(state_dir) / WATCH_RESULT_FILE)
+    return isinstance(document, dict) and document.get("result") == "rollback_restored"
+
+
 def run_rollback_watch(state_dir, *, pin, deadline_unix, parent_pid, now=None,
                        sleep=None, alive=None, rollback_fn=None):
     """Child entry: hold the pin, then call the existing rollback.
 
     Ready is written only after the pin and snapshot both load. The loop
     then waits for the deadline or for the controller process to disappear.
-    This process dying too is not covered; the caller must not claim it is.
+    This process dying is the sentinel's job. The sentinel is another
+    process, so this function still must not claim a hard guarantee.
     """
     state = assert_acceptance_state(state_dir)
     now = now or time.time
@@ -1402,15 +1615,104 @@ def run_rollback_watch(state_dir, *, pin, deadline_unix, parent_pid, now=None,
     if isinstance(result, dict):
         result = dict(result)
         result["trigger"] = trigger
-        result["guarantees_restore_if_watchdog_dies"] = False
+        result["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
     macos_prepare._atomic_private_write(
         state, WATCH_RESULT_FILE,
         json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
     return result
 
 
+def run_restore_sentinel(state_dir, *, pin, deadline_unix, watchdog_pid, parent_pid,
+                         now=None, sleep=None, alive=None, rollback_fn=None):
+    """If the watchdog exits before a completed restore, run that rollback.
+
+    Ready is written only after the same pin and snapshot load. The loop does
+    not restore while the watchdog is alive and the deadline grace remains.
+    A recorded ``rollback_restored`` means the watchdog already finished; this
+    process does not mutate again. Any earlier watchdog exit, or silence past
+    the grace, uses the pinned snapshot and the existing rollback. Exit-node
+    arguments therefore stay on the PR #8 contract.
+
+    This process dying too is not covered. The returned claim stays false.
+    ``parent_pid`` is recorded so a later reader can see which controller
+    armed the sentinel; the trigger is the watchdog, not the parent.
+    """
+    state = assert_acceptance_state(state_dir)
+    now = now or time.time
+    sleep = sleep or time.sleep
+    alive = alive or _pid_alive
+    rollback_fn = rollback_fn or rollback
+    if type(watchdog_pid) is not int or isinstance(watchdog_pid, bool) or watchdog_pid <= 1:
+        raise TakeoverError("invalid_arguments")
+    reason = "pin_unreadable"
+    ready = False
+    try:
+        loaded = read_pin(state)
+        if loaded == pin:
+            _load_snapshot(_select_snapshot(state, pin))
+            ready = True
+            reason = "ready"
+        else:
+            reason = "pin_mismatch"
+    except TakeoverError:
+        ready = False
+    document = {"schema_version": SCHEMA_VERSION, "ready": ready, "reason": reason,
+                "pid": os.getpid(), "pgid": os.getpgrp(), "euid": os.geteuid(),
+                "pin": pin, "deadline_unix": deadline_unix,
+                "watchdog_pid": watchdog_pid, "parent_pid": parent_pid,
+                "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES}
+    macos_prepare._atomic_private_write(
+        state, SENTINEL_READY_FILE,
+        json.dumps(document, sort_keys=True).encode("utf-8") + b"\n")
+    if not ready:
+        return {"ready": False, "reason": reason,
+                "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES}
+    trigger = None
+    while trigger is None:
+        if _watch_result_restored(state):
+            trigger = "watchdog_restored"
+            break
+        if alive(watchdog_pid) is False:
+            trigger = "watchdog_dead"
+            break
+        if now() >= int(deadline_unix) + SENTINEL_GRACE_SECONDS:
+            trigger = "watchdog_stuck"
+            break
+        sleep(0.2)
+    if trigger == "watchdog_restored":
+        result = {"result": "rollback_restored", "steps": [], "trigger": trigger,
+                  "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES}
+    else:
+        result = rollback_fn(state, snapshot_name=pin)
+        if not isinstance(result, dict):
+            result = {"result": None}
+        else:
+            result = dict(result)
+        result["trigger"] = trigger
+        result["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
+    macos_prepare._atomic_private_write(
+        state, SENTINEL_RESULT_FILE,
+        json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
+    return result
+
+
+def _prepare_ready_file(path):
+    """Remove a regular ready file. A symlink or an unusable inode is not ready."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False
+    with contextlib.suppress(OSError):
+        path.unlink()
+    return True
+
+
 def arm_external_watchdog(state_dir, pin, deadline_unix, *, spawn=None, probe=None,
-                          sleep=None, now=None):
+                          sleep=None, now=None, spawn_sentinel=None):
     """Start the watchdog and accept it only after the ready file is confirmed."""
     state_dir = Path(state_dir)
     ready_path = state_dir / READY_FILE
@@ -1448,6 +1750,44 @@ def arm_external_watchdog(state_dir, pin, deadline_unix, *, spawn=None, probe=No
         child_pid=child.pid, parent_pgid=os.getpgrp(), probe=probe or _probe_child)
     if confirmed.get("ready") is not True:
         _stop_child(child)
+        return confirmed
+    sentinel_path = state_dir / SENTINEL_READY_FILE
+    if not _prepare_ready_file(sentinel_path):
+        _stop_child(child)
+        return {"ready": False, "reason": "ready_unknown"}
+    if spawn_sentinel is not None:
+        sentinel = spawn_sentinel(state_dir, pin, deadline_unix, child.pid)
+    else:
+        sentinel = _spawn_sentinel(state_dir, pin, deadline_unix, child.pid)
+    if sentinel is None or not isinstance(getattr(sentinel, "pid", None), int):
+        _stop_child(child)
+        return {"ready": False, "reason": "sentinel_not_started"}
+    stop_at = now() + WATCHDOG_HANDSHAKE_SECONDS
+    document = None
+    while now() < stop_at:
+        if sentinel.poll() is not None:
+            _stop_child(child)
+            return {"ready": False, "reason": "sentinel_exited", "pid": sentinel.pid}
+        document = _read_ready_document(sentinel_path)
+        if document is not None:
+            break
+        sleep(0.05)
+    else:
+        _stop_child(sentinel)
+        _stop_child(child)
+        return {"ready": False, "reason": "sentinel_not_ready", "pid": sentinel.pid}
+    sentinel_confirmed = confirm_ready(
+        document, expected_pin=pin, expected_deadline=deadline_unix,
+        child_pid=sentinel.pid, parent_pgid=os.getpgrp(), probe=probe or _probe_child)
+    if sentinel_confirmed.get("ready") is not True:
+        _stop_child(sentinel)
+        _stop_child(child)
+        sentinel_confirmed["ready"] = False
+        return sentinel_confirmed
+    confirmed["sentinel_ready"] = True
+    confirmed["sentinel_pid"] = sentinel.pid
+    confirmed["sentinel_pgid"] = sentinel_confirmed.get("pgid")
+    confirmed["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
     return confirmed
 
 
@@ -1544,23 +1884,41 @@ def reexec_root(script_path, script_argv):
         raise TakeoverError("untrusted_exec_path") from exc
 
 
+def _child_env():
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
+    account = _sudo_user_home()
+    if account is not None:
+        env["SUDO_USER"] = account.pw_name
+    return env
+
+
+def _spawn_logged(argv, state_dir, log_name):
+    log = open(Path(state_dir) / log_name, "ab")
+    try:
+        return subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, env=_child_env())
+    finally:
+        log.close()
+
+
 def _spawn_watch(state_dir, pin, deadline_unix):
     python = _trusted_interpreter()
     script = _trusted_script(Path(__file__).resolve())
     argv = [str(python), str(script), "rollback-watch",
             "--state-dir", str(state_dir), "--pin", pin,
             "--deadline", str(int(deadline_unix)), "--parent", str(os.getpid())]
-    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
-    account = _sudo_user_home()
-    if account is not None:
-        env["SUDO_USER"] = account.pw_name
-    log = open(Path(state_dir) / "rollback-watch.log", "ab")
-    try:
-        return subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-            start_new_session=True, env=env)
-    finally:
-        log.close()
+    return _spawn_logged(argv, state_dir, "rollback-watch.log")
+
+
+def _spawn_sentinel(state_dir, pin, deadline_unix, watchdog_pid):
+    python = _trusted_interpreter()
+    script = _trusted_script(Path(__file__).resolve())
+    argv = [str(python), str(script), "rollback-sentinel",
+            "--state-dir", str(state_dir), "--pin", pin,
+            "--deadline", str(int(deadline_unix)),
+            "--watchdog", str(int(watchdog_pid)), "--parent", str(os.getpid())]
+    return _spawn_logged(argv, state_dir, "rollback-sentinel.log")
 
 
 # --- takeover ----------------------------------------------------------------
@@ -1606,8 +1964,8 @@ def _write_heartbeat(path):
 def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
              mihomo_path=None, state_dir=None, runner=None, mutator=None,
              spawner=None, tcp=None, exists=None, sleep=None, now=None,
-             geodata_dir=None, external_rollback=False, geo_auto_update=True,
-             arm_watchdog=None):
+             wall=None, geodata_dir=None, external_rollback=False,
+             geo_auto_update=True, arm_watchdog=None):
     """Drive one bounded run: preflight, cutover, watchdog, rollback, record.
 
     Every exit path after the cutover begins goes through the finally block:
@@ -1617,7 +1975,18 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     minutes = validate_minutes(minutes)
     runner = runner or macos_prepare.execute
     sleep = sleep or time.sleep
+    # Tests inject one clock through ``now``. Production deadlines use wall
+    # time so a Darwin sleep, which stops the monotonic clock, cannot extend
+    # the session. Wake detection compares the two clocks.
+    injected_now = now is not None
     now = now or time.monotonic
+
+    def wall_sample():
+        if wall is not None:
+            return wall()
+        if injected_now:
+            return now()
+        return time.time()
     if tcp is None:
         tcp = macos_readonly.tcp_connect
     mihomo = first_mihomo(exists=exists, override=mihomo_path)
@@ -1633,6 +2002,8 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             raise TakeoverError("daemon_conflict")
         if _watchdog_still_running(state_dir):
             raise TakeoverError("watchdog_conflict")
+        if _sentinel_still_running(state_dir):
+            raise TakeoverError("sentinel_conflict")
     else:
         state_dir = _absolute_lexical(state_dir)
         if state_dir.is_symlink():
@@ -1711,20 +2082,27 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     pin_holder[0] = snapshot_name
     step("snapshot_taken")
     deadline_unix = None
+    watchdog_pid = None
     if external_rollback:
         deadline_unix = int(time.time()) + minutes * 60
-        record["guarantees_restore_if_watchdog_dies"] = False
+        record["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
+        record["restore_sentinel_armed"] = False
         if arm_watchdog is None:
             armed = arm_external_watchdog(state_dir, snapshot_name, deadline_unix)
         else:
             armed = arm_watchdog(state_dir, snapshot_name, deadline_unix)
         record["watchdog"] = {key: armed.get(key)
-                              for key in ("ready", "reason", "pid", "pgid", "pin")
+                              for key in ("ready", "reason", "pid", "pgid", "pin",
+                                          "sentinel_pid", "sentinel_ready")
                               if isinstance(armed, dict) and key in armed}
         if not isinstance(armed, dict) or armed.get("ready") is not True:
             record["result"] = "watchdog_not_ready"
             return record
+        watchdog_pid = armed.get("pid")
+        record["restore_sentinel_armed"] = armed.get("sentinel_ready") is True
         step("watchdog_ready")
+        if record["restore_sentinel_armed"]:
+            step("sentinel_ready")
 
     tailscale = first_tailscale(exists)
     stop_requested = []
@@ -1764,10 +2142,57 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             state_dir, f"takeover-{stamp}.json",
             json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n")
 
+    deadline_mark = [None]
+    power_prev = [None]
+
+    def watchdog_lost():
+        if not external_rollback:
+            return False
+        if type(watchdog_pid) is not int or isinstance(watchdog_pid, bool):
+            return False
+        return _pid_alive(watchdog_pid) is False
+
+    def note_power():
+        sample = (wall_sample(), now())
+        previous = power_prev[0]
+        power_prev[0] = sample
+        if previous is None:
+            return None
+        return classify_power_gap(previous[0], sample[0], previous[1], sample[1])
+
+    def respond_to_power(require_native_dns):
+        """Rollback when the watchdog is gone, the deadline has passed, or wake is wrong.
+
+        The first sample only sets a baseline. A wake that still matches the
+        managed takeover is recorded and the run continues.
+        """
+        gap = note_power()
+        if watchdog_lost():
+            record["result"] = "watchdog_died"
+            return True
+        if deadline_mark[0] is not None and wall_sample() >= deadline_mark[0]:
+            record["result"] = "deadline_reached"
+            return True
+        if gap != "wake":
+            return False
+        decision = assess_managed_takeover(
+            state_dir, snapshot_name, runner=runner, tailscale_path=tailscale,
+            mihomo_alive=process.alive(), require_native_dns=require_native_dns)
+        record["wake"] = decision
+        if decision["action"] != "rollback":
+            step("wake:continue")
+            return False
+        record["result"] = "wake_restore"
+        step("wake:restore")
+        return True
+
     try:
         # 3. Cutover: clear the exit node, then start the only process we own.
         mutate([tailscale, "set", "--exit-node="])
         step("exit_node_cleared")
+        if watchdog_lost():
+            record["result"] = "watchdog_died"
+            return record
         if not config_is_direct_regular(config_dir, config_path):
             raise TakeoverError("config_not_confined")
         if external_rollback:
@@ -1785,9 +2210,11 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             write_owner(state_dir, process.pid, mihomo, str(config_dir), runner=runner)
         step("mihomo_started")
 
-        deadline = now() + minutes * 60
         ready_by = now() + READY_TIMEOUT_SECONDS
-        while now() < ready_by:
+        ready_wall_by = wall_sample() + READY_TIMEOUT_SECONDS
+        while now() < ready_by and wall_sample() < ready_wall_by:
+            if respond_to_power(require_native_dns=False):
+                return record
             if external_rollback and _mutation_blocked(state_dir, snapshot_name):
                 record["result"] = _engaged_result(deadline_unix)
                 return record
@@ -1808,10 +2235,14 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         # A cycle counts as failed when any critical check fails; a cycle with
         # every check passing resets the streak, per the recorded contract.
         # TCP connect success is not an application success; it only says the
-        # configured SOCKS port accepted a handshake.
+        # configured SOCKS port accepted a handshake. The deadline is wall time
+        # once this loop starts, so a sleep does not add time to the session.
         checks = _watch_checks(inputs, runner=runner, tcp=tcp, exists=exists)
         failures = 0
+        deadline_mark[0] = wall_sample() + minutes * 60
         while True:
+            if respond_to_power(require_native_dns=True):
+                return record
             if external_rollback and _mutation_blocked(state_dir, snapshot_name):
                 record["result"] = _engaged_result(deadline_unix)
                 return record
@@ -1838,9 +2269,6 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
                 record["result"] = "stopped"
                 record["stopped_at"] = stop_requested[0]
                 return record
-            if now() >= deadline:
-                record["result"] = "deadline_reached"
-                return record
             sleep(CHECK_INTERVAL_SECONDS)
     except TakeoverError as exc:
         record["result"] = f"takeover_error:{exc}"
@@ -1850,12 +2278,13 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
 
 
 
-_COMMANDS = ("accept", "takeover", "rollback", "rollback-watch")
+_COMMANDS = ("accept", "takeover", "rollback", "rollback-watch", "rollback-sentinel")
 _FLAG_VALUES = {
     "accept": ("--inputs", "--profile", "--mihomo", "--state-dir", "--geodata-dir"),
     "takeover": ("--inputs", "--profile", "--minutes", "--mihomo", "--state-dir", "--geodata-dir"),
     "rollback": ("--state-dir",),
     "rollback-watch": ("--state-dir", "--pin", "--deadline", "--parent"),
+    "rollback-sentinel": ("--state-dir", "--pin", "--deadline", "--watchdog", "--parent"),
 }
 
 
@@ -1882,7 +2311,7 @@ def _syntax(argv):
         raise TakeoverError("inputs_required")
     if argv[0] == "accept" and "--state-dir" not in seen:
         raise TakeoverError("state_dir_required")
-    if argv[0] == "rollback-watch" and seen != set(allowed):
+    if argv[0] in ("rollback-watch", "rollback-sentinel") and seen != set(allowed):
         raise TakeoverError("invalid_arguments")
     return seen
 
@@ -1920,7 +2349,32 @@ def _watch_cli(argv):
         deadline_unix=int(values["--deadline"]), parent_pid=int(values["--parent"]))
     print(json.dumps({"result": result.get("result") if isinstance(result, dict) else None,
                       "trigger": result.get("trigger") if isinstance(result, dict) else None,
-                      "guarantees_restore_if_watchdog_dies": False},
+                      "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES},
+                     ensure_ascii=False))
+    return 0 if isinstance(result, dict) and result.get("result") == "rollback_restored" else 1
+
+
+def _sentinel_cli(argv):
+    values = {}
+    index = 1
+    while index < len(argv):
+        values[argv[index]] = argv[index + 1]
+        index += 2
+    for flag in ("--deadline", "--parent", "--watchdog"):
+        if not re.fullmatch(r"\d+", values[flag]):
+            raise TakeoverError("invalid_arguments")
+    if int(values["--watchdog"]) <= 1:
+        raise TakeoverError("invalid_arguments")
+    if not _SNAPSHOT_NAME.fullmatch(values["--pin"]):
+        raise TakeoverError("invalid_snapshot_name")
+    result = run_restore_sentinel(
+        values["--state-dir"], pin=values["--pin"],
+        deadline_unix=int(values["--deadline"]),
+        watchdog_pid=int(values["--watchdog"]),
+        parent_pid=int(values["--parent"]))
+    print(json.dumps({"result": result.get("result") if isinstance(result, dict) else None,
+                      "trigger": result.get("trigger") if isinstance(result, dict) else None,
+                      "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES},
                      ensure_ascii=False))
     return 0 if isinstance(result, dict) and result.get("result") == "rollback_restored" else 1
 
@@ -1953,6 +2407,8 @@ def main(argv=None):
     try:
         if argv[0] == "rollback-watch":
             return _watch_cli(argv)
+        if argv[0] == "rollback-sentinel":
+            return _sentinel_cli(argv)
         if argv[0] == "rollback":
             state_dir = None
             rest = argv[1:]
@@ -1987,7 +2443,8 @@ def main(argv=None):
     if rollback_record.get("detail"):
         summary["detail"] = rollback_record["detail"]
     if argv[0] == "accept":
-        summary["guarantees_restore_if_watchdog_dies"] = False
+        summary["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
+        summary["restore_sentinel_armed"] = record.get("restore_sentinel_armed") is True
     print(json.dumps(summary, ensure_ascii=False))
     if argv[0] == "accept":
         return 0 if record.get("result") in ("stopped", "deadline_reached") and rollback_result == "rollback_restored" else 1

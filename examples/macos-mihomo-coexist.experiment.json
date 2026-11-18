@@ -90,6 +90,8 @@
     "installs_daemon_or_autostart": false,
     "changes_power_management": false,
     "sleep_wake_keeps_absolute_deadline": true,
+    "sleep_wake_revalidates_or_restores": true,
+    "guarantees_restore_if_watchdog_dies": false,
     "guarantees_restore_if_watchdog_and_sampler_die": false,
     "requires_watchdog_unhealthy_logic_change": false,
     "implemented_in_this_repository": true
