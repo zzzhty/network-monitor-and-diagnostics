@@ -28,6 +28,8 @@ PROFILE = json.loads((ROOT / "examples/macos-mihomo-coexist.experiment.json").re
 INPUTS = {"proxy_name": "VPS", "server": "fd7a:115c:a1e0::abcd", "port": 1081}
 TS = "/usr/local/bin/tailscale"
 MIHOMO = "/usr/local/bin/mihomo"
+EXIT_IP = "100.64.0.2"
+PINNED_IP = "100.64.0.8"
 DNS_CLEAN = "resolver #1\n  nameserver[0]     : 100.100.100.100\n"
 DNS_DIRTY = "resolver #1\n  nameserver[0]     : 198.18.0.2\n"
 
@@ -88,10 +90,24 @@ class Table:
                 return 0, f"There aren't any DNS Servers set on {argv[2]}.\n", None
             return 0, "\n".join(servers) + "\n", None
         if argv == (TS, "status", "--json"):
+            peers = {
+                "nodekey:abc": {
+                    "ID": "nodekey:abc", "DNSName": "pinned-exit.example.ts.net.",
+                    "HostName": "pinned-exit", "TailscaleIPs": [EXIT_IP],
+                    "ExitNodeOption": True, "Online": True,
+                },
+                "nodekey:pinned": {
+                    "ID": "nodekey:pinned", "DNSName": "other-exit.example.ts.net.",
+                    "HostName": "other-exit", "TailscaleIPs": [PINNED_IP],
+                    "ExitNodeOption": True, "Online": True,
+                },
+            }
             if self.status_healthy:
-                body = {"BackendState": "Running", "Self": {"Online": True}, "Peer": {}}
+                body = {"BackendState": "Running", "Self": {"Online": True},
+                        "MagicDNSSuffix": "example.ts.net.", "Peer": peers}
             else:
-                body = {"BackendState": "Stopped", "Self": {"Online": False}, "Peer": {}}
+                body = {"BackendState": "Stopped", "Self": {"Online": False},
+                        "MagicDNSSuffix": "example.ts.net.", "Peer": peers}
             return 0, json.dumps(body), None
         if argv == (TS, "debug", "prefs"):
             prefs = {"ExitNodeID": None if self.exit_node_cleared else "nodekey:abc",
@@ -169,7 +185,8 @@ class AllowlistTests(unittest.TestCase):
     def test_the_closed_mutation_set(self):
         allowed = (
             [TS, "set", "--exit-node="],
-            [TS, "set", "--exit-node=nodekey:abc"],
+            [TS, "set", "--exit-node=" + EXIT_IP],
+            [TS, "set", "--exit-node=pinned-exit"],
             [TS, "set", "--exit-node=", "--accept-dns=true"],
             [TS, "set", "--exit-node=x", "--exit-node-allow-lan-access"],
             ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "Empty"],
@@ -213,6 +230,9 @@ class AllowlistTests(unittest.TestCase):
             [MIHOMO, "-d", "relative", "-f", "/tmp/config.yaml"],
             [TS, "set", "--exit-node-allow-lan-access=maybe"],
             [TS, "set", "--exit-node=bad node"],
+            [TS, "set", "--exit-node=nodekey:abc"],
+            [TS, "set", "--exit-node=auto:any"],
+            [TS, "set", "--exit-node=100.64.0.2/32"],
         )
         for argv in rejected:
             with self.subTest(argv=argv):
@@ -337,13 +357,17 @@ class TakeoverFlowTests(unittest.TestCase):
 
 
 class RollbackTests(unittest.TestCase):
-    def write_snapshot(self, state, *, prefs=None, services=(("Wi-Fi", ["192.0.2.53"]),)):
+    def write_snapshot(self, state, *, prefs=None, services=(("Wi-Fi", ["192.0.2.53"]),),
+                       exit_node_cli=None):
+        tail = {"prefs": prefs or {"status": "observed", "ExitNodeID": "nodekey:abc",
+                                   "ExitNodeIP": None, "CorpDNS": True,
+                                   "RouteAll": False,
+                                   "ExitNodeAllowLANAccess": False,
+                                   "WantRunning": True}}
+        if exit_node_cli is not None:
+            tail["exit_node_cli"] = exit_node_cli
         snapshot = {"schema_version": 1, "kind": "macos_pre_start_snapshot", "phase": "A",
-                    "tailscale": {"prefs": prefs or {"status": "observed", "ExitNodeID": "nodekey:abc",
-                                                     "ExitNodeIP": None, "CorpDNS": True,
-                                                     "RouteAll": False,
-                                                     "ExitNodeAllowLANAccess": False,
-                                                     "WantRunning": True}},
+                    "tailscale": tail,
                     "dns": {"services": [{"service": name, "dnsservers": list(servers),
                                           "status": "observed"} for name, servers in services]}}
         path = state / "pre-start-20261117T000000Z.json"
@@ -380,7 +404,7 @@ class RollbackTests(unittest.TestCase):
                                   sleep=table.sleep, now=lambda: table.clock,
                                   tailscale_path=TS)
             self.assertEqual(result["result"], "rollback_restored")
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
             self.assertIn(["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "192.0.2.53"],
                           table.mutations)
             after_first = len(table.mutations)
@@ -447,7 +471,7 @@ class RollbackTests(unittest.TestCase):
                                   sleep=table.sleep, now=lambda: table.clock,
                                   tailscale_path=TS)
             self.assertEqual(result["snapshot"], pinned.name)
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
             self.assertFalse(any("evil" in json.dumps(item) for item in table.mutations))
 
     def test_symlink_snapshot_and_symlink_pin_are_ignored(self):
@@ -468,7 +492,7 @@ class RollbackTests(unittest.TestCase):
                                   sleep=table.sleep, now=lambda: table.clock,
                                   tailscale_path=TS)
             self.assertEqual(result["snapshot"], pinned.name)
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
             link = state / mod.PIN_FILE
             link.symlink_to(evil)
             with self.assertRaisesRegex(mod.TakeoverError, "pin_untrusted"):
@@ -491,6 +515,138 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(result["result"], "rollback_incomplete")
             self.assertIn("exit_node_unrestorable", result["steps"])
             self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_stable_node_id_is_not_passed_to_tailscale(self):
+        stable = "n292kg92CNTRL"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, prefs={
+                "status": "observed", "ExitNodeID": stable, "ExitNodeIP": None,
+                "CorpDNS": True, "RouteAll": False, "ExitNodeAllowLANAccess": False,
+                "WantRunning": True})
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+
+            def runner(argv, timeout):
+                if tuple(argv) == (TS, "status", "--json"):
+                    body = {
+                        "BackendState": "Running", "Self": {"Online": True},
+                        "MagicDNSSuffix": "example.ts.net.",
+                        "Peer": {"k": {
+                            "ID": stable, "DNSName": "pinned-exit.example.ts.net.",
+                            "TailscaleIPs": [EXIT_IP], "ExitNodeOption": True, "Online": True,
+                        }},
+                    }
+                    return 0, json.dumps(body), None
+                return table.runner(argv, timeout)
+
+            result = mod.rollback(state, runner=runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+            self.assertFalse(any(stable in json.dumps(item) for item in table.mutations))
+            self.assertNotIn("auto:any", json.dumps(table.mutations))
+
+    def test_unresolved_stable_id_skips_exit_and_still_restores_dns(self):
+        stable = "n292kg92CNTRL"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, prefs={
+                "status": "observed", "ExitNodeID": stable, "ExitNodeIP": "",
+                "CorpDNS": False, "RouteAll": False, "ExitNodeAllowLANAccess": True,
+                "WantRunning": True})
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            table.service_dns["Wi-Fi"] = []
+            table.corp_dns = True
+            table.allow_lan = False
+
+            def runner(argv, timeout):
+                if tuple(argv) == (TS, "status", "--json"):
+                    return 0, json.dumps({"BackendState": "Running", "Self": {"Online": True},
+                                          "Peer": {}}), None
+                return table.runner(argv, timeout)
+
+            result = mod.rollback(state, runner=runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_incomplete")
+            self.assertIn("exit_node_unrestorable", result["steps"])
+            self.assertIn([TS, "set", "--accept-dns=false"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node-allow-lan-access=true"], table.mutations)
+            self.assertIn(["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "192.0.2.53"],
+                          table.mutations)
+            self.assertFalse(any(item[2:3] == ["--exit-node=" + stable] for item in table.mutations))
+
+    def test_stored_cli_target_is_used_when_status_has_no_peer(self):
+        stable = "n292kg92CNTRL"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, prefs={
+                "status": "observed", "ExitNodeID": stable, "ExitNodeIP": None,
+                "CorpDNS": True, "RouteAll": False, "ExitNodeAllowLANAccess": False,
+                "WantRunning": True}, exit_node_cli="100.64.0.9")
+            table = Table(services=(("Wi-Fi", []),))
+            table.exit_node_cleared = True
+
+            def runner(argv, timeout):
+                if tuple(argv) == (TS, "status", "--json"):
+                    return 1, "", "command_failed"
+                return table.runner(argv, timeout)
+
+            result = mod.rollback(state, runner=runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--exit-node=100.64.0.9"], table.mutations)
+            self.assertFalse(any(stable in json.dumps(item) for item in table.mutations))
+
+    def test_failed_exit_set_keeps_the_reason_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            table.service_dns["Wi-Fi"] = []
+            table.corp_dns = False
+            table.allow_lan = True
+            detail = 'invalid value "n292kg92CNTRL" for --exit-node; must be IP or peer hostname'
+
+            def mutator(argv):
+                if argv[:2] == [TS, "set"] and any(
+                        item.startswith("--exit-node=") and item != "--exit-node=" for item in argv[2:]):
+                    raise mod.TakeoverError("mutation_failed", detail)
+                table.mutator(argv)
+
+            result = mod.rollback(state, runner=table.runner, mutator=mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_incomplete")
+            self.assertIn("exit_node:failed", result["steps"])
+            self.assertIn("accept_dns_restored", result["steps"])
+            self.assertIn("allow_lan_restored", result["steps"])
+            self.assertIn("Wi-Fi:restored", result["steps"])
+            self.assertEqual(result["failures"][0]["error"], "mutation_failed")
+            self.assertIn("must be IP or peer hostname", result["failures"][0]["detail"])
+            self.assertIn([TS, "set", "--accept-dns=true"], table.mutations)
+            self.assertNotIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+
+    def test_mutation_stderr_is_kept_and_credentials_are_redacted(self):
+        class Proc:
+            returncode = 1
+            pid = 4242
+
+            def communicate(self, timeout=None):
+                return b"", b'failed tskey-auth-abc123xyz must be IP or peer hostname\n'
+
+        with patch.object(mod.subprocess, "Popen", return_value=Proc()):
+            with self.assertRaises(mod.TakeoverError) as caught:
+                mod.execute_mutating([TS, "set", "--exit-node=" + EXIT_IP])
+        self.assertEqual(str(caught.exception), "mutation_failed")
+        self.assertIn("must be IP or peer hostname", caught.exception.detail)
+        self.assertNotIn("tskey-auth-abc123xyz", caught.exception.detail)
+        self.assertIn("[redacted]", caught.exception.detail)
 
     def test_one_dns_service_failure_does_not_skip_the_next(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -526,7 +682,7 @@ class RollbackTests(unittest.TestCase):
                                   tailscale_path=TS)
             self.assertEqual(result["result"], "rollback_restored")
             self.assertGreaterEqual(calls["dns"], 2)
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
 
     def test_unreadable_live_prefs_leave_the_exit_node_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -660,7 +816,7 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
             self.assertEqual((state / mod.PIN_FILE).read_text(encoding="utf-8").find(pinned.name) > 0, True)
             self.assertEqual(outside_file.read_text(encoding="utf-8"), "do-not-touch")
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
 
 
 class WorkdirTests(unittest.TestCase):
@@ -1223,7 +1379,7 @@ class CLITests(unittest.TestCase):
                 alive=lambda _pid: False, rollback_fn=rollback_fn)
             self.assertEqual(result["trigger"], "parent_dead")
             self.assertEqual(result["result"], "rollback_restored")
-            self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
             before = len(table.mutations)
             again = rollback_fn(state, snapshot_name=name)
             self.assertEqual(again["result"], "rollback_restored")

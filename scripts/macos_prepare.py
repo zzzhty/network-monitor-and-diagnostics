@@ -453,6 +453,126 @@ def _parse_prefs(code, text, error):
     return prefs
 
 
+# Official `tailscale set --exit-node` (CLI 1.104) accepts an IP, a MagicDNS
+# base name, or auto:any. auto:any selects whichever exit is available, so it
+# cannot restore one pinned node. A StableNodeID matches none of those forms.
+_EXIT_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _ip_or_none(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def exit_identity(prefs):
+    """Stable id and IP from prefs. Empty strings are absent, not selected."""
+    if not isinstance(prefs, dict):
+        return None, None
+    raw_id = prefs.get("ExitNodeID")
+    exit_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else None
+    return exit_id, _ip_or_none(prefs.get("ExitNodeIP"))
+
+
+def exits_match(want, have):
+    """True when both prefs describe the same exit selection, including none."""
+    want_id, want_ip = exit_identity(want)
+    have_id, have_ip = exit_identity(have)
+    if want_id and have_id:
+        return want_id == have_id
+    if want_ip and have_ip:
+        return want_ip == have_ip
+    return not want_id and not want_ip and not have_id and not have_ip
+
+
+def cli_exit_token_allowed(value):
+    """Empty clears. Any other token must be an IP or one MagicDNS label."""
+    if value == "":
+        return True
+    if not isinstance(value, str):
+        return False
+    if _ip_or_none(value) is not None:
+        return True
+    return _EXIT_HOSTNAME.fullmatch(value) is not None
+
+
+def _magic_dns_base(dns_name, suffix):
+    if not isinstance(dns_name, str) or not dns_name.strip():
+        return None
+    name = dns_name.strip()
+    if name.endswith("."):
+        name = name[:-1]
+    if isinstance(suffix, str) and suffix.strip():
+        trimmed = suffix.strip()
+        if trimmed.endswith("."):
+            trimmed = trimmed[:-1]
+        if name.lower().endswith("." + trimmed.lower()):
+            name = name[:-(len(trimmed) + 1)]
+    base = name.split(".", 1)[0]
+    if _EXIT_HOSTNAME.fullmatch(base):
+        return base
+    return None
+
+
+def _peer_tailscale_ip(peer):
+    found = []
+    for raw in peer.get("TailscaleIPs") or []:
+        ip = _ip_or_none(raw)
+        if ip is None or ip.is_unspecified or ip.is_loopback or ip.is_multicast:
+            continue
+        found.append(ip)
+    for ip in found:
+        if ip.version == 4:
+            return ip
+    return found[0] if found else None
+
+
+def _peer_is_exit(peer, exit_id, exit_ip):
+    if not isinstance(peer, dict) or peer.get("ExitNodeOption") is not True:
+        return False
+    if exit_id and peer.get("ID") == exit_id:
+        return True
+    if exit_ip is None:
+        return False
+    return any(_ip_or_none(raw) == exit_ip for raw in (peer.get("TailscaleIPs") or []))
+
+
+def exit_node_cli_value(prefs, status):
+    """CLI argument for the pinned exit, or None when it cannot be named.
+
+    ``ExitNodeID`` is a StableNodeID. The official CLI rejects that form.
+    The peer's Tailscale IP is preferred; the MagicDNS base name is the
+    fallback. ``auto:any`` is never returned.
+    """
+    exit_id, exit_ip = exit_identity(prefs)
+    if exit_id is None and exit_ip is None:
+        return None
+    peers = []
+    suffix = None
+    if isinstance(status, dict):
+        suffix = status.get("MagicDNSSuffix")
+        raw = status.get("Peer")
+        if isinstance(raw, dict):
+            peers = [peer for peer in raw.values() if _peer_is_exit(peer, exit_id, exit_ip)]
+    for peer in peers:
+        ip = _peer_tailscale_ip(peer)
+        if ip is not None and str(ip) != exit_id:
+            return str(ip)
+    for peer in peers:
+        base = _magic_dns_base(peer.get("DNSName"), suffix)
+        if base and base != exit_id:
+            return base
+    if exit_ip is not None and str(exit_ip) != exit_id:
+        return str(exit_ip)
+    return None
+
+
 def _parse_scutil_dns(code, text, error):
     if error or code != 0:
         return {"status": "unavailable", "reason": error or "command_failed",
@@ -716,6 +836,7 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
     tailscale_path = _first_tailscale(exists)
     status_view = {"availability": "unavailable", "reason": "binary_missing"}
     prefs = {"status": "unavailable", "reason": "binary_missing"}
+    status_document = None
     if tailscale_path is not None:
         code, text, error = _run(runner, (tailscale_path, "status", "--json"),
                                  _TAILSCALE_TIMEOUT, commands)
@@ -723,11 +844,18 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
             status_view = {"availability": "unavailable", "reason": error or "command_failed"}
         else:
             status_view = macos_coexist.normalize_tailscale_status(text, returncode=code)
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                status_document = parsed
         code, text, error = _run(runner, (tailscale_path, "debug", "prefs"),
                                  _TAILSCALE_TIMEOUT, commands)
         prefs = _parse_prefs(code, text, error)
     else:
         notes.append("tailscale_binary_missing")
+    exit_node_cli = exit_node_cli_value(prefs, status_document) if prefs.get("status") == "observed" else None
 
     if dns["status"] != "observed":
         notes.append("scutil_dns_unavailable")
@@ -758,7 +886,7 @@ def build_snapshot(platform, *, runner=None, exists=None, now=None):
         created_at=_timestamp(now)[1],
         created_at_unix=int(now),
         commands=commands,
-        tailscale={"status": status_view, "prefs": prefs},
+        tailscale={"status": status_view, "prefs": prefs, "exit_node_cli": exit_node_cli},
         dns=dict(dns, services=service_rows),
         proxy=proxy,
         routes={"inet": routes, "inet6": routes6},

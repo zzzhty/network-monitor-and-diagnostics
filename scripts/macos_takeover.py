@@ -27,6 +27,7 @@ restored values and does not mutate again.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -63,7 +64,6 @@ MIHOMO_CANDIDATES = (
     "/usr/local/sbin/mihomo",
 )
 _EXIT_FLAG = re.compile(r"^--exit-node(=.*)?$")
-_EXIT_VALUE = re.compile(r"^[A-Za-z0-9:_./+-]{0,200}$")
 _LAN_FLAG = "--exit-node-allow-lan-access"
 _LAN_TRUE = "--exit-node-allow-lan-access=true"
 _LAN_FALSE = "--exit-node-allow-lan-access=false"
@@ -107,8 +107,30 @@ print this text and do not escalate. System proxy and bypass are never changed.
 """
 
 
+_SECRET_TEXT = re.compile(r"(?i)\b(?:tskey-[A-Za-z0-9_-]*|authkey-\S+)")
+
+
+def sanitize_cli_detail(value):
+    """One short line of CLI stderr. Credentials are not kept."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    line = value.replace("\x00", "").strip().splitlines()[0]
+    line = "".join(ch if ch.isprintable() else " " for ch in line)
+    line = _SECRET_TEXT.sub("[redacted]", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    if len(line) > 180:
+        line = line[:180]
+    return line or None
+
+
 class TakeoverError(Exception):
-    """Stable error codes; never carries command output."""
+    """Stable error codes. ``detail`` is sanitized CLI text, never a secret."""
+
+    def __init__(self, code, detail=None):
+        super().__init__(code)
+        self.detail = sanitize_cli_detail(detail)
 
 
 # --- argv gates --------------------------------------------------------------
@@ -155,12 +177,16 @@ def mutating_allowlisted(argv, mihomo_path=None):
 
 
 def _safe_exit_value(item):
-    """``--exit-node`` or ``--exit-node=<token>``. Empty clears the node."""
+    """``--exit-node`` or ``--exit-node=<ip|label>``. Empty clears the node.
+
+    A StableNodeID, a node key, and ``auto:any`` are not accepted here.
+    ``auto:any`` would select some other exit instead of the pinned one.
+    """
     if item == "--exit-node":
         return True
     if not item.startswith("--exit-node="):
         return False
-    return _EXIT_VALUE.fullmatch(item.split("=", 1)[1]) is not None
+    return macos_prepare.cli_exit_token_allowed(item.split("=", 1)[1])
 
 
 def _config_inside_workdir(work_arg, flag_and_config):
@@ -175,15 +201,53 @@ def _config_inside_workdir(work_arg, flag_and_config):
     return config.parent == work and config.name not in ("", ".", "..")
 
 
+def _mutation_run(argv, timeout):
+    """Run one already-allowlisted mutation and keep a capped stderr line.
+
+    ``bounded_run`` drops stderr. A failed ``tailscale set`` is otherwise
+    only ``mutation_failed``, which is what the live rollback showed.
+    """
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None, "tool_missing", None
+    except PermissionError:
+        return None, "permission_denied", None
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return None, "permission_denied", None
+        return None, "launch_error", None
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.communicate(timeout=2)
+        return None, "timeout", None
+    detail = sanitize_cli_detail(err)
+    if out is not None and len(out) > 65536:
+        return None, "output_too_large", detail
+    return proc.returncode, None, detail
+
+
 def execute_mutating(argv, timeout=COMMAND_TIMEOUT, mihomo_path=None):
-    """One gated mutation through the shared bounded runner."""
+    """One gated mutation. Non-zero exits keep sanitized stderr on the error."""
     if not mutating_allowlisted(list(argv), mihomo_path):
         raise TakeoverError("mutation_not_allowlisted")
-    code, data, error = macos_readonly.bounded_run(list(argv), timeout, 65536)
+    code, error, detail = _mutation_run(list(argv), timeout)
     if error:
-        raise TakeoverError(error)
+        raise TakeoverError(error, detail)
     if code != 0:
-        raise TakeoverError("mutation_failed")
+        raise TakeoverError("mutation_failed", detail)
     return code
 
 
@@ -656,49 +720,99 @@ def _exit_set_argv(tailscale_path, value):
     return [tailscale_path, "set", flag]
 
 
-def restore_tailscale(prefs, tailscale_path, runner=None, mutator=None):
+def _read_status_document(tailscale_path, runner):
+    try:
+        code, text = read_state([tailscale_path, "status", "--json"], runner=runner)
+    except TakeoverError:
+        return None
+    if code != 0 or not isinstance(text, str):
+        return None
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _choose_exit_token(prefs, tailscale_path, runner, status_document, exit_node_cli):
+    """IP or MagicDNS label for the pinned exit. Never the StableNodeID."""
+    exit_id, _exit_ip = macos_prepare.exit_identity(prefs)
+    document = status_document
+    if document is None:
+        document = _read_status_document(tailscale_path, runner)
+    token = macos_prepare.exit_node_cli_value(prefs, document)
+    if token:
+        return token
+    if (isinstance(exit_node_cli, str)
+            and macos_prepare.cli_exit_token_allowed(exit_node_cli)
+            and exit_node_cli != exit_id):
+        return exit_node_cli
+    return None
+
+
+def _apply_mutation(mutator, argv, steps, failures, ok_step, fail_step):
+    try:
+        mutator(argv)
+    except TakeoverError as exc:
+        steps.append(fail_step)
+        failures.append({"step": fail_step, "error": str(exc), "detail": exc.detail})
+    else:
+        steps.append(ok_step)
+
+
+def restore_tailscale(prefs, tailscale_path, runner=None, mutator=None, *,
+                      status_document=None, exit_node_cli=None):
     """Idempotent restore from the snapshot prefs. Skips what already matches.
 
     If the snapshot could not read prefs at all, nothing is restored here:
     clearing whatever exit node happens to be set now would be a destructive
     guess, not a restore. A live prefs read that fails is reported and also
     changes nothing; the caller treats that as an incomplete rollback.
+
+    The exit-node argument is an IP or a MagicDNS base name. One failed
+    ``tailscale set`` does not skip accept-dns, allow-lan, or later NIC DNS.
     """
     mutator = mutator or execute_mutating
     steps = []
+    failures = []
     if not isinstance(prefs, dict) or prefs.get("status") != "observed":
-        return ["prefs_unavailable_in_snapshot"]
+        return ["prefs_unavailable_in_snapshot"], failures
     try:
         current = read_prefs(tailscale_path, runner=runner)
-    except TakeoverError:
-        return ["prefs_unreadable"]
-    want_exit = prefs.get("ExitNodeID") or prefs.get("ExitNodeIP")
-    have_exit = current.get("ExitNodeID") or current.get("ExitNodeIP")
-    if want_exit != have_exit:
-        argv = _exit_set_argv(tailscale_path, want_exit)
+    except TakeoverError as exc:
+        return ["prefs_unreadable"], [{"step": "prefs", "error": str(exc), "detail": exc.detail}]
+    if macos_prepare.exits_match(prefs, current):
+        want_id, want_ip = macos_prepare.exit_identity(prefs)
+        steps.append("exit_node_already_set" if want_id or want_ip else "exit_node_was_empty")
+    else:
+        want_id, want_ip = macos_prepare.exit_identity(prefs)
+        if want_id is None and want_ip is None:
+            argv = _exit_set_argv(tailscale_path, "")
+        else:
+            token = _choose_exit_token(
+                prefs, tailscale_path, runner, status_document, exit_node_cli)
+            argv = _exit_set_argv(tailscale_path, token) if token else None
         if argv is None:
             steps.append("exit_node_unrestorable")
         else:
-            mutator(argv)
-            steps.append("exit_node_restored")
-    elif want_exit:
-        steps.append("exit_node_already_set")
-    else:
-        steps.append("exit_node_was_empty")
+            _apply_mutation(mutator, argv, steps, failures,
+                            "exit_node_restored", "exit_node:failed")
     want_dns = prefs.get("CorpDNS")
     if isinstance(want_dns, bool) and want_dns is not current.get("CorpDNS"):
-        mutator([tailscale_path, "set",
-                 "--accept-dns=true" if want_dns else "--accept-dns=false"])
-        steps.append("accept_dns_restored")
+        _apply_mutation(
+            mutator,
+            [tailscale_path, "set", "--accept-dns=true" if want_dns else "--accept-dns=false"],
+            steps, failures, "accept_dns_restored", "accept_dns:failed")
     else:
         steps.append("accept_dns_unchanged")
     want_lan = prefs.get("ExitNodeAllowLANAccess")
     if isinstance(want_lan, bool) and want_lan is not current.get("ExitNodeAllowLANAccess"):
-        mutator([tailscale_path, "set", _LAN_TRUE if want_lan else _LAN_FALSE])
-        steps.append("allow_lan_restored")
+        _apply_mutation(
+            mutator, [tailscale_path, "set", _LAN_TRUE if want_lan else _LAN_FALSE],
+            steps, failures, "allow_lan_restored", "allow_lan:failed")
     else:
         steps.append("allow_lan_unchanged")
-    return steps
+    return steps, failures
 
 
 def restore_service_dns(services, runner=None, mutator=None):
@@ -1047,12 +1161,19 @@ def rollback(state_dir, *, runner=None, mutator=None, sleep=None, now=None,
         if not clean:
             return {"result": "rollback_blocked_dirty_dns", "steps": steps,
                     "snapshot": chosen.name}
-        steps.extend(restore_tailscale(snapshot["tailscale"]["prefs"], tailscale,
-                                       runner=runner, mutator=mutator))
-        steps.extend(restore_service_dns(snapshot["dns"]["services"],
+        tail = snapshot.get("tailscale") if isinstance(snapshot.get("tailscale"), dict) else {}
+        restored, failures = restore_tailscale(
+            tail.get("prefs"), tailscale, runner=runner, mutator=mutator,
+            exit_node_cli=tail.get("exit_node_cli"))
+        steps.extend(restored)
+        dns = snapshot.get("dns") if isinstance(snapshot.get("dns"), dict) else {}
+        steps.extend(restore_service_dns(dns.get("services") or [],
                                          runner=runner, mutator=mutator))
     result = "rollback_incomplete" if _rollback_incomplete(steps) else "rollback_restored"
-    return {"result": result, "steps": steps, "snapshot": chosen.name}
+    payload = {"result": result, "steps": steps, "snapshot": chosen.name}
+    if failures:
+        payload["failures"] = failures
+    return payload
 
 
 def _mark_engaged(state_dir, snapshot_name):
@@ -1631,7 +1752,13 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
                 state_dir, runner=runner, mutator=mutator, sleep=sleep, now=now,
                 tailscale_path=tailscale, snapshot_name=snapshot_name)
         except Exception as exc:  # never lose the record to a rollback crash
-            record["rollback"] = {"result": f"rollback_error:{type(exc).__name__}"}
+            record["rollback"] = {
+                "result": f"rollback_error:{type(exc).__name__}",
+                "error": str(exc) if isinstance(exc, TakeoverError) else type(exc).__name__,
+            }
+            detail = getattr(exc, "detail", None)
+            if detail:
+                record["rollback"]["detail"] = detail
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         macos_prepare._atomic_private_write(
             state_dir, f"takeover-{stamp}.json",
@@ -1836,8 +1963,10 @@ def main(argv=None):
                 return 2
             result = rollback(state_dir if state_dir is not None
                               else macos_prepare.default_state_dir())
-            print(json.dumps({"result": result["result"], "snapshot": result.get("snapshot")},
-                             ensure_ascii=False))
+            payload = {"result": result["result"], "snapshot": result.get("snapshot")}
+            if result.get("failures"):
+                payload["failures"] = result["failures"]
+            print(json.dumps(payload, ensure_ascii=False))
             return 0 if result["result"] == "rollback_restored" else 1
         options, rest = _parse_takeover_args(argv[1:])
         if rest:
@@ -1847,9 +1976,16 @@ def main(argv=None):
     except TakeoverError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
-    rollback_result = (record.get("rollback") or {}).get("result")
+    rollback_record = record.get("rollback") or {}
+    rollback_result = rollback_record.get("result")
     summary = {"result": record.get("result"), "rollback": rollback_result,
                "snapshot": record.get("snapshot")}
+    if rollback_record.get("failures"):
+        summary["failures"] = rollback_record["failures"]
+    if rollback_record.get("error"):
+        summary["error"] = rollback_record["error"]
+    if rollback_record.get("detail"):
+        summary["detail"] = rollback_record["detail"]
     if argv[0] == "accept":
         summary["guarantees_restore_if_watchdog_dies"] = False
     print(json.dumps(summary, ensure_ascii=False))

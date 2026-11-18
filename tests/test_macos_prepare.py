@@ -406,6 +406,61 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(services[0]["dnsservers"], [])
         self.assertEqual(services[1]["dnsservers"], ["192.0.2.53"])
 
+    def test_exit_node_cli_prefers_the_peer_ip_over_the_stable_id(self):
+        stable = "n292kg92CNTRL"
+        prefs = {"status": "observed", "ExitNodeID": stable, "ExitNodeIP": None}
+        status = {
+            "MagicDNSSuffix": "example.ts.net.",
+            "Peer": {"k": {
+                "ID": stable,
+                "DNSName": "pinned-exit.example.ts.net.",
+                "HostName": "do-not-hardcode",
+                "TailscaleIPs": ["fd7a:115c:a1e0::2", "100.64.0.2"],
+                "ExitNodeOption": True,
+            }},
+        }
+        self.assertEqual(mod.exit_node_cli_value(prefs, status), "100.64.0.2")
+        nameless = json.loads(json.dumps(status))
+        nameless["Peer"]["k"]["TailscaleIPs"] = []
+        self.assertEqual(mod.exit_node_cli_value(prefs, nameless), "pinned-exit")
+        same_name = json.loads(json.dumps(nameless))
+        same_name["Peer"]["k"]["DNSName"] = stable + ".example.ts.net."
+        self.assertIsNone(mod.exit_node_cli_value(prefs, same_name))
+        self.assertIsNone(mod.exit_node_cli_value(prefs, {"Peer": {}}))
+        not_advertising = json.loads(json.dumps(status))
+        not_advertising["Peer"]["k"]["ExitNodeOption"] = False
+        self.assertIsNone(mod.exit_node_cli_value(prefs, not_advertising))
+        self.assertEqual(mod.exit_node_cli_value(
+            {"ExitNodeID": stable, "ExitNodeIP": "100.64.0.9"}, None), "100.64.0.9")
+        self.assertFalse(mod.cli_exit_token_allowed("auto:any"))
+        self.assertFalse(mod.cli_exit_token_allowed("nodekey:abc"))
+        self.assertTrue(mod.cli_exit_token_allowed("100.64.0.2"))
+        self.assertTrue(mod.cli_exit_token_allowed(""))
+
+    def test_snapshot_records_the_cli_target_and_the_summary_hides_it(self):
+        stable = "n292kg92CNTRL"
+        table = fixtures(prefs_text=json.dumps({
+            "ExitNodeID": stable, "ExitNodeIP": "", "CorpDNS": True,
+            "RouteAll": False, "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        }))
+        table[(TAILSCALE, "status", "--json")] = (0, json.dumps({
+            "BackendState": "Running", "Self": {"Online": True, "HostName": "hidden-host"},
+            "MagicDNSSuffix": "example.ts.net.",
+            "Peer": {"k": {
+                "ID": stable, "Online": True, "ExitNodeOption": True,
+                "DNSName": "pinned-exit.example.ts.net.",
+                "HostName": "pinned-exit", "TailscaleIPs": ["100.64.0.2"],
+            }},
+        }), None)
+        snapshot = self.build(table)
+        self.assertEqual(snapshot["tailscale"]["exit_node_cli"], "100.64.0.2")
+        self.assertEqual(snapshot["tailscale"]["prefs"]["ExitNodeID"], stable)
+        summary = mod.summarize_snapshot(snapshot)
+        blob = json.dumps(summary)
+        self.assertNotIn("100.64.0.2", blob)
+        self.assertNotIn("pinned-exit", blob)
+        self.assertNotIn(stable, blob)
+
     def test_invalid_prefs_json_is_unavailable_and_noted(self):
         snapshot = self.build(fixtures(prefs_text="{not json"))
         self.assertEqual(snapshot["tailscale"]["prefs"]["status"], "unavailable")
