@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 import macos_coexist
 import nmd_daemon as d
-from test_macos_takeover import FakeProcess, Table, TS, MIHOMO
+from test_macos_takeover import EXIT_IP, FakeProcess, MIHOMO, PINNED_IP, Table, TS
 
 CONFIG = {"schema_version": 1, "dashboard": {"port": 8765},
           "takeover": {"inputs": {"proxy_name": "VPS", "server": "fd7a:115c:a1e0::abcd",
@@ -492,7 +492,7 @@ class SupervisorTests(unittest.TestCase):
         sup = make_supervisor(self.state, table, on_boot=True, boottime=lambda: 111)
         sup._recover_leftovers()
         sup._boot_policy()
-        self.assertIn([TS, "set", "--exit-node=nodekey:pinned"], table.mutations)
+        self.assertIn([TS, "set", "--exit-node=" + PINNED_IP], table.mutations)
         self.assertFalse(any("evil" in json.dumps(item) for item in table.mutations))
         status = sup.status()
         self.assertEqual((status["phase"], status["result"]),
@@ -541,7 +541,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((status["phase"], status["result"]),
                          (d.PHASE_ROLLED_BACK, "critical_failures"))
         self.assertFalse(status["takeover_active"])
-        self.assertIn([TS, "set", "--exit-node=nodekey:abc"], table.mutations)
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
         self.assertFalse(any(item[2:3] == ["--exit-node="] for item in table.mutations
                              if item[0] == TS))
 

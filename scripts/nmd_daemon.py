@@ -1139,8 +1139,14 @@ def uninstall_root_plist():
 def cli_daemon(argv):
     """`nmd macos daemon install|uninstall|start|stop|status|takeover-start`."""
     import manager
+    if any(arg in ("-h", "--help") for arg in argv):
+        sys.stdout.write(HELP)
+        return 0
     if not argv or argv[0] not in ("install", "uninstall", "start", "stop",
                                    "status", "takeover-start", "takeover-stop"):
+        sys.stderr.write(HELP)
+        return 2
+    if len(argv) != 1:
         sys.stderr.write(HELP)
         return 2
     action = argv[0]
@@ -1155,8 +1161,11 @@ def cli_daemon(argv):
         return 0 if "error" not in reply else 1
     if action == "takeover-start":
         if os.geteuid() != 0:
-            os.execvp("sudo", ["sudo", "--", sys.executable,
-                               str(Path(__file__).resolve()), "daemon", *argv])
+            try:
+                macos_takeover.reexec_root(Path(__file__).resolve(), ["daemon", *argv])
+            except macos_takeover.TakeoverError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                return 2
         reply = DaemonIPCClient(SOCKET_PATH).start_takeover()
         print(json.dumps(reply, ensure_ascii=False, indent=2))
         return 0 if "error" not in reply else 1
@@ -1364,22 +1373,27 @@ def run_user_daemon(config, *, monitor_config_path=None):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv in ([], ["help"], ["-h"], ["--help"]):
-        stream = sys.stdout if argv else sys.stderr
-        stream.write(HELP)
-        return 0 if argv else 2
+    if any(arg in ("-h", "--help") for arg in argv) or argv == ["help"]:
+        sys.stdout.write(HELP)
+        return 0
+    if not argv:
+        sys.stderr.write(HELP)
+        return 2
     if argv[0] in ("install-root", "uninstall-root", "start-root", "stop-root"):
         return cli_root_helper(argv)
     if argv[0] == "daemon":
         return cli_daemon(argv[1:])
     if argv[0] == "supervise":
-        if os.geteuid() != 0:
-            os.execvp("sudo", ["sudo", "--", sys.executable,
-                               str(Path(__file__).resolve()), *argv])
         config_path, state_dir = _supervise_args(argv[1:])
         if config_path is None or state_dir is None:
             sys.stderr.write(HELP)
             return 2
+        if os.geteuid() != 0:
+            try:
+                macos_takeover.reexec_root(Path(__file__).resolve(), argv)
+            except macos_takeover.TakeoverError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                return 2
         config = load_daemon_config(config_path)
         check_private_config(config_path)
         state_dir = Path(state_dir if config["takeover"]["state_dir"] is None
