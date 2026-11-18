@@ -1558,8 +1558,10 @@ class PowerAndSentinelTests(unittest.TestCase):
             state = Path(tmp)
             pinned = self.write_snapshot(state)
             mod.write_pin(state, pinned.name)
-            (state / mod.WATCH_RESULT_FILE).write_text(
-                json.dumps({"result": "rollback_restored"}), encoding="utf-8")
+            (state / mod.WATCH_RESULT_FILE).write_text(json.dumps({
+                "result": "rollback_restored", "pin": pinned.name,
+                "deadline_unix": 50, "pid": 4242,
+            }), encoding="utf-8")
 
             def boom(*_args, **_kwargs):
                 raise AssertionError("rollback")
@@ -1571,6 +1573,80 @@ class PowerAndSentinelTests(unittest.TestCase):
             self.assertEqual(result["trigger"], "watchdog_restored")
             self.assertEqual(result["result"], "rollback_restored")
             self.assertFalse(result["guarantees_restore_if_watchdog_dies"])
+
+    def test_a_previous_runs_restored_result_does_not_finish_this_sentinel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pinned = self.write_snapshot(state, services=(("Wi-Fi", []),))
+            mod.write_pin(state, pinned.name)
+            (state / mod.WATCH_RESULT_FILE).write_text(
+                json.dumps({"result": "rollback_restored", "pin": "pre-start-old.json",
+                            "deadline_unix": 1, "pid": 9}), encoding="utf-8")
+            table = Table(services=(("Wi-Fi", []),))
+            table.exit_node_cleared = True
+            result = mod.run_restore_sentinel(
+                state, pin=pinned.name, deadline_unix=50, watchdog_pid=4242,
+                parent_pid=7, now=lambda: 0, sleep=lambda _seconds: None,
+                alive=lambda _pid: False, rollback_fn=self._rollback(table))
+            self.assertEqual(result["trigger"], "watchdog_dead")
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+            self.assertNotIn("nodekey:", json.dumps(table.mutations))
+
+    def test_arm_drops_a_previous_result_and_refuses_a_result_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            pin = "pre-start-20260101T000000Z.json"
+            (state / mod.WATCH_RESULT_FILE).write_text(
+                json.dumps({"result": "rollback_restored"}), encoding="utf-8")
+            (state / mod.SENTINEL_RESULT_FILE).write_text(
+                json.dumps({"result": "rollback_restored"}), encoding="utf-8")
+            seen = {}
+
+            class Child:
+                def __init__(self, pid):
+                    self.pid = pid
+
+                def poll(self):
+                    return None
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def write_ready(path, pid):
+                path.write_text(json.dumps({
+                    "ready": True, "pid": pid, "pgid": pid, "euid": 0,
+                    "pin": pin, "deadline_unix": 80,
+                }), encoding="utf-8")
+
+            def spawn_watch(state_dir, _pin, _deadline):
+                seen["watch"] = not (Path(state_dir) / mod.WATCH_RESULT_FILE).exists()
+                seen["sentinel"] = not (Path(state_dir) / mod.SENTINEL_RESULT_FILE).exists()
+                write_ready(Path(state_dir) / mod.READY_FILE, 70)
+                return Child(70)
+
+            def spawn_sentinel(state_dir, *_args):
+                write_ready(Path(state_dir) / mod.SENTINEL_READY_FILE, 71)
+                return Child(71)
+
+            probe = lambda pid: {"alive": True, "pgid": pid, "uid": 0}
+            with patch.object(mod.os, "kill", lambda *_args, **_kwargs: None):
+                armed = mod.arm_external_watchdog(
+                    state, pin, 80, spawn=spawn_watch, spawn_sentinel=spawn_sentinel,
+                    probe=probe, sleep=lambda _seconds: None, now=lambda: 0)
+            self.assertTrue(armed["sentinel_ready"])
+            self.assertEqual(seen, {"watch": True, "sentinel": True})
+
+            (state / mod.WATCH_RESULT_FILE).symlink_to(state / "not-a-result")
+
+            def refused(*_args, **_kwargs):
+                raise AssertionError("spawned")
+
+            blocked = mod.arm_external_watchdog(
+                state, pin, 80, spawn=refused, spawn_sentinel=refused,
+                probe=probe, sleep=lambda _seconds: None, now=lambda: 0)
+            self.assertEqual(blocked, {"ready": False, "reason": "ready_unknown"})
+            self.assertTrue((state / mod.WATCH_RESULT_FILE).is_symlink())
 
     def test_sentinel_takes_over_when_the_watchdog_stays_silent_past_grace(self):
         with tempfile.TemporaryDirectory() as tmp:

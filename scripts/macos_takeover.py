@@ -1565,10 +1565,21 @@ def _pid_alive(pid):
     return True
 
 
-def _watch_result_restored(state_dir):
-    """True only when the watchdog already recorded a completed restore."""
+def _watch_result_restored(state_dir, *, pin, deadline_unix, watchdog_pid):
+    """True only when this watchdog recorded a completed restore for this run.
+
+    A reused state directory can still hold the previous run's
+    ``rollback_restored``. That file is not this run: the pin, the absolute
+    deadline, and the watchdog pid all have to match.
+    """
     document = _read_ready_document(Path(state_dir) / WATCH_RESULT_FILE)
-    return isinstance(document, dict) and document.get("result") == "rollback_restored"
+    if not isinstance(document, dict) or document.get("result") != "rollback_restored":
+        return False
+    if document.get("pin") != pin or type(deadline_unix) is not int:
+        return False
+    if document.get("deadline_unix") != deadline_unix or type(watchdog_pid) is not int:
+        return False
+    return document.get("pid") == watchdog_pid
 
 
 def run_rollback_watch(state_dir, *, pin, deadline_unix, parent_pid, now=None,
@@ -1615,6 +1626,9 @@ def run_rollback_watch(state_dir, *, pin, deadline_unix, parent_pid, now=None,
     if isinstance(result, dict):
         result = dict(result)
         result["trigger"] = trigger
+        result["pin"] = pin
+        result["deadline_unix"] = deadline_unix if type(deadline_unix) is int else None
+        result["pid"] = os.getpid()
         result["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
     macos_prepare._atomic_private_write(
         state, WATCH_RESULT_FILE,
@@ -1628,10 +1642,12 @@ def run_restore_sentinel(state_dir, *, pin, deadline_unix, watchdog_pid, parent_
 
     Ready is written only after the same pin and snapshot load. The loop does
     not restore while the watchdog is alive and the deadline grace remains.
-    A recorded ``rollback_restored`` means the watchdog already finished; this
-    process does not mutate again. Any earlier watchdog exit, or silence past
-    the grace, uses the pinned snapshot and the existing rollback. Exit-node
-    arguments therefore stay on the PR #8 contract.
+    A recorded ``rollback_restored`` means this watchdog already finished this
+    pin, deadline, and pid. A previous run's result file does not count, and
+    this process does not mutate again when the current one does. Any earlier
+    watchdog exit, or silence past the grace, uses the pinned snapshot and
+    the existing rollback. Exit-node arguments therefore stay on the PR #8
+    contract.
 
     This process dying too is not covered. The returned claim stays false.
     ``parent_pid`` is recorded so a later reader can see which controller
@@ -1669,7 +1685,8 @@ def run_restore_sentinel(state_dir, *, pin, deadline_unix, watchdog_pid, parent_
                 "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES}
     trigger = None
     while trigger is None:
-        if _watch_result_restored(state):
+        if _watch_result_restored(
+                state, pin=pin, deadline_unix=deadline_unix, watchdog_pid=watchdog_pid):
             trigger = "watchdog_restored"
             break
         if alive(watchdog_pid) is False:
@@ -1681,6 +1698,9 @@ def run_restore_sentinel(state_dir, *, pin, deadline_unix, watchdog_pid, parent_
         sleep(0.2)
     if trigger == "watchdog_restored":
         result = {"result": "rollback_restored", "steps": [], "trigger": trigger,
+                  "pin": pin,
+                  "deadline_unix": deadline_unix if type(deadline_unix) is int else None,
+                  "pid": watchdog_pid,
                   "guarantees_restore_if_watchdog_dies": GUARANTEES_RESTORE_IF_WATCHDOG_DIES}
     else:
         result = rollback_fn(state, snapshot_name=pin)
@@ -1689,6 +1709,9 @@ def run_restore_sentinel(state_dir, *, pin, deadline_unix, watchdog_pid, parent_
         else:
             result = dict(result)
         result["trigger"] = trigger
+        result["pin"] = pin
+        result["deadline_unix"] = deadline_unix if type(deadline_unix) is int else None
+        result["pid"] = watchdog_pid
         result["guarantees_restore_if_watchdog_dies"] = GUARANTEES_RESTORE_IF_WATCHDOG_DIES
     macos_prepare._atomic_private_write(
         state, SENTINEL_RESULT_FILE,
@@ -1727,6 +1750,11 @@ def arm_external_watchdog(state_dir, pin, deadline_unix, *, spawn=None, probe=No
     if info is not None:
         with contextlib.suppress(OSError):
             ready_path.unlink()
+    # A reused directory still holds the previous run's success. Leaving it
+    # makes the new sentinel exit before it is armed.
+    for name in (WATCH_RESULT_FILE, SENTINEL_RESULT_FILE):
+        if not _prepare_ready_file(state_dir / name):
+            return {"ready": False, "reason": "ready_unknown"}
     child = spawn(state_dir, pin, deadline_unix) if spawn is not None else _spawn_watch(
         state_dir, pin, deadline_unix)
     if child is None or not isinstance(getattr(child, "pid", None), int):
