@@ -1,7 +1,7 @@
 # NMD macOS 实验性只读诊断
 
 macOS 是桌面机。NMD 在这里的定位是监控（monitor）和诊断（diagnostics）。与 Clash Verge Rev 共同使用时，流量由 Clash Verge Rev 管理。桌面端长期客户端仍在调研（具体软件调研中，待定）。
-NMD 不部署 mihomo，不改 DNS、路由、TUN 或系统代理。
+默认的监控和诊断不部署 mihomo，不改 DNS、路由、TUN 或系统代理。显式实验接管，以及重载一个正在接管的常驻守护，会改变网络；见下文的预检和 `apply`。
 平台分工见 [跨平台分工](platforms.md)。
 
 开发位置：`~/Projects/network-monitor-and-diagnostics`，分支 `feat/macos-support`。
@@ -55,7 +55,7 @@ systemd 安装管理，面板不提供编辑。
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 诊断只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host；macOS 额外仅开放 `/api/config` 编辑自己的 monitor 配置（不启动采集） |
 | 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
-| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时执行 `nmd macos daemon restart`（先 stop 再 start），不部署网络、不启动接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
+| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时先做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。预检失败不 stop、不 sudo。进行中的接管会被这次 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
 | 实验性自管接管（单次） | `sudo nmd macos takeover`：sudo 前台运行 mihomo 接管出口，绝对截止（默认 10 分钟、上限 8 小时，按墙钟），STOP/到期/连续 3 个故障周期幂等回退；唤醒后复查或回退。仅显式运行，无常驻组件。accept 的 sentinel 有一次实机恢复记录；睡眠唤醒尚未验收。见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md) |
 | 实验性自管接管（常驻 daemon） | `nmd macos daemon install`：root 管理器（launchd KeepAlive）常驻监督接管——无绝对截止，健康故障（默认连续 3 周期）或 mihomo 退出即自动回退，唤醒后复查托管状态且不因此启动接管，手动停止走 CLI 或面板；开机策略 `daemon.json` 的 `on_boot`（默认关）。面板归属 daemon，桌面壳自动复用。未实机验证。策略见 `DAEMON_POLICY`。 |
 
@@ -67,12 +67,38 @@ systemd 安装管理，面板不提供编辑。
 不启动后台常驻，不自动测速、修复或切换网络。唯一例外是显式 `nmd desktop autostart on`
 写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
 macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `desktop` 生命周期。
-`apply` 记录当前版本；已安装常驻守护时重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
-它不下载代理资产，不改路由、DNS、系统代理或 Tailscale，也不调用 `takeover-start`。
+`apply` 记录当前版本；已安装常驻守护时先做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
+它不下载代理资产，也不调用 `takeover-start`。预检失败时不会 stop，也不会 sudo，待应用状态保留。
+若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。
+若 `daemon.json` 的 `on_boot` 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。
+会话若停在 `active`、`starting` 或 `needs_rollback`，启动会先把那次回退做完。
 `start` 在任务未加载时会 bootstrap，所以未加载的 root 管理器会被 `apply` 拉起。
 用户 LaunchAgent 不在这次重载里。`install`（monitor）、`adopt`、`source`、顶层网络命令
 及 `monitor start/enable/install/...` 仍是 Linux 管理能力，在 macOS 明确报不支持。
 请勿通过直接运行 Linux 脚本尝试这些操作。
+
+## 只读预检
+
+三档分开，打开面板不要求接管才用得到的组件：
+
+```bash
+./nmd macos preflight
+./nmd macos preflight --tier readonly
+./nmd macos preflight --tier daemon
+./nmd macos preflight --tier takeover
+```
+
+| 档 | 什么时候用 | 查什么 |
+| --- | --- | --- |
+| `readonly` | 面板、只读诊断。默认就是这一档 | 当前用户能不能用采集目录；已安装守护时面板端口是否被占用。不查 mihomo、Tailscale、geodata |
+| `daemon` | `daemon start` / `restart`，以及已安装守护时的 `apply` / `refresh` | mihomo 是否可执行、官方 Tailscale 命令行、`daemon.json`、状态目录权限。`on_boot` 为 true，或看不清守护是否正在接管时，同时要求下一档 |
+| `takeover` | `accept`、`takeover`、`daemon takeover-start` 改网络之前 | 上一档之外，还有版本能力、离线配置、geodata、Tailscale 是否在运行、198.18 / 已有 mihomo / DNS 端口 |
+
+`tun.dns-mode: native` 需要 mihomo 1.19.33 或更新。这是文档里 native 模式的要求，不是把曾经观测到的 1.19.34 当成最低版本。`dns-mode: disabled` 没有这道下限。
+
+输出是一份 JSON：`result` 为 `pass`、`fail` 或 `unknown`。`unknown` 是探测没有得到结果，不会当成通过。退出码分别是 0、1、3。`fail` 和 `unknown` 都不会 sudo、stop、start 或改网络。失败项带一句中文的下一步，例如把官方 mihomo 或官方 Tailscale 装到哪、地理数据放哪。不会自动安装或下载，也不会打印配置正文、地址或密钥。
+
+这些检查在本仓库里用替身和离线用例验证。它们不是实机验收，也不表示睡眠唤醒或 watchdog 恢复已经在真机上通过。
 
 ## 可选：显式本机单次观测
 

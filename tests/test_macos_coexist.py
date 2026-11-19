@@ -188,7 +188,8 @@ class ProfileTests(unittest.TestCase):
                 continue
             source = path.read_text(encoding="utf-8")
             if path.name in ("macos_readonly.py", "macos_prepare.py",
-                             "macos_takeover.py", "nmd_daemon.py"):
+                             "macos_takeover.py", "macos_preflight.py",
+                             "nmd_daemon.py"):
                 self.assertIn("import macos_coexist", source)
                 continue
             self.assertNotIn("import macos_coexist", source)

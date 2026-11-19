@@ -918,7 +918,11 @@ class DaemonRestartTests(unittest.TestCase):
                 raise d.DaemonError("socket_missing")
 
         output = io.StringIO()
+        # The stop-then-start order is what this class checks. The darwin
+        # preflight gate is covered by test_macos_preflight and must not
+        # stat this runner's mihomo, Tailscale, or daemon socket.
         with patch.object(d, "daemon_receipt", return_value=None), \
+                patch("macos_preflight.host_is_darwin", return_value=False), \
                 patch.object(d, "_run_helper", side_effect=helper), \
                 patch.object(d, "DaemonIPCClient", client or Client), \
                 contextlib.redirect_stdout(output):

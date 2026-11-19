@@ -311,11 +311,17 @@ launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端�
 重新 `bootstrap` 再 `kickstart`。卸载同时 `bootout` 当前用户的 LaunchAgent。
 示例配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
 **`nmd update` 只更新磁盘代码，不重载进程。** 已安装守护时，`nmd apply`
-（`refresh` 同义）执行 `nmd macos daemon restart`。它不跑 Linux 的网络部署，
-不调用 `takeover-start`，不改路由、DNS、系统代理、Tailscale 或 `on_boot`。
-未安装守护时 `nmd apply` 只记录版本，不执行 sudo。`start` 会在任务未加载时
-bootstrap，因此已安装但未加载的 root 管理器会被 `apply` 拉起。用户
-LaunchAgent 不在这次重载里。daemon 代码没有在实机运行。另一终端的
+（`refresh` 同义）先做只读预检，通过后才执行 `nmd macos daemon restart`。
+它不跑 Linux 的网络部署，不调用 `takeover-start`，也不改 `on_boot`。
+预检失败则不 stop、不 sudo，待应用保留。若当时有进行中的接管，stop 会先按
+快照回退，路由、DNS 或 Tailscale exit node 会变。若 `on_boot` 为 true，且
+这次启动被管理器当成新的一次开机，它可能开始接管。会话若停在 active、
+starting 或 needs_rollback，启动会先把那次回退做完。未安装守护时 `nmd apply`
+只记录版本，不执行 sudo。`start` 会在任务未加载时 bootstrap，因此已安装但未
+加载的 root 管理器会被 `apply` 拉起。用户 LaunchAgent 不在这次重载里。
+显式只读入口是 `nmd macos preflight --tier readonly|daemon|takeover`：面板档
+不要求 mihomo；守护档在 start/restart 之前；接管档在改网络之前。`fail` 和
+`unknown` 都不继续。daemon 代码没有在实机运行。另一终端的
 `sudo nmd macos rollback` 不拿管理器的锁：它读 pin，只在 `owned-mihomo.json`
 里的 pid、`ps` 的启动时间、完整 argv（含精确的 `-d` 工作目录）和会话组
 长身份同时对得上时才发信号，再按这份原始快照恢复。pid 被同名进程复用、
