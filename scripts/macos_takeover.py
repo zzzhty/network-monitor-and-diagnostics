@@ -107,8 +107,10 @@ SLEEP_GAP_SECONDS = 2.0
 GUARANTEES_RESTORE_IF_WATCHDOG_DIES = False
 DAEMON_SOCKET = "/var/run/nmd-daemon.sock"
 # geoip.dat is copied only when it is already on disk. The generated config
-# does not set geodata-mode, so mihomo reads MMDB (geoip.metadb) instead.
-GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
+# does not set geodata-mode, so mihomo reads MMDB. geoip.db is one of the
+# names mihomo 1.19 equal-folds for that MMDB; leaving it out of this list
+# would accept the file in preflight and then hand mihomo an empty work dir.
+GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat", "geoip.db")
 GEODATA_MAX_BYTES = 64 * 1024 * 1024
 
 HELP = """\
@@ -2542,14 +2544,20 @@ def main(argv=None):
                 return 2
             import macos_geodata
             try:
-                macos_geodata.prepare_for_foreground(options)
+                prepared = macos_geodata.prepare_for_foreground(options)
             except (OSError, ValueError, TypeError, KeyError, macos_geodata.GeodataError):
-                pass
+                prepared = {"ok": False, "reason": "geodata_failed"}
             report = macos_preflight.for_foreground(options)
             if report.get("blocking"):
                 print(json.dumps(dict(report, refused_action=argv[0]),
                                  ensure_ascii=False, indent=2))
                 return macos_preflight.exit_code(report)
+            if macos_geodata.blocks_action(prepared):
+                refusal = macos_geodata.action_refusal(
+                    argv[0], prepared, geodata_dir=options.get("geodata_dir"),
+                    tier="takeover")
+                print(json.dumps(refusal, ensure_ascii=False, indent=2))
+                return macos_preflight.exit_code(refusal)
     try:
         if os.geteuid() != 0:
             reexec_root(Path(__file__).resolve(), argv)

@@ -111,7 +111,7 @@ nmd macos geodata ensure
 nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
 ```
 
-不带 `--geodata-dir` 时写到当前账户的 `~/.config/mihomo`。这个目录也是 sudo 前台（`SUDO_USER` 的家目录）和 launchd（daemon 配置所有者的家目录）复制地理数据的地方。不要用 sudo 跑这条命令：它不会把文件写进 `/var/root`，也不会改 root 拥有的权限。显式目录只写该目录。规则里没有 `GEOSITE` 就不下 `geosite.dat`，没有 `GEOIP` 就不下 `geoip.metadb`。文件已经是合法的 MMDB 或 geosite 时不访问网络。
+不带 `--geodata-dir` 时写到当前账户的 `~/.config/mihomo`。这个目录也是 sudo 前台（`SUDO_USER` 的家目录）和 launchd（daemon 配置所有者的家目录）复制地理数据的地方。不要用 sudo 跑这条命令：它不会把文件写进 `/var/root`，也不会改 root 拥有的权限。显式 `--geodata-dir` 只写该目录，规则来自 `--inputs` 或已安装的 `daemon.json` 时都一样。规则里没有 `GEOSITE` 就不下 `geosite.dat`，没有 `GEOIP` 就不下 `geoip.metadb`。文件已经是合法的 MMDB 或 geosite 时不访问网络。下载或格式校验失败时，原来的字节留在原地；目录里剩下一个非空但无效的文件也不会 sudo、stop，或把这次 apply 记成已应用。复制进 mihomo 工作目录时包含 `geoip.db`，因为这个名字和 `geoip.metadb`、`Country.mmdb` 一样被 mihomo 1.19 认作 MMDB。
 
 `accept`、`takeover`，以及需要接管检查的 `daemon start` / `restart` / `takeover-start`（含已安装守护上的 `apply`），会在 sudo、stop、start 之前做同一步。下载或校验失败则不继续，不改路由、DNS、代理或 Tailscale，也不把版本记成已应用。`preflight`、`help`、`status` 和只读面板不会下载。
 

@@ -83,8 +83,9 @@ usage: nmd macos geodata ensure [--geodata-dir DIR] [--inputs FILE] [--profile F
 Download geodata required by the generated rules when a valid file is not
 already in the destination. GEOSITE uses geosite.dat. GEOIP uses the MMDB
 file geoip.metadb; an existing Country.mmdb or geoip.db counts, and
-geoip.dat is not downloaded. The destination is --geodata-dir, or
-~/.config/mihomo for this account.
+geoip.dat is not downloaded. Rules come from --inputs, or from the installed
+daemon.json when --inputs is omitted. --geodata-dir is the destination
+either way; otherwise the destination is ~/.config/mihomo for this account.
 
 Does not sudo, stop, start, or change routes, DNS, proxy, or Tailscale.
 nmd macos preflight, help, status, and the read-only panel do not download.
@@ -296,22 +297,68 @@ def prepare_for_foreground(options, *, transport=None):
 
 
 def prepare_for_daemon(action, *, transport=None):
-    """Ensure before daemon start/restart/takeover-start. Does not stop or sudo."""
+    """Ensure before daemon start/restart/takeover-start. Does not stop or sudo.
+
+    Root does not download and does not create a directory. It may continue
+    only when every required file is already valid. A failed download is
+    ``ok: false`` so the caller can refuse stop and sudo; a readable but
+    invalid leftover is not treated as success.
+    """
     import macos_preflight
     if not macos_preflight.host_is_darwin():
         return _result(True, None, directory=None, needed=[], skipped=True)
     if action not in ("start", "restart", "takeover-start"):
         return _result(True, None, directory=None, needed=[], skipped=True)
-    if os.geteuid() == 0:
-        return _result(False, "root_refused", directory=None, needed=[])
     if not _daemon_wants_geodata(action):
         return _result(True, None, directory=None, needed=[], skipped=True)
     needs_site, needs_ip, problem = _installed_needs()
     if problem:
         return _result(False, problem, directory=None, needed=[])
+    if os.geteuid() == 0:
+        return _root_existing(needs_site, needs_ip)
     directory, create = _default_destination()
     return ensure_into(directory, needs_site=needs_site, needs_ip=needs_ip,
                        transport=transport, create=create)
+
+
+def blocks_action(result):
+    """True when preparation failed and the caller must not sudo, stop, or start."""
+    if not isinstance(result, dict):
+        return True
+    return not (result.get("ok") or result.get("skipped"))
+
+
+def action_refusal(action, result, *, geodata_dir=None, tier="daemon"):
+    """A blocking report for a failed ensure that presence-only preflight can miss."""
+    reason = _token((result or {}).get("reason") if isinstance(result, dict) else None,
+                    "geodata_failed")
+    remediation = geodata_remediation(geodata_dir)
+    if tier == "takeover":
+        effects = {"preflight_mutates": False, "command_may_change_network": True}
+    else:
+        effects = {"preflight_mutates": False,
+                   "later_restart_may_roll_back_active_takeover": None,
+                   "later_start_may_takeover_on_new_boot": None,
+                   "later_start_may_finish_a_pending_rollback": True}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "macos_preflight",
+        "tier": tier,
+        "result": "fail",
+        "blocking": True,
+        "refused_action": action,
+        "reason": reason,
+        "checks": [{
+            "id": "geodata",
+            "status": "fail",
+            "required": True,
+            "reason": reason,
+            "summary": "地理数据没有通过下载或格式校验，已有文件保持原样。",
+            "remediation": remediation,
+        }],
+        "remediation": [remediation],
+        "effects": effects,
+    }
 
 
 def main(argv=None):
@@ -343,8 +390,6 @@ def main(argv=None):
             body = _result(False, problem, directory=None, needed=[])
             print(_dumps(body))
             return 1
-        directory, create = _default_destination()
-        explicit = None
     else:
         import macos_preflight as preflight
         document = preflight.inspect_document(options["profile"], options["inputs"])
@@ -355,12 +400,12 @@ def main(argv=None):
             return 1
         needs_site = bool(document.get("needs_site"))
         needs_ip = bool(document.get("needs_ip"))
-        explicit = options["geodata_dir"]
-        if explicit:
-            directory, create = Path(explicit), (not Path(explicit).exists()
-                                                 and not Path(explicit).is_symlink())
-        else:
-            directory, create = _default_destination()
+    explicit = options.get("geodata_dir")
+    if explicit:
+        path = Path(explicit)
+        directory, create = path, (not path.exists() and not path.is_symlink())
+    else:
+        directory, create = _default_destination()
     body = ensure_into(directory, needs_site=needs_site, needs_ip=needs_ip, create=create)
     probed = None
     if body.get("directory"):
@@ -666,6 +711,26 @@ def _default_destination():
     return Path.home() / ".config" / "mihomo", True
 
 
+def _root_existing(needs_site, needs_ip):
+    """Read-only check for euid 0. Does not create, download, or chmod."""
+    needed = _needed(needs_site, needs_ip)
+    try:
+        directory = macos_takeover.resolve_geodata_dir(None)
+    except macos_takeover.TakeoverError:
+        directory = None
+    if directory is None:
+        return _result(False, "root_refused", directory=None, needed=needed)
+    try:
+        present, pending, problem = _plan(directory, needed)
+    except GeodataError as exc:
+        return _result(False, exc.reason, directory=None, needed=needed)
+    if problem or pending:
+        return _result(False, problem or "root_refused", directory=directory,
+                       needed=needed, present=present)
+    return _result(True, None, directory=directory, needed=needed,
+                   present=present, downloaded=[])
+
+
 def _daemon_wants_geodata(action):
     import macos_preflight
     if action == "takeover-start":
@@ -692,7 +757,7 @@ def _installed_needs():
         return False, False, "unreadable"
     if stat.S_ISLNK(info.st_mode):
         return False, False, "symlink"
-    if info.st_uid != os.geteuid():
+    if os.geteuid() != 0 and info.st_uid != os.geteuid():
         return False, False, "config_owner_mismatch"
     config, problem = macos_preflight._load_installed_config(root)
     takeover = config.get("takeover") if isinstance(config, dict) else None

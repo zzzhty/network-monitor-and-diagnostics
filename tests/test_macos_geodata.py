@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import macos_geodata as geodata
 import macos_preflight as pf
+import macos_readonly
 import macos_takeover
 import manager
 import nmd_daemon
@@ -64,6 +65,28 @@ def _private(path):
     path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
     return path
+
+
+def _daemon_probes():
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch.object(
+        pf, "probe_activity",
+        return_value={"state": "inactive", "reason": None, "on_boot": True}))
+    stack.enter_context(patch.object(
+        pf, "probe_tailscale_cli",
+        return_value={"status": "pass", "path": "/usr/bin/tailscale", "reason": None}))
+    stack.enter_context(patch.object(
+        pf, "probe_tailscale_status",
+        return_value={"status": "pass", "availability": "healthy", "reason": None}))
+    stack.enter_context(patch.object(
+        pf, "probe_version",
+        return_value={"status": "pass", "parsed": (1, 19, 33), "reason": None}))
+    stack.enter_context(patch.object(
+        pf, "probe_snapshot",
+        return_value={"status": "pass", "reason": None,
+                      "has_198_18": False, "mihomo_running": False}))
+    stack.enter_context(patch.object(pf, "probe_listen", return_value="free"))
+    return stack
 
 
 class FormatTests(unittest.TestCase):
@@ -262,6 +285,22 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertFalse((self.geo / "geosite.dat").exists())
         self.assertFalse((self.geo / "geoip.metadb").exists())
+
+    def test_geoip_db_satisfies_ensure_and_is_staged(self):
+        (self.geo / "geosite.dat").write_bytes(SITE)
+        (self.geo / "geoip.db").write_bytes(MMDB)
+        calls = []
+        result = geodata.ensure_into(
+            self.geo, needs_site=True, needs_ip=True,
+            transport=_transport(_payloads(), calls))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, [])
+        self.assertFalse((self.geo / "geoip.metadb").exists())
+        work = _private(self.base / "work")
+        staged, _missing = macos_takeover.stage_geodata(work, self.geo)
+        self.assertIn("geoip.db", staged)
+        self.assertEqual((work / "geoip.db").read_bytes(), MMDB)
+        self.assertEqual((work / "geosite.dat").read_bytes(), SITE)
 
     def test_geoip_dat_alone_does_not_count_and_is_left_in_place(self):
         dat = self.geo / "geoip.dat"
@@ -686,6 +725,102 @@ class LifecycleTests(_Checkout):
         self.assertEqual(code, 0)
         self.assertEqual(calls, ["stop", "start"])
 
+    def test_installed_rules_use_the_explicit_directory(self):
+        self.write_config(on_boot=True)
+        explicit = _private(self.base / "explicit")
+        default = Path(os.environ["HOME"]) / ".config" / "mihomo"
+
+        def fake(name, *, transport=None):
+            return {"geosite.dat": SITE, "geoip.metadb": MMDB}[name]
+
+        output = io.StringIO()
+        with self.context(), \
+                patch.object(geodata, "fetch_verified", side_effect=fake), \
+                contextlib.redirect_stdout(output):
+            code = geodata.main(["ensure", "--geodata-dir", str(explicit)])
+        body = json.loads(output.getvalue())
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(Path(body["directory"]), explicit)
+        self.assertEqual((explicit / "geosite.dat").read_bytes(), SITE)
+        self.assertEqual((explicit / "geoip.metadb").read_bytes(), MMDB)
+        self.assertFalse(default.exists())
+        self.assertNotIn(TOKEN, output.getvalue())
+        self.assertNotIn(TAILNET, output.getvalue())
+
+    def test_invalid_leftover_does_not_stop_or_mark_applied(self):
+        self.write_config(on_boot=True)
+        home = Path(os.environ["HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".config").mkdir(mode=0o700)
+        directory = _private(home / ".config" / "mihomo")
+        bad = b"\x00" * 64
+        (directory / "geosite.dat").write_bytes(bad)
+        (directory / "geoip.metadb").write_bytes(MMDB)
+        self.assertEqual(pf.probe_geodata(directory, True, True)["status"], "pass")
+        output = io.StringIO()
+        with self.context(), _daemon_probes(), \
+                patch.object(geodata, "fetch_verified",
+                             side_effect=geodata.GeodataError("timeout")), \
+                patch.object(nmd_daemon, "_daemon_stop", side_effect=AssertionError("stop")), \
+                patch.object(nmd_daemon, "_daemon_start", side_effect=AssertionError("start")), \
+                patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
+                contextlib.redirect_stdout(output):
+            code = nmd_daemon.cli_daemon(["restart"])
+        self.assertEqual(code, 1, output.getvalue())
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["reason"], "timeout")
+        self.assertTrue(report["blocking"])
+        self.assertFalse(report["effects"]["preflight_mutates"])
+        self.assertIn("nmd macos geodata ensure", report["remediation"][0])
+        self.assertEqual((directory / "geosite.dat").read_bytes(), bad)
+        self.assertNotIn(TOKEN, output.getvalue())
+        self.assertNotIn(TAILNET, output.getvalue())
+        with self.context(), _daemon_probes(), \
+                patch.object(nmd_daemon, "daemon_receipt", return_value={"version": 1}), \
+                patch.object(geodata, "fetch_verified",
+                             side_effect=geodata.GeodataError("timeout")), \
+                patch.object(nmd_daemon, "_daemon_stop", side_effect=AssertionError("stop")), \
+                patch.object(nmd_daemon, "_daemon_start", side_effect=AssertionError("start")), \
+                patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(manager.ManagerError, "待应用状态保留"):
+                manager.apply(self.checkout)
+        self.assertEqual(manager.setting(self.checkout, "pendingApply"), "true")
+        self.assertEqual(manager.setting(self.checkout, "appliedRevision"), "")
+        self.assertEqual((directory / "geosite.dat").read_bytes(), bad)
+
+    def test_root_keeps_valid_files_and_does_not_replace_invalid_ones(self):
+        self.write_config(on_boot=True)
+        home = _private(self.base / "alice")
+        (home / ".config").mkdir(mode=0o700)
+        directory = _private(home / ".config" / "mihomo")
+        (directory / "geosite.dat").write_bytes(SITE)
+        (directory / "geoip.metadb").write_bytes(MMDB)
+        account = type("Account", (), {"pw_uid": os.getuid(), "pw_dir": str(home),
+                                       "pw_name": "alice"})()
+        with self.context(), \
+                patch.object(os, "geteuid", return_value=0), \
+                patch.dict(os.environ, {"SUDO_USER": "alice",
+                                        "HOME": str(self.base / "var-root")}), \
+                patch("pwd.getpwnam", return_value=account), \
+                patch.object(geodata, "fetch_verified", side_effect=AssertionError("network")):
+            ready = geodata.prepare_for_daemon("restart")
+        self.assertTrue(ready["ok"], ready)
+        self.assertEqual(ready["downloaded"], [])
+        self.assertEqual((directory / "geosite.dat").read_bytes(), SITE)
+        bad = b"\x00" * 64
+        (directory / "geosite.dat").write_bytes(bad)
+        with self.context(), \
+                patch.object(os, "geteuid", return_value=0), \
+                patch.dict(os.environ, {"SUDO_USER": "alice",
+                                        "HOME": str(self.base / "var-root")}), \
+                patch("pwd.getpwnam", return_value=account), \
+                patch.object(geodata, "fetch_verified", side_effect=AssertionError("network")):
+            refused = geodata.prepare_for_daemon("restart")
+        self.assertFalse(refused["ok"], refused)
+        self.assertEqual((directory / "geosite.dat").read_bytes(), bad)
+        self.assertFalse(any(path.name.startswith(".") for path in directory.iterdir()))
+
     def test_dispatch_help_does_not_download(self):
         output = io.StringIO()
         with self.context(), \
@@ -695,6 +830,65 @@ class LifecycleTests(_Checkout):
                 manager.main(["macos", "geodata", "--help"])
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("nmd macos geodata ensure", output.getvalue())
+
+
+class ForegroundRefusalTests(unittest.TestCase):
+    def test_invalid_leftover_does_not_reexec(self):
+        if os.geteuid() == 0:
+            self.skipTest("root skips the pre-sudo gate")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state = _private(base / "state")
+            geo = _private(base / "geo")
+            bad = b"\x00" * 64
+            (geo / "geosite.dat").write_bytes(bad)
+            (geo / "geoip.metadb").write_bytes(MMDB)
+            program = base / "mihomo"
+            program.write_bytes(b"#!/bin/sh\nexit 0\n")
+            program.chmod(0o755)
+            inputs = base / "inputs.json"
+            inputs.write_text(json.dumps(
+                {"server": TAILNET, "port": 1081, "proxy_name": TOKEN}), encoding="utf-8")
+            os.chmod(inputs, 0o600)
+            output = io.StringIO()
+            with patch.object(pf, "host_is_darwin", return_value=True), \
+                    patch.object(macos_takeover, "reexec_root",
+                                 side_effect=AssertionError("reexec")), \
+                    patch.object(macos_takeover.os, "execv", side_effect=AssertionError("execv")), \
+                    patch.object(macos_takeover.os, "execvp",
+                                 side_effect=AssertionError("execvp")), \
+                    patch.object(pf, "probe_snapshot",
+                                 return_value={"status": "pass", "reason": None,
+                                               "has_198_18": False, "mihomo_running": False}), \
+                    patch.object(pf, "probe_tailscale_cli",
+                                 return_value={"status": "pass", "path": "/usr/bin/tailscale",
+                                               "reason": None}), \
+                    patch.object(pf, "probe_tailscale_status",
+                                 return_value={"status": "pass", "availability": "healthy",
+                                               "reason": None}), \
+                    patch.object(pf, "probe_listen", return_value="free"), \
+                    patch.object(pf, "probe_version",
+                                 return_value={"status": "pass", "parsed": (1, 19, 33),
+                                               "reason": None}), \
+                    patch.object(macos_readonly.subprocess, "Popen",
+                                 side_effect=AssertionError("spawn")), \
+                    patch.object(geodata, "fetch_verified",
+                                 side_effect=geodata.GeodataError("checksum_mismatch")), \
+                    contextlib.redirect_stdout(output):
+                code = macos_takeover.main([
+                    "takeover", "--inputs", str(inputs), "--mihomo", str(program),
+                    "--state-dir", str(state), "--geodata-dir", str(geo)])
+            self.assertEqual(code, 1, output.getvalue())
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["refused_action"], "takeover")
+            self.assertEqual(report["reason"], "checksum_mismatch")
+            self.assertFalse(report["effects"]["preflight_mutates"])
+            self.assertTrue(report["effects"]["command_may_change_network"])
+            self.assertIn("nmd macos geodata ensure --geodata-dir", report["remediation"][0])
+            self.assertEqual((geo / "geosite.dat").read_bytes(), bad)
+            self.assertEqual(pf.probe_geodata(geo, True, True)["status"], "pass")
+            self.assertNotIn(TOKEN, output.getvalue())
+            self.assertNotIn(TAILNET, output.getvalue())
 
 
 if __name__ == "__main__":
