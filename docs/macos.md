@@ -91,7 +91,7 @@ macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `de
 | 档 | 什么时候用 | 查什么 |
 | --- | --- | --- |
 | `readonly` | 面板、只读诊断。默认就是这一档 | 当前用户能不能用采集目录；已安装守护时面板端口是否被占用。不查 mihomo、Tailscale、geodata |
-| `daemon` | `daemon start` / `restart`，以及已安装守护时的 `apply` / `refresh` | mihomo 是否可执行、官方 Tailscale 命令行、`daemon.json`、状态目录权限。`on_boot` 为 true，或看不清守护是否正在接管时，同时要求下一档 |
+| `daemon` | `daemon start` / `restart`，以及已安装守护时的 `apply` / `refresh` | mihomo 是否可执行、官方 Tailscale 命令行、`daemon.json`、状态目录权限。`on_boot` 为 true，或看不清守护是否正在接管时，同时要求下一档。守护自己正在接管时，它占用的 mihomo、198.18 和 DNS 端口不算另一份实例；缺组件或 Tailscale 没在运行仍然会拦住 |
 | `takeover` | `accept`、`takeover`、`daemon takeover-start` 改网络之前 | 上一档之外，还有版本能力、离线配置、geodata、Tailscale 是否在运行、198.18 / 已有 mihomo / DNS 端口 |
 
 `tun.dns-mode: native` 需要 mihomo 1.19.33 或更新。这是文档里 native 模式的要求，不是把曾经观测到的 1.19.34 当成最低版本。`dns-mode: disabled` 没有这道下限。

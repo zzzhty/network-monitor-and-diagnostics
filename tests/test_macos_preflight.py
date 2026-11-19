@@ -239,6 +239,63 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(one(unknown, "mihomo_process")["status"], "unknown")
         self.assertIn("不会当成没有冲突", one(unknown, "tun_dns")["remediation"])
 
+    def test_active_daemon_keeps_its_own_takeover_resources_when_on_boot_rechecks(self):
+        active = {"state": "active", "reason": None, "on_boot": True}
+        held = {"status": "pass", "reason": None, "has_198_18": True, "mihomo_running": True}
+        report = pf.assess("daemon", daemon_facts(
+            on_boot=True, expand_takeover=True, activity=active,
+            snapshot=held, listen={1053: "busy"}))
+        self.assertEqual(report["result"], "pass")
+        self.assertFalse(report["blocking"])
+        for check_id in ("tun_dns", "mihomo_process", "dns_listen"):
+            item = one(report, check_id)
+            self.assertEqual(item["status"], "pass", check_id)
+            self.assertEqual(item["reason"], "owned_by_daemon", check_id)
+        self.assertIn("不是另一份", one(report, "tun_dns")["summary"])
+        self.assertIn("按快照回退", one(report, "mihomo_process")["summary"])
+        self.assertIn("会变", one(report, "network_effect")["summary"])
+        blocked = pf.assess("daemon", daemon_facts(
+            on_boot=True, expand_takeover=True, activity=active, snapshot=held,
+            listen={1053: "busy"},
+            geodata={"status": "fail", "reason": "geodata_missing", "missing": ["geosite.dat"]}))
+        self.assertEqual(blocked["result"], "fail")
+        self.assertEqual(one(blocked, "geodata")["status"], "fail")
+        self.assertEqual(one(blocked, "tun_dns")["reason"], "owned_by_daemon")
+
+    def test_inactive_on_boot_still_rejects_another_instances_resources(self):
+        report = pf.assess("daemon", daemon_facts(
+            on_boot=True, expand_takeover=True,
+            snapshot={"status": "pass", "reason": None, "has_198_18": True,
+                      "mihomo_running": True},
+            listen={1053: "busy"}))
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(one(report, "tun_dns")["reason"], "conflict")
+        self.assertEqual(one(report, "mihomo_process")["status"], "fail")
+        self.assertEqual(one(report, "dns_listen")["reason"], "busy")
+
+    def test_takeover_tier_does_not_treat_a_running_daemon_as_the_owner(self):
+        report = pf.assess("takeover", takeover_facts(
+            activity={"state": "active", "reason": None, "on_boot": True},
+            snapshot={"status": "pass", "reason": None, "has_198_18": True,
+                      "mihomo_running": True},
+            listen={1053: "busy"}))
+        self.assertEqual(one(report, "tun_dns")["status"], "fail")
+        self.assertEqual(one(report, "mihomo_process")["status"], "fail")
+        self.assertEqual(one(report, "dns_listen")["status"], "fail")
+        self.assertNotEqual(one(report, "tun_dns").get("reason"), "owned_by_daemon")
+
+    def test_unknown_conflict_stays_unknown_while_the_daemon_is_active(self):
+        report = pf.assess("daemon", daemon_facts(
+            on_boot=True, expand_takeover=True,
+            activity={"state": "active", "reason": None, "on_boot": True},
+            snapshot={"status": "unknown", "reason": "not_observed",
+                      "has_198_18": None, "mihomo_running": None},
+            listen={1053: "unknown"}))
+        self.assertEqual(report["result"], "unknown")
+        self.assertEqual(one(report, "tun_dns")["status"], "unknown")
+        self.assertEqual(one(report, "dns_listen")["status"], "unknown")
+        self.assertNotEqual(one(report, "tun_dns").get("reason"), "owned_by_daemon")
+
     def test_positive_conflicts_fail_and_clear_conflicts_pass(self):
         conflict = pf.assess("takeover", takeover_facts(
             snapshot={"status": "pass", "reason": None, "has_198_18": True,
@@ -822,6 +879,60 @@ class LifecycleTests(_Tree):
         report = json.loads(output.getvalue())
         self.assertEqual(code, 3)
         self.assertEqual(one(report, "daemon_activity")["reason"], "probe_error")
+
+    def test_restart_is_not_blocked_by_the_active_daemons_own_resources(self):
+        self.write_config(on_boot=True, mihomo_path=self.program("mihomo"))
+        calls = []
+
+        def stop():
+            calls.append("stop")
+            return {"result": "stop"}
+
+        def start():
+            calls.append("start")
+            return {"result": "start"}
+
+        held = {"status": "pass", "reason": None, "has_198_18": True, "mihomo_running": True}
+        with self.context(), \
+                patch.object(pf, "probe_activity",
+                             return_value={"state": "active", "reason": None, "on_boot": True}), \
+                patch.object(pf, "probe_tailscale_cli", return_value=dict(CLI_OK)), \
+                patch.object(pf, "probe_tailscale_status", return_value=dict(TS_OK)), \
+                patch.object(pf, "probe_version", return_value=dict(VERSION_OK)), \
+                patch.object(pf, "probe_geodata", return_value=dict(GEO_OK)), \
+                patch.object(pf, "probe_snapshot", return_value=held), \
+                patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(macos_takeover, "resolve_geodata_dir",
+                             return_value=str(self.state_dir)), \
+                patch.object(nmd_daemon, "_daemon_stop", side_effect=stop), \
+                patch.object(nmd_daemon, "_daemon_start", side_effect=start), \
+                patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = nmd_daemon.cli_daemon(["restart"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["stop", "start"])
+
+        calls.clear()
+        output = io.StringIO()
+        with self.context(), \
+                patch.object(pf, "probe_activity", return_value=dict(INACTIVE)), \
+                patch.object(pf, "probe_tailscale_cli", return_value=dict(CLI_OK)), \
+                patch.object(pf, "probe_tailscale_status", return_value=dict(TS_OK)), \
+                patch.object(pf, "probe_version", return_value=dict(VERSION_OK)), \
+                patch.object(pf, "probe_geodata", return_value=dict(GEO_OK)), \
+                patch.object(pf, "probe_snapshot", return_value=held), \
+                patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(macos_takeover, "resolve_geodata_dir",
+                             return_value=str(self.state_dir)), \
+                patch.object(nmd_daemon, "_daemon_stop", side_effect=AssertionError("stop")), \
+                patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
+                contextlib.redirect_stdout(output):
+            code = nmd_daemon.cli_daemon(["restart"])
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(report["result"], "fail")
+        self.assertEqual(one(report, "mihomo_process")["reason"], "conflict")
+        self.assertEqual(calls, [])
 
     def test_active_takeover_restart_does_stop_and_the_report_names_the_change(self):
         self.write_config(on_boot=False, mihomo_path=self.program("mihomo"))

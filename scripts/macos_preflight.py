@@ -902,6 +902,10 @@ def assess(tier, facts):
 
     snapshot = facts.get("snapshot") or {"status": "unknown", "has_198_18": None,
                                          "mihomo_running": None}
+    # Restart stops this daemon's takeover before the new process listens.
+    # Its own mihomo and 198.18 are not another instance. A boolean probe
+    # cannot see a second mihomo beside that takeover; unknown stays unknown.
+    owns = _daemon_owns_takeover(tier, facts)
     for check_id, field, busy_summary, busy_fix, clear_summary in (
             ("tun_dns", "has_198_18",
              "系统 DNS 里已经有 198.18。",
@@ -917,6 +921,11 @@ def assess(tier, facts):
                 reason=snapshot.get("reason") or "not_observed",
                 summary="读不到这项冲突检查的结果。",
                 remediation="unknown 不会当成没有冲突。没有改网络。"))
+        elif snapshot.get(field) is True and owns:
+            checks.append(_check(
+                check_id, "pass", required=True, reason="owned_by_daemon",
+                summary="这是当前常驻守护自己的接管，不是另一份实例。"
+                        "重载会先结束它并按快照回退。"))
         elif snapshot.get(field) is True:
             checks.append(_check(check_id, "fail", required=True, reason="conflict",
                                  summary=busy_summary, remediation=busy_fix))
@@ -929,7 +938,12 @@ def assess(tier, facts):
                              summary="这份配置没有本机回环 DNS 端口需要检查。"))
     else:
         listened = (facts.get("listen") or {}).get(listen_port)
-        if listened == "busy":
+        if listened == "busy" and owns:
+            checks.append(_check(
+                "dns_listen", "pass", required=True, reason="owned_by_daemon",
+                summary=f"127.0.0.1:{listen_port} 正由当前接管使用，不是另一份程序。"
+                        "重载会先结束它，再由新进程监听。"))
+        elif listened == "busy":
             checks.append(_check(
                 "dns_listen", "fail", required=True, reason="busy",
                 summary=f"127.0.0.1:{listen_port} 已有程序在监听。",
@@ -945,6 +959,16 @@ def assess(tier, facts):
 
     required = ["takeover"] if tier == "takeover" else ["daemon", "takeover"]
     return _finish(tier, required, checks, facts)
+
+
+def _daemon_owns_takeover(tier, facts):
+    """True when this daemon reports its own takeover, not a foreign one.
+
+    Only the daemon lifecycle releases that takeover before listening again.
+    ``accept`` / ``takeover`` do not, so the takeover tier stays strict.
+    """
+    return (tier == "daemon"
+            and (facts.get("activity") or {}).get("state") == "active")
 
 
 def _network_summary(activity, on_boot):
