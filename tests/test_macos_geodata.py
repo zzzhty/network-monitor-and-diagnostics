@@ -283,8 +283,15 @@ class EnsureTests(unittest.TestCase):
             transport=_transport(_payloads(), calls))
         self.assertTrue(result["ok"], result)
         self.assertEqual(calls, [])
-        self.assertFalse((self.geo / "geosite.dat").exists())
-        self.assertFalse((self.geo / "geoip.metadb").exists())
+        self.assertEqual(result["downloaded"], [])
+        # macOS volumes compare names case-insensitively, so GeoSite.dat and
+        # geosite.dat are one directory entry. The check is the stored name.
+        stored = [path.name for path in self.geo.iterdir()
+                  if path.name.casefold() == "geosite.dat"]
+        self.assertEqual(stored, ["GeoSite.dat"])
+        self.assertEqual((self.geo / stored[0]).read_bytes(), SITE)
+        self.assertNotIn("geoip.metadb", {path.name for path in self.geo.iterdir()})
+        self.assertEqual((self.geo / "Country.mmdb").read_bytes(), MMDB)
 
     def test_geoip_db_satisfies_ensure_and_is_staged(self):
         (self.geo / "geosite.dat").write_bytes(SITE)
