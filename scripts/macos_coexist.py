@@ -197,6 +197,12 @@ ROLLBACK_POLICY = {
     "installs_daemon_or_autostart": False,
     "changes_power_management": False,
     "sleep_wake_keeps_absolute_deadline": True,
+    # Wake re-reads managed state and restores when it is wrong. CI injects
+    # the clocks; sleep_wake_verified stays false until a real Mac sleeps.
+    "sleep_wake_revalidates_or_restores": True,
+    # The accept sentinel is another process. It is not a hard guarantee,
+    # and this checklist must not say that it is.
+    "guarantees_restore_if_watchdog_dies": False,
     "guarantees_restore_if_watchdog_and_sampler_die": False,
     "requires_watchdog_unhealthy_logic_change": False,
     "implemented_in_this_repository": True,
@@ -223,6 +229,9 @@ DAEMON_POLICY = {
     "changes_system_proxy": False,
     "changes_bypass": False,
     "changes_power_management": False,
+    "sleep_wake_revalidates_or_restores": True,
+    # A wake never starts a takeover and never flips on_boot.
+    "wake_does_not_start_takeover": True,
     "panel_may_start_takeover": False,
     "requires_explicit_install": True,
     # An unfinished restore is retried. A finished one does not start again.

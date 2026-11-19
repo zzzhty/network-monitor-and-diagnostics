@@ -32,13 +32,15 @@ CONFIG = {"schema_version": 1, "dashboard": {"port": 8765},
 
 
 def make_supervisor(state, table, config=None, *, on_boot=False, boottime=lambda: 111,
-                    validator=None, geodata_dir=None):
+                    validator=None, geodata_dir=None, wall=None):
     config = json.loads(json.dumps(config or CONFIG))
     config["takeover"]["on_boot"] = on_boot
     return d.RootSupervisor(
         config, state, runner=table.runner, mutator=table.mutator,
         spawner=table.spawner, tcp=table.tcp, exists=lambda path: path == TS,
-        sleep=table.sleep, now=lambda: table.clock, boottime=boottime,
+        sleep=table.sleep, now=lambda: table.clock,
+        wall=wall if wall is not None else (lambda: table.clock),
+        boottime=boottime,
         socket_path=Path(state) / "nmd.sock",
         validator=validator or (lambda mihomo, config_path, work_dir: (True, "")),
         geodata_dir=geodata_dir)
@@ -879,6 +881,88 @@ class DaemonInstallTests(unittest.TestCase):
         with patch.object(self.manager.nmd_platform, "name", return_value="linux"):
             with self.assertRaises(SystemExit):
                 self.manager.main(["macos", "daemon", "status"])
+
+
+class WakeResidencyTests(unittest.TestCase):
+    """Sleep/wake for the supervisor. No LaunchDaemon is loaded and on_boot stays put."""
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.state = Path(holder.name)
+
+    def test_broken_wake_restores_residency_and_does_not_start_another(self):
+        clocks = {"wall": 5_000.0}
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        sup = make_supervisor(self.state, table, on_boot=False, wall=lambda: clocks["wall"])
+        self.assertEqual(sup.start_takeover()["result"], "takeover_active")
+        self.assertFalse(sup.status()["on_boot"])
+        table.dns_dirty_window = None
+        clocks["wall"] += 40
+        decision = sup.observe_power()
+        self.assertEqual(decision["action"], "rollback")
+        self.assertIn("native_dns_missing", decision["reasons"])
+        status = sup.status()
+        self.assertEqual((status["phase"], status["result"], status["takeover_active"]),
+                         (d.PHASE_ROLLED_BACK, "wake_restore", False))
+        self.assertFalse(status["on_boot"])
+        clears = [item for item in table.mutations if item[:3] == [TS, "set", "--exit-node="]]
+        self.assertEqual(clears, [[TS, "set", "--exit-node="]])
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+        rendered = json.dumps(table.mutations)
+        self.assertNotIn("nodekey:", rendered)
+        self.assertNotIn("auto:any", rendered)
+
+    def test_healthy_wake_leaves_the_takeover_running(self):
+        clocks = {"wall": 8_000.0}
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        sup = make_supervisor(self.state, table, wall=lambda: clocks["wall"])
+        self.assertEqual(sup.start_takeover()["result"], "takeover_active")
+        before = len(table.mutations)
+        clocks["wall"] += 25
+        decision = sup.observe_power()
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reasons"], [])
+        self.assertEqual(decision["proxy"]["expected_enabled"], {})
+        self.assertEqual(decision["proxy"]["live_enabled"], {})
+        self.assertNotIn("bypass", decision["proxy"])
+        self.assertTrue(sup.status()["takeover_active"])
+        self.assertEqual(len(table.mutations), before)
+        self.assertFalse(sup.status()["on_boot"])
+
+    def test_wake_while_direct_does_not_take_over_even_if_on_boot_is_configured(self):
+        clocks = {"wall": 100.0}
+        table = Table()
+        sup = make_supervisor(self.state, table, on_boot=True, wall=lambda: clocks["wall"])
+        self.assertIsNone(sup.observe_power())
+        clocks["wall"] += 50
+        decision = sup.observe_power()
+        self.assertEqual(decision["action"], "none")
+        self.assertEqual(sup.status()["phase"], d.PHASE_DIRECT)
+        self.assertEqual(table.mutations, [])
+        self.assertFalse(sup.status()["takeover_active"])
+        self.assertTrue(sup.status()["on_boot"])
+
+    def test_wake_during_start_restores_before_the_takeover_is_active(self):
+        clocks = {"wall": 300.0}
+        table = Table(dns_dirty_window=None)
+
+        def sleeping(seconds):
+            table.clock += seconds
+            clocks["wall"] += 30
+            table.route_text = ("Routing tables\n\nInternet:\n"
+                                "Destination Gateway Flags Netif Expire\n")
+
+        sup = make_supervisor(self.state, table, wall=lambda: clocks["wall"])
+        sup.sleep = sleeping
+        result = sup.start_takeover()
+        self.assertEqual(result["reason"], "wake_restore")
+        self.assertNotEqual(sup.status()["phase"], d.PHASE_ACTIVE)
+        self.assertFalse(sup.status()["takeover_active"])
+        self.assertIn("default_route_missing", sup.last_wake["reasons"])
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+        self.assertNotIn("nodekey:", json.dumps(table.mutations))
+        self.assertFalse(sup.config["takeover"]["on_boot"])
 
 
 class SourceSafetyTests(unittest.TestCase):

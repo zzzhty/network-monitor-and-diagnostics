@@ -413,6 +413,11 @@ class EvidenceBoundaryTests(unittest.TestCase):
         self.assertFalse(m.ROLLBACK_POLICY["renew_deadline"])
         self.assertEqual(m.ROLLBACK_POLICY["consecutive_critical_failures_before_rollback"], 3)
         self.assertFalse(m.ROLLBACK_POLICY["guarantees_restore_if_watchdog_and_sampler_die"])
+        self.assertFalse(m.ROLLBACK_POLICY["guarantees_restore_if_watchdog_dies"])
+        self.assertTrue(m.ROLLBACK_POLICY["sleep_wake_revalidates_or_restores"])
+        self.assertFalse(m.UNVERIFIED_CLAIMS["sleep_wake_verified"])
+        self.assertTrue(m.DAEMON_POLICY["sleep_wake_revalidates_or_restores"])
+        self.assertTrue(m.DAEMON_POLICY["wake_does_not_start_takeover"])
         self.assertFalse(m.WATCHDOG_UNHEALTHY_OBSERVATION["required_fix"])
         self.assertFalse(m.WATCHDOG_UNHEALTHY_OBSERVATION["logic_conflict_established"])
         for key, flipped in (
@@ -421,6 +426,7 @@ class EvidenceBoundaryTests(unittest.TestCase):
             ("changes_bypass", True),
             ("consecutive_critical_failures_before_rollback", 1),
             ("guarantees_restore_if_watchdog_and_sampler_die", True),
+            ("guarantees_restore_if_watchdog_dies", True),
             ("requires_watchdog_unhealthy_logic_change", True),
         ):
             policy = dict(m.ROLLBACK_POLICY)

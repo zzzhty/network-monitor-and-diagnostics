@@ -653,6 +653,10 @@ def _parse_scutil_proxy(code, text, error):
     if error or code != 0:
         return {"status": "unavailable", "reason": error or "command_failed",
                 "protocols": {}, "bypass": []}
+    # A successful command that is not a scutil dictionary is not "no proxy".
+    if not isinstance(text, str) or "<dictionary>" not in text:
+        return {"status": "unknown", "reason": "invalid_proxy_output",
+                "protocols": {}, "bypass": []}
     protocols, bypass, in_exceptions = {}, [], False
     for line in text.splitlines():
         stripped = line.strip()
@@ -661,7 +665,11 @@ def _parse_scutil_proxy(code, text, error):
             continue
         match = re.fullmatch(r"(\w+)Enable\s*:\s*(\d+)", stripped)
         if match:
-            protocols.setdefault(match.group(1), {})["enabled"] = int(match.group(2)) == 1
+            row = protocols.setdefault(match.group(1), {})
+            # Only 0 and 1 are the documented flags. Any other number stays
+            # unset so a caller cannot treat it as disabled.
+            if match.group(2) in {"0", "1"}:
+                row["enabled"] = match.group(2) == "1"
             continue
         match = re.fullmatch(r"(\w+)Proxy\s*:\s*(\S+)", stripped)
         if match:
