@@ -1435,13 +1435,46 @@ def cli_root_helper(argv):
 # --- CLI ----------------------------------------------------------------------
 
 
+def _collector_can_lock(path):
+    """True when this uid may create or lock a private collector directory."""
+    if not path.exists():
+        return True
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return False
+    return True
+
+
+def collector_state_dir(preferred):
+    """Directory the user collector can write without moving takeover state.
+
+    The default takeover directory may already be root 0700. The collector
+    refuses that leaf. Samples then go to the sibling ``<name>-user``. The
+    root supervisor keeps the original directory and its session files.
+    """
+    preferred = Path(preferred)
+    if _collector_can_lock(preferred):
+        return preferred
+    sibling = preferred.parent / (preferred.name + "-user")
+    if (preferred.exists() and sibling.exists()
+            and not _collector_can_lock(sibling)):
+        raise DaemonError("collector_state_unusable")
+    return sibling
+
+
 def run_user_daemon(config, *, monitor_config_path=None):
     """Serve the dashboard in the main thread; supervise the collector beside it."""
     import nmd_monitor
     import observability
     takeover = config["takeover"]
-    state_dir = Path(takeover["state_dir"] if takeover["state_dir"] is not None
-                     else macos_prepare.default_state_dir())
+    state_dir = collector_state_dir(
+        Path(takeover["state_dir"] if takeover["state_dir"] is not None
+             else macos_prepare.default_state_dir()))
     monitor_config = monitor_config_path or nmd_monitor.default_config_path()
     bridge = DaemonClientBridge(SOCKET_PATH)
     stopped = threading.Event()
