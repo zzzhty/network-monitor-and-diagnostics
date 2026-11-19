@@ -1224,13 +1224,26 @@ def uninstall_root_plist():
     return {"uninstalled": str(path)}
 
 
+def _daemon_stop():
+    """IPC stop, then bootout. A missing socket is not a stop failure."""
+    with contextlib.suppress(DaemonError):
+        DaemonIPCClient(SOCKET_PATH, timeout=1.5).stop_takeover()
+    return _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
+                        "stop-root"])
+
+
+def _daemon_start():
+    return _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
+                        "start-root"])
+
+
 def cli_daemon(argv):
-    """`nmd macos daemon install|uninstall|start|stop|status|takeover-start`."""
+    """`nmd macos daemon install|uninstall|start|stop|restart|status|takeover-start`."""
     import manager
     if any(arg in ("-h", "--help") for arg in argv):
         sys.stdout.write(HELP)
         return 0
-    if not argv or argv[0] not in ("install", "uninstall", "start", "stop",
+    if not argv or argv[0] not in ("install", "uninstall", "start", "stop", "restart",
                                    "status", "takeover-start", "takeover-stop"):
         sys.stderr.write(HELP)
         return 2
@@ -1337,17 +1350,24 @@ def cli_daemon(argv):
         print(json.dumps({"result": "daemon_uninstalled"}))
         return 0
     if action == "start":
-        helper = _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
-                              "start-root"])
+        helper = _daemon_start()
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
     if action == "stop":
-        with contextlib.suppress(DaemonError):
-            DaemonIPCClient(SOCKET_PATH, timeout=1.5).stop_takeover()
-        helper = _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
-                              "stop-root"])
+        helper = _daemon_stop()
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
+    if action == "restart":
+        # stop then start. A stop error does not start, so a failed bootout
+        # cannot be followed by bootstrapping the root job.
+        stop = _daemon_stop()
+        if "error" in stop:
+            print(json.dumps({"result": "restart", "stop": stop}, ensure_ascii=False))
+            return 1
+        start = _daemon_start()
+        print(json.dumps({"result": "restart", "stop": stop, "start": start},
+                         ensure_ascii=False))
+        return 0 if "error" not in start else 1
     return 2
 
 
@@ -1362,7 +1382,7 @@ def _root_control(action):
     """euid-0 helpers for start/stop without rewriting the plist.
 
     ``stop`` bootouts the job, so ``start`` cannot assume kickstart still has
-    a loaded service. A reload after ``nmd update`` is stop && start: start
+    a loaded service. ``nmd macos daemon restart`` is stop then start: start
     bootstraps the installed plist when kickstart says it is not loaded.
     """
     if os.geteuid() != 0:

@@ -5,7 +5,7 @@ import io
 import stat
 import http.client
 import threading
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import subprocess
 from unittest.mock import Mock, patch
 from pathlib import Path
@@ -148,7 +148,9 @@ class SafeMacOSCLITests(unittest.TestCase):
         self.assertEqual(snapshot['collector']['state'], 'fresh')
 
     def test_macos_lifecycle_and_network_commands_fail_before_any_side_effect(self):
-        for args in [['apply'], ['start'], ['verify'], ['source', 'status'], ['channel', 'list'],
+        # apply/refresh are allowed: they reload an installed daemon and do not
+        # run the Linux network deploy. See the apply tests below.
+        for args in [['start'], ['verify'], ['source', 'status'], ['channel', 'list'],
                      ['adopt', '--user'], ['install'], ['monitor', 'install'], ['monitor', 'start'],
                      ['monitor', 'enable'], ['monitor', 'uninstall']]:
             with self.subTest(args=args), patch.object(manager, 'run', side_effect=AssertionError('command')), \
@@ -157,9 +159,193 @@ class SafeMacOSCLITests(unittest.TestCase):
                 with self.assertRaisesRegex(manager.ManagerError, 'Linux'):
                     manager.main(args)
 
+    def test_macos_apply_extra_arguments_fail_before_any_side_effect(self):
+        with patch.object(manager, 'apply', side_effect=AssertionError('apply')), \
+                patch.object(manager, 'managed', side_effect=AssertionError('installation')), \
+                patch.object(manager, 'run', side_effect=AssertionError('command')):
+            with self.assertRaisesRegex(manager.ManagerError, '不支持的参数'):
+                manager.main(['apply', 'extra'])
+
+    def test_macos_help_names_apply_and_daemon_restart(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            manager.main(['help'])
+        text = output.getvalue()
+        self.assertIn('apply / refresh', text)
+        self.assertIn('restart 等于先 stop 再 start', text)
+        self.assertNotIn('apply 与 systemd', text)
+
+    def test_linux_apply_deploys_then_verifies_inside_the_same_transaction(self):
+        calls = []
+        writes = []
+
+        def fake_setting(root, key, value=None):
+            if value is not None:
+                writes.append((key, str(value)))
+                return str(value)
+            return ''
+
+        def fake_assets(root):
+            calls.append('assets')
+            self.assertEqual(writes[-1], ('pendingApply', 'true'))
+
+        def fake_network(root, command):
+            calls.append(command)
+
+        with patch.object(nmd_platform, 'name', return_value='linux'), \
+                patch.object(manager, 'managed'), \
+                patch.object(manager, 'lock', return_value=nullcontext()), \
+                patch.object(manager, 'ensure_assets', side_effect=fake_assets), \
+                patch.object(manager, 'network_command', side_effect=fake_network), \
+                patch.object(manager, 'setting', side_effect=fake_setting), \
+                patch.object(manager, 'git', return_value='abc123'):
+            manager.main(['apply'])
+            manager.main(['refresh'])
+        self.assertEqual(calls, ['assets', 'apply', 'verify', 'assets', 'apply', 'verify'])
+        self.assertEqual(writes, [
+            ('pendingApply', 'true'),
+            ('appliedRevision', 'abc123'),
+            ('pendingApply', 'false'),
+            ('pendingApply', 'true'),
+            ('appliedRevision', 'abc123'),
+            ('pendingApply', 'false'),
+        ])
+
+    def _managed_checkout(self):
+        checkout = Path(self.temp.name) / 'installed'
+        checkout.mkdir()
+        subprocess.run(['git', 'init', '-q', str(checkout)], check=True, capture_output=True)
+        (checkout / 'marker').write_text('x\n', encoding='utf-8')
+        subprocess.run(['git', '-C', str(checkout), 'add', 'marker'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(checkout), '-c', 'user.email=t@example.com',
+                        '-c', 'user.name=test', 'commit', '-q', '-m', 'init'],
+                       check=True, capture_output=True)
+        head = subprocess.run(['git', '-C', str(checkout), 'rev-parse', 'HEAD'],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        settings = {
+            'home': str(checkout), 'scope': 'user',
+            'configDir': str(Path(self.temp.name) / 'config' / 'nmd'),
+            'stateDir': str(Path(self.temp.name) / 'state' / 'nmd'),
+        }
+        return checkout, head, settings
+
+    def test_macos_apply_restarts_an_installed_daemon_without_network_changes(self):
+        import nmd_daemon
+        checkout, head, settings = self._managed_checkout()
+        writes = []
+        calls = []
+
+        def fake_setting(root, key, value=None):
+            if value is not None:
+                writes.append((key, str(value)))
+                settings[key] = str(value)
+                return str(value)
+            return settings.get(key, '')
+
+        def fake_cli(argv):
+            calls.append(list(argv))
+            self.assertEqual(settings.get('pendingApply'), 'true')
+            self.assertNotIn('appliedRevision', settings)
+            return 0
+
+        for command in ('apply', 'refresh'):
+            writes.clear()
+            calls.clear()
+            settings.pop('pendingApply', None)
+            settings.pop('appliedRevision', None)
+            output = io.StringIO()
+            with self.subTest(command=command), patch.object(manager, 'ROOT', checkout), \
+                    patch.object(manager, 'setting', side_effect=fake_setting), \
+                    patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                    patch.object(manager, 'ensure_assets', side_effect=AssertionError('assets')), \
+                    patch.object(nmd_daemon, 'daemon_receipt', return_value={'version': 1}), \
+                    patch.object(nmd_daemon, 'cli_daemon', side_effect=fake_cli), \
+                    redirect_stdout(output):
+                manager.main([command])
+            self.assertEqual(calls, [['restart']])
+            self.assertEqual(writes, [
+                ('pendingApply', 'true'),
+                ('appliedRevision', head),
+                ('pendingApply', 'false'),
+            ])
+            text = output.getvalue()
+            self.assertIn('nmd macos daemon restart', text)
+            self.assertIn('没有改路由、DNS、系统代理或 Tailscale', text)
+            self.assertIn('也没有启动接管', text)
+            self.assertIn('用户 LaunchAgent 不在这次重载里', text)
+
+    def test_macos_apply_keeps_pending_when_restart_fails(self):
+        import nmd_daemon
+        checkout, _head, settings = self._managed_checkout()
+
+        def fake_setting(root, key, value=None):
+            if value is not None:
+                settings[key] = str(value)
+                return str(value)
+            return settings.get(key, '')
+
+        with patch.object(manager, 'ROOT', checkout), \
+                patch.object(manager, 'setting', side_effect=fake_setting), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'ensure_assets', side_effect=AssertionError('assets')), \
+                patch.object(nmd_daemon, 'daemon_receipt', return_value={'version': 1}), \
+                patch.object(nmd_daemon, 'cli_daemon', return_value=1):
+            with self.assertRaisesRegex(manager.ManagerError, '待应用状态保留'):
+                manager.main(['apply'])
+        self.assertEqual(settings.get('pendingApply'), 'true')
+        self.assertNotIn('appliedRevision', settings)
+
+    def test_macos_apply_keeps_pending_when_the_receipt_cannot_be_read(self):
+        import nmd_daemon
+        checkout, _head, settings = self._managed_checkout()
+
+        def fake_setting(root, key, value=None):
+            if value is not None:
+                settings[key] = str(value)
+                return str(value)
+            return settings.get(key, '')
+
+        with patch.object(manager, 'ROOT', checkout), \
+                patch.object(manager, 'setting', side_effect=fake_setting), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'ensure_assets', side_effect=AssertionError('assets')), \
+                patch.object(nmd_daemon, 'daemon_receipt',
+                             side_effect=nmd_daemon.DaemonError('daemon_invalid_receipt')), \
+                patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('sudo')):
+            with self.assertRaisesRegex(manager.ManagerError, '待应用状态保留'):
+                manager.main(['apply'])
+        self.assertEqual(settings.get('pendingApply'), 'true')
+        self.assertNotIn('appliedRevision', settings)
+
+    def test_macos_apply_without_a_daemon_records_the_revision_and_does_not_sudo(self):
+        import nmd_daemon
+        checkout, head, settings = self._managed_checkout()
+
+        def fake_setting(root, key, value=None):
+            if value is not None:
+                settings[key] = str(value)
+                return str(value)
+            return settings.get(key, '')
+
+        output = io.StringIO()
+        with patch.object(manager, 'ROOT', checkout), \
+                patch.object(manager, 'setting', side_effect=fake_setting), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'ensure_assets', side_effect=AssertionError('assets')), \
+                patch.object(nmd_daemon, 'daemon_receipt', return_value=None), \
+                patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('sudo')), \
+                redirect_stdout(output):
+            manager.main(['apply'])
+        self.assertEqual(settings.get('pendingApply'), 'false')
+        self.assertEqual(settings.get('appliedRevision'), head)
+        text = output.getvalue()
+        self.assertIn('没有执行 sudo', text)
+        self.assertIn('没有改路由、DNS、系统代理或 Tailscale', text)
+
     def test_macos_bootstrap_requires_manager_only_before_any_side_effect(self):
-        # bootstrap and update are the macOS-supported lifecycle commands; the
-        # desktop shell needs them. Everything else above stays rejected.
+        # bootstrap and update are macOS lifecycle commands; apply/refresh reload
+        # an installed daemon. The desktop shell needs bootstrap. The commands
+        # in the rejection test stay rejected.
         for args in [['bootstrap'], ['bootstrap', '--system']]:
             with self.subTest(args=args), patch.object(manager, 'run', side_effect=AssertionError('command')), \
                     patch.object(manager, 'setting', side_effect=AssertionError('settings')), \

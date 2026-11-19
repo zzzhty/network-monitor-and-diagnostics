@@ -44,7 +44,7 @@ monitor 单元和 mihomo 服务是两件事。`nmd monitor install` 不部署网
 - macOS：源码 CLI、只读诊断面板，以及「设置与帮助」里对自己 `monitor.json` 的编辑。可选 `nmd desktop install` 做用户级桌面壳；登录自启是 LaunchAgent，只启动这个壳。没有 monitor 服务，也没有网络部署。
 - Windows：当前用户的 CLI、SQLite 和可编辑监控配置的面板。后台是计划任务 `\NMD\Monitor`。不安装 Windows 服务，不安装桌面壳。
 
-两边都拒绝 `apply`、来源/通道管理、`adopt` 和系统网络命令。
+两边都拒绝来源/通道管理、`adopt` 和 Linux 的系统网络命令。`nmd apply` / `refresh` 在 Linux 和 macOS 上是同一次事务：先标待应用，再激活本机已安装的运行面，成功后才记录版本。Linux 激活 mihomo 部署并校验；macOS 在已安装常驻守护时执行 `nmd macos daemon restart`（先 stop 再 start），不下载代理资产，不改 DNS、路由或系统代理，不启动接管。Windows 仍拒绝 `apply`。
 
 ### 外部客户端
 

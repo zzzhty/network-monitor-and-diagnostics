@@ -303,15 +303,19 @@ LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复
 `macos_coexist.DAEMON_POLICY`；单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠
 既有 preflight 双向失败关闭。健康检查含 Tailscale status 和配置里的 VPS SOCKS
 TCP 连接；TCP 成功只说明端口接受了握手，不是应用成功，HTTP 200 不在这项检查里。
-安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|status|
+安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|restart|status|
 takeover-start|takeover-stop`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
-launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`stop` 会
+launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`restart`
+等于先 `stop` 再 `start`；`stop` 失败则不 `start`。`stop` 会
 `bootout` 系统任务，`start` 在 `kickstart` 发现任务未加载时用已安装的 plist
 重新 `bootstrap` 再 `kickstart`。卸载同时 `bootout` 当前用户的 LaunchAgent。
 示例配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
-**`nmd update` 只更新磁盘代码，launchd 里的 root 管理器仍在跑旧代码**——更新后
-需 `nmd macos daemon stop && nmd macos daemon start` 重载（update 会在安装了
-守护时提示）。daemon 代码没有在实机运行。另一终端的
+**`nmd update` 只更新磁盘代码，不重载进程。** 已安装守护时，`nmd apply`
+（`refresh` 同义）执行 `nmd macos daemon restart`。它不跑 Linux 的网络部署，
+不调用 `takeover-start`，不改路由、DNS、系统代理、Tailscale 或 `on_boot`。
+未安装守护时 `nmd apply` 只记录版本，不执行 sudo。`start` 会在任务未加载时
+bootstrap，因此已安装但未加载的 root 管理器会被 `apply` 拉起。用户
+LaunchAgent 不在这次重载里。daemon 代码没有在实机运行。另一终端的
 `sudo nmd macos rollback` 不拿管理器的锁：它读 pin，只在 `owned-mihomo.json`
 里的 pid、`ps` 的启动时间、完整 argv（含精确的 `-d` 工作目录）和会话组
 长身份同时对得上时才发信号，再按这份原始快照恢复。pid 被同名进程复用、

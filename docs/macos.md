@@ -55,7 +55,7 @@ systemd 安装管理，面板不提供编辑。
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 诊断只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host；macOS 额外仅开放 `/api/config` 编辑自己的 monitor 配置（不启动采集） |
 | 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
-| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）；来源控制、网络部署与 systemd 仍仅 Linux，CLI 在执行动作前拒绝 |
+| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时执行 `nmd macos daemon restart`（先 stop 再 start），不部署网络、不启动接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
 | 实验性自管接管（单次） | `sudo nmd macos takeover`：sudo 前台运行 mihomo 接管出口，绝对截止（默认 10 分钟、上限 8 小时，按墙钟），STOP/到期/连续 3 个故障周期幂等回退；唤醒后复查或回退。仅显式运行，无常驻组件。accept 的 sentinel 有一次实机恢复记录；睡眠唤醒尚未验收。见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md) |
 | 实验性自管接管（常驻 daemon） | `nmd macos daemon install`：root 管理器（launchd KeepAlive）常驻监督接管——无绝对截止，健康故障（默认连续 3 周期）或 mihomo 退出即自动回退，唤醒后复查托管状态且不因此启动接管，手动停止走 CLI 或面板；开机策略 `daemon.json` 的 `on_boot`（默认关）。面板归属 daemon，桌面壳自动复用。未实机验证。策略见 `DAEMON_POLICY`。 |
 
@@ -66,9 +66,13 @@ systemd 安装管理，面板不提供编辑。
 适配不会修改系统代理、路由、DNS、VPN、Tailscale、防火墙或网络工具配置，不抓包，
 不启动后台常驻，不自动测速、修复或切换网络。唯一例外是显式 `nmd desktop autostart on`
 写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
-macOS 支持 `bootstrap --manager-only`、`update` 与 `desktop` 生命周期；`install`
-（monitor）、`adopt`、`source`、顶层网络命令及 `monitor start/enable/install/...`
-仍是 Linux 管理能力，在 macOS 明确报不支持。请勿通过直接运行 Linux 脚本尝试这些操作。
+macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `desktop` 生命周期。
+`apply` 记录当前版本；已安装常驻守护时重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
+它不下载代理资产，不改路由、DNS、系统代理或 Tailscale，也不调用 `takeover-start`。
+`start` 在任务未加载时会 bootstrap，所以未加载的 root 管理器会被 `apply` 拉起。
+用户 LaunchAgent 不在这次重载里。`install`（monitor）、`adopt`、`source`、顶层网络命令
+及 `monitor start/enable/install/...` 仍是 Linux 管理能力，在 macOS 明确报不支持。
+请勿通过直接运行 Linux 脚本尝试这些操作。
 
 ## 可选：显式本机单次观测
 

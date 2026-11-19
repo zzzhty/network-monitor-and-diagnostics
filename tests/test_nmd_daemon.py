@@ -6,6 +6,7 @@ temporary directory, so the macOS CI runner never clears an exit node, never
 starts mihomo, and never writes launchd state.
 """
 import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -901,6 +902,85 @@ class DaemonInstallTests(unittest.TestCase):
         with patch.object(self.manager.nmd_platform, "name", return_value="linux"):
             with self.assertRaises(SystemExit):
                 self.manager.main(["macos", "daemon", "status"])
+
+
+class DaemonRestartTests(unittest.TestCase):
+    """restart is stop then start. No sudo, launchctl, or socket is used."""
+
+    def run_restart(self, helper, client=None):
+        order = []
+
+        class Client:
+            def __init__(self, path, timeout=None):
+                order.append("ipc")
+            def stop_takeover(self):
+                order.append("stop_takeover")
+                raise d.DaemonError("socket_missing")
+
+        output = io.StringIO()
+        with patch.object(d, "daemon_receipt", return_value=None), \
+                patch.object(d, "_run_helper", side_effect=helper), \
+                patch.object(d, "DaemonIPCClient", client or Client), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["restart"])
+        return code, output.getvalue(), order
+
+    def test_restart_stops_then_starts_and_prints_one_document(self):
+        calls = []
+
+        def helper(argv):
+            calls.append(list(argv))
+            return {"result": argv[-1].replace("-root", "")}
+
+        code, out, order = self.run_restart(helper)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(order, ["ipc", "stop_takeover"])
+        self.assertEqual([item[-1] for item in calls], ["stop-root", "start-root"])
+        self.assertEqual(calls[0][:2], ["sudo", "--"])
+        self.assertEqual(calls[1][:2], ["sudo", "--"])
+        document = json.loads(out)
+        self.assertEqual(document, {
+            "result": "restart",
+            "stop": {"result": "stop"},
+            "start": {"result": "start"},
+        })
+
+    def test_restart_does_not_start_when_stop_fails(self):
+        calls = []
+
+        def helper(argv):
+            calls.append(argv[-1])
+            return {"error": "launchctl_stop_failed"}
+
+        code, out, _order = self.run_restart(helper)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(calls, ["stop-root"])
+        document = json.loads(out)
+        self.assertEqual(document["result"], "restart")
+        self.assertEqual(document["stop"]["error"], "launchctl_stop_failed")
+        self.assertNotIn("start", document)
+
+    def test_restart_reports_a_start_failure_after_stop_succeeded(self):
+        calls = []
+
+        def helper(argv):
+            calls.append(argv[-1])
+            if argv[-1] == "start-root":
+                return {"error": "launchctl_start_failed"}
+            return {"result": "stop"}
+
+        code, out, _order = self.run_restart(helper)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(calls, ["stop-root", "start-root"])
+        document = json.loads(out)
+        self.assertEqual(document["stop"], {"result": "stop"})
+        self.assertEqual(document["start"], {"error": "launchctl_start_failed"})
+
+    def test_restart_rejects_extra_arguments_before_any_helper(self):
+        with patch.object(d, "_run_helper", side_effect=AssertionError("helper")), \
+                patch.object(d, "DaemonIPCClient", side_effect=AssertionError("ipc")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(d.cli_daemon(["restart", "now"]), 2)
 
 
 class WakeResidencyTests(unittest.TestCase):

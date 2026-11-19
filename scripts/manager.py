@@ -306,15 +306,61 @@ def network_command(root, command):
     run("bash", root / "local-setup.sh", command, "--sources-dir", source_directory(root))
 
 
-def deploy(root, command="deploy"):
-    ensure_assets(root)
-    # Pending is written before privileged work. A failed sudo/validation/service
-    # operation remains visible and retryable; never report it as applied.
+def apply(root):
+    """Make this checkout the running revision. One transaction on every platform.
+
+    Pending is written before activation. A failed activation stays pending
+    and does not record a revision. The only platform difference is
+    ``activate``: Linux deploys mihomo and verifies it; macOS reloads an
+    installed daemon and does not deploy the network.
+    """
+    # Pending is written before privileged work. A failed download, sudo,
+    # validation, or service operation remains visible and retryable.
     setting(root, "pendingApply", "true")
-    network_command(root, command)
-    network_command(root, "verify")
+    lines = activate(root)
     setting(root, "appliedRevision", git(root, "rev-parse", "HEAD"))
     setting(root, "pendingApply", "false")
+    for line in lines:
+        print(line, flush=True)
+
+
+def activate(root):
+    """Bring the installed runtime in line with this revision.
+
+    Returns lines to print after the revision is recorded. Raising leaves
+    pending set.
+    """
+    if nmd_platform.name() == "macos":
+        return _activate_macos_daemon(root)
+    ensure_assets(root)
+    network_command(root, "apply")
+    network_command(root, "verify")
+    return ()
+
+
+def _activate_macos_daemon(root):
+    """Reload the installed daemon. No receipt means there is nothing to reload.
+
+    ``restart`` is stop then start, and start bootstraps a root job that is
+    not loaded. The user LaunchAgent is not restarted. Routes, DNS, proxy,
+    Tailscale, and ``on_boot`` stay as they are.
+    """
+    from nmd_daemon import DaemonError, cli_daemon, daemon_receipt
+    unchanged = ("没有改路由、DNS、系统代理或 Tailscale，也没有启动接管。"
+                 "用户 LaunchAgent 不在这次重载里。")
+    try:
+        installed = daemon_receipt(root) is not None
+    except DaemonError as exc:
+        raise ManagerError("常驻守护收据无法读取；待应用状态保留。再次运行 nmd apply 重试。") from exc
+    if not installed:
+        return ("未安装常驻守护，没有执行 sudo，也没有重载进程。", unchanged)
+    try:
+        code = cli_daemon(["restart"])
+    except DaemonError as exc:
+        raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。") from exc
+    if code != 0:
+        raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。")
+    return ("已通过 nmd macos daemon restart 重载常驻守护（先 stop 再 start）。", unchanged)
 
 
 def bootstrap(args):
@@ -399,7 +445,10 @@ def update(root, check_only):
         if check_only:
             print("有更新" if previous != target else "已是最新版本", flush=True)
             if setting(root, "pendingApply") == "true":
-                print("当前安装仍待系统部署；运行 nmd apply 显式应用。", flush=True)
+                if nmd_platform.name() == "macos":
+                    print("当前安装仍待应用；运行 nmd apply。已安装常驻守护时，这会执行 daemon restart。", flush=True)
+                else:
+                    print("当前安装仍待系统部署；运行 nmd apply 显式应用。", flush=True)
             return
         if previous != target:
             # Validate a candidate without replacing the working installation.
@@ -426,7 +475,8 @@ def update(root, check_only):
             except Exception:
                 installed = False
             if installed:
-                print("常驻守护仍在运行旧代码；执行 nmd macos daemon stop && nmd macos daemon start 重载。", flush=True)
+                print("常驻守护仍在运行旧代码；执行 nmd apply 重载"
+                      "（即 nmd macos daemon restart，先 stop 再 start）。", flush=True)
 
 
 def monitor_install(root):
@@ -865,16 +915,18 @@ def main(argv=None):
     if platform not in ("linux", "windows"):
         allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
         if platform == "macos":
-            # User-level shell lifecycle and managed-install code updates only;
-            # deployment and systemd stay Linux-only. `macos` is the Phase B
-            # experimental sudo-foreground takeover controller.
-            allowed |= {"desktop", "bootstrap", "update", "macos"}
+            # User-level shell lifecycle, code update, and an explicit apply that
+            # only reloads an installed daemon. Linux network deploy and systemd
+            # stay unsupported. `macos` is the experimental takeover controller.
+            allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos"}
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
                                "（「设置与帮助」页可编辑监控配置）、模拟 demo、"
-                               "管理安装（bootstrap --manager-only）、代码更新、用户级桌面壳"
-                               "与常驻守护（nmd macos daemon）；不管理网络部署或 systemd。")
+                               "管理安装（bootstrap --manager-only）、代码更新、"
+                               "nmd apply / refresh（重载已安装的常驻守护，不部署网络）、"
+                               "用户级桌面壳与常驻守护（nmd macos daemon）；"
+                               "不管理 Linux 网络部署或 systemd。")
         if command in {"help", "--help", "-h"}:
             print("NMD macOS：只读诊断（不接管流量）与用户级桌面壳\n"
                   "  demo [--once] [--port PORT]  临时合成数据演示，不采集本机、不读取来源配置\n"
@@ -884,14 +936,17 @@ def main(argv=None):
                   "  gui [--state-dir DIR] [--config FILE] [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
                   "  machine capabilities | machine status --state-dir DIR\n"
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
-                  "  update [--check]  快进更新代码，不部署网络\n"
+                  "  update [--check]  快进更新代码，不部署网络、不重载守护\n"
+                  "  apply / refresh       记录当前版本；已安装守护时执行 daemon restart。"
+                  "不部署 Linux 网络，不启动接管\n"
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
                   "  macos accept           2 分钟验收：独立 root 回退进程就绪后才改网络\n"
                   "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
                   "                         见 docs/macos-mihomo-tailscale.md\n"
-                  "  macos daemon install/uninstall/start/stop/status/takeover-start/takeover-stop\n"
-                  "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管\n"
-                  "Linux 网络管理、apply 与 systemd 生命周期在 macOS 不支持。")
+                  "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
+                  "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
+                  "restart 等于先 stop 再 start\n"
+                  "Linux 的网络部署与 systemd 生命周期在 macOS 不支持。")
             return
         if command == "version":
             if argv[1:]:
@@ -1052,7 +1107,7 @@ def main(argv=None):
                     print("已卸载 monitor 和所属命令链接；保留代码、配置与历史，不影响 mihomo/tailscaled。")
     elif command in ("apply", "refresh"):
         with lock(ROOT / ".git" / "nmd.lock"):
-            deploy(ROOT, "apply")
+            apply(ROOT)
     elif command == "install-cli":
         with lock(ROOT / ".git" / "nmd.lock"):
             install_links(ROOT, Path(setting(ROOT, "binDir")), register_path=scope_of(ROOT) == "user")
