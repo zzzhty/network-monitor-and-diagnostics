@@ -590,6 +590,26 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("vps_socks_tcp", [name for name, _critical, _check in sup.checks])
 
 
+class CollectorStateDirTests(unittest.TestCase):
+    def test_user_owned_directory_stays(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            self.assertEqual(d.collector_state_dir(path), path)
+
+    def test_missing_directory_stays_so_the_collector_can_create_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nmd-monitor"
+            self.assertFalse(path.exists())
+            self.assertEqual(d.collector_state_dir(path), path)
+
+    def test_unowned_directory_uses_a_sibling_and_leaves_the_original(self):
+        preferred = Path("/tmp/nmd-state-choice/nmd-monitor")
+        with patch.object(d, "_collector_can_lock", return_value=False):
+            chosen = d.collector_state_dir(preferred)
+        self.assertEqual(chosen, preferred.parent / "nmd-monitor-user")
+        self.assertNotEqual(chosen, preferred)
+
+
 class UserDaemonTests(unittest.TestCase):
     def test_collect_runs_until_stopped_and_reports(self):
         with tempfile.TemporaryDirectory() as tmp:

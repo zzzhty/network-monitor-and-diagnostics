@@ -8,7 +8,7 @@
 
 ## 状态矩阵
 
-三列不要混写。用户隔离配置是机器上另一个目录里的实验，不是本 PR 的代码或安装包。本 PR 的静态/CI 只说明仓库里的纯函数和文档。本 PR 代码尚未在实机运行。这句指共存实验和回退实现；只读采集在 `4044472` 上有过一次部分验收，代理交叉读取还没有复跑，见下文。
+三列不要混写。用户隔离配置是机器上另一个目录里的实验，不是本 PR 的代码或安装包。本 PR 的静态/CI 只说明仓库里的纯函数和文档。本 PR 代码尚未在实机运行。这句指共存实验和回退实现；只读采集在 `4044472` 上有过一次部分验收。代理交叉读取已于 2026-11-19 在已安装代码上复跑，见下文。
 
 | 项 | 用户隔离配置 | 本 PR 静态 / CI | 本 PR 实机 |
 | --- | --- | --- | --- |
@@ -207,7 +207,21 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 5. 再看一次系统代理和路由，确认这次命令没有改它们。已启用但端口不通只留下警告，不会自动关闭，也不会改 bypass。
 6. `real_machine_verified` 和 `overnight_23s_root_cause_fixed` 在代码里固定为 false。
 
-2026-11-17 14:55–14:59（Asia/Hong_Kong）用 `git archive` 在用户 Mac 上跑过 PR5 `4044472`（`40444724a36079da9919b5089e6b48ab345dc69f`）的 `python3 scripts/macos_readonly.py observe`。Tailscale 完整 JSON 解析通过。路由是按路由表发现的。DNS 已回到官方 MagicDNS，没有 198.18。当时 `scutil --proxy` 几乎只剩 FTP passive，没有 HTTPEnable、HTTPSEnable、SOCKSEnable，旧逻辑把 `system_proxy.status` 记成 `unknown` / `missing_field`。同一时刻 `networksetup` 显示 Wi-Fi 的 HTTP、HTTPS、SOCKS 都是 Enabled: No，Server/Port 仍是 127.0.0.1:7897，旧输出没有写入 `disabled_saved`。VPS 没有 monitor 配置，所以是 `not_configured`，没有编造或扫描地址。这次验收时三项代理是关闭的，保存着的地址不是故障，机器在代理关闭时是安全的。下面的交叉读取还没有在那台 Mac 上复跑。此次新代码没有在实机运行。
+2026-11-17 14:55–14:59（Asia/Hong_Kong）用 `git archive` 在用户 Mac 上跑过 PR5 `4044472`（`40444724a36079da9919b5089e6b48ab345dc69f`）的 `python3 scripts/macos_readonly.py observe`。Tailscale 完整 JSON 解析通过。路由是按路由表发现的。DNS 已回到官方 MagicDNS，没有 198.18。当时 `scutil --proxy` 几乎只剩 FTP passive，没有 HTTPEnable、HTTPSEnable、SOCKSEnable，旧逻辑把 `system_proxy.status` 记成 `unknown` / `missing_field`。同一时刻 `networksetup` 显示 Wi-Fi 的 HTTP、HTTPS、SOCKS 都是 Enabled: No，Server/Port 仍是 127.0.0.1:7897，旧输出没有写入 `disabled_saved`。VPS 没有 monitor 配置，所以是 `not_configured`，没有编造或扫描地址。这次验收时三项代理是关闭的，保存着的地址不是故障，机器在代理关闭时是安全的。下面的交叉读取当时还没有复跑。此次新代码没有在实机运行。
+
+### 2026-11-19 只读复跑
+
+在已安装的 `df26516` 上复跑了两条只读入口，没有 sudo，没有改路由、DNS、代理或 Tailscale。配置是空 `probes`、`macos_readonly.enabled` 为 true、没有 `vps`。前后 `scutil --proxy` 的摘要一致，默认路由仍是 `utun5`，没有 `198.18`。
+
+`python3 scripts/macos_readonly.py observe` 的整份报告 `status` 为 `observed`。Tailscale 完整 JSON 解析为 `healthy`（BackendState Running，Self.Online true）。路由按路由表发现，默认接口是 `en0` 和 `utun5`，`interface_discovery` 为 `dynamic`。DNS 为 `observed`，MagicDNS 在，没有 fake-ip，也没有 `198.18`。没有配置 VPS，所以 `vps_tcp` 和 `tailnet_route_status` 都是 `not_configured`，没有扫描地址。`ipv6_default_status` 为 `not_applicable`，这不是真实 IPv6 验收。
+
+系统代理交叉读取：`scutil` 仍是 `missing_field`（没有 HTTPEnable、HTTPSEnable、SOCKSEnable）。`networksetup` 读了 Thunderbolt Bridge、Wi-Fi、Tailscale，三项都是 Enabled No，保存的地址是 `127.0.0.1:7897`。合并结果 `status` 为 `observed`，`effect` 为 `not_a_fault`，三项 `state` 为 `disabled`，`sources_agree` 为 true，地址进入 `disabled_saved`，`disabled_saved_address_is_fault` 为 false，没有 `dead_proxy`。缺键没有再把整段代理盖成未知。
+
+同一次配置又做了 `nmd monitor run --once`，状态目录是本次私有临时目录。`monitor status` 为 `fresh`，一条样本，`macos_readonly.status` 为 `observed`，代理效果同样是 `not_a_fault`。样本的 `service_observation_error` 为 `unsupported_platform`，这是 macOS 没有 systemd。
+
+`real_machine_verified`、`overnight_23s_root_cause_fixed`、`business_stable`、`report_is_health` 仍是 false。`real_machine_verified` 在读任何命令之前就写进报告，一次成功的观察不能把它改成 true。没有启用外部探测，没有看应用是否真的发出，没有启动 SSH，也没有把这次观察写成健康。过夜 23 秒窗口先不分析，`overnight_23s_root_cause_fixed` 保持 false；这次没有配置 `vps`，采集不会连接 1080。窗口以后再出现时，用当时的样本和同一条时间线上的路由、接口、Tailscale 一起看。
+
+常驻用户 daemon 不能锁属 root 且为 0700 的接管目录。样本改写到旁边的 `nmd-monitor-user`，接管目录、`on_boot` 和 root supervisor 不动。已放上只读 `monitor.json`（空 `probes`，没有 `vps`）。重载后的第一笔样本是 `observed`，代理效果 `not_a_fault`，Tailscale `healthy`，`vps_tcp` 为 `not_configured`。这仍不证明 1080 窗口会被记下。
 
 ### 系统代理交叉读取
 
@@ -332,6 +346,19 @@ sudo nmd macos rollback --state-dir DIR
 
 `nmd macos accept` 是固定 2 分钟的短时入口。它不改变上面默认 10 分钟、最长 8 小时的 takeover，不加载、不安装 launchd，不改 `on_boot`，也不停止已经在跑的 run-user。`--state-dir` 必须指向这次的私有目录，不能是 `~/.local/state/nmd-monitor`。普通用户可以先准备 inputs 和这个目录；sudo 之后核对所有者、权限、祖先符号链接和路径，不从 PATH 找 sudo 或解释器。geodata 只复制普通文件。这次生成的配置把 `geo-auto-update` 写成 false，避免这两分钟里自动联网更新；其它生成路径和示例配置仍是 true。
 
+### 谁把网络装回去
+
+一次 `accept` 里，能把网络装回切网前快照的有四个角色。它们都不是平时的网络维护者；平时的出口由 Tailscale 自己保持。长时 `takeover` 不拉起独立 watchdog 和 sentinel，回滚只写在那个前台进程的 `finally` 里，这个进程被 SIGKILL 后只剩下人。常驻 daemon 不使用这条链：launchd 重新拉起 supervisor，由 supervisor 回收残留，没有 sentinel。
+
+- 控制器还在时自己回滚。停止、SIGINT、SIGTERM、到期，以及它发现 watchdog 消失，都调用现有 `rollback`。SIGKILL 跳过 `finally`，这条不会执行。
+- watchdog 是切网前拉起的独立进程，不在控制器进程组里。它确认 pin 和快照可读之后等待，直到两分钟到期，或者控制器进程消失，然后用这份 pin 调用同一个 `rollback`。它不监视 sentinel，也不处理自己的死亡。
+- sentinel 只监视这个 watchdog。watchdog 还活着，并且还没超过到期后的 45 秒时，sentinel 不改网络。watchdog 中途退出时，sentinel 用同一份 pin 回滚，`trigger` 为 `watchdog_dead`。到期后再过 45 秒，仍没有一份 pin、绝对截止和 watchdog pid 都对得上的 `rollback_restored` 时，sentinel 把 watchdog 当成卡住并回滚，`trigger` 为 `watchdog_stuck`。watchdog 已经恢复成功时，sentinel 只记下 `watchdog_restored`，steps 为空，不再改网络。控制器已经死了而 watchdog 仍在工作时，sentinel 不动。
+- 人在这三个进程之外。产品不通知人，accept 也不安装 LaunchDaemon，没有进程会把死掉的 sentinel 拉起来。watchdog 和 sentinel 都没了、网络仍处于接管状态时，人执行 `nmd macos rollback --state-dir DIR`。这条命令不依赖那两个进程还活着：读 pin，只停止身份对得上的 mihomo，确认 scutil 里没有 198.18，再按快照恢复 exit node、allow-lan、accept-dns 和网卡 DNS。198.18 还在则结果是 `rollback_blocked_dirty_dns`，不改 exit node。官方回滚没有把出口装回去时，人再执行 `tailscale set --exit-node=<IP 或 MagicDNS 基名>`。
+
+`guarantees_restore_if_watchdog_dies` 不参与分支，在代码里固定为 false，并写入 ready 和 result。`restore_sentinel_armed` 为 true 只表示 sentinel 的握手成功。只杀掉 watchdog 时 sentinel 会恢复，这个结果不能把字段改成 true。watchdog 和 sentinel 一起死掉时，产品里没有进程会恢复。`guarantees_restore_if_watchdog_and_sampler_die` 同样固定为 false。
+
+2026-11-19 的一次 accept 中，watchdog 和 sentinel 被一起杀掉。随后的观察里两份 result 都没有写出，出口保持被清掉，198.18 仍在，mihomo 仍在跑。观察结束后，还活着的测试调用者执行了上面的 `rollback`，结果为 `rollback_restored`。产品自己没有恢复。
+
 任何网络变更之前，一个已经是 root、且不在控制器进程组里的 deadline 进程必须写好 ready，并且 ready 里的 pin 就是变更前钉死的快照。同一个握手还要确认第二个独立进程 restore sentinel。watchdog 或 sentinel 起不来、握手失败、或 ready 不是明确的 true，就零网络变更退出。控制器被杀掉后，watchdog 仍按最初的 pin 调用现有 rollback。watchdog 在回退完成前退出（崩溃、被杀、异常退出，或过了宽限仍没有这一轮的 `rollback_restored`）时，sentinel 用同一份 pin 调用现有 rollback。上一轮留在同一目录里的 `rollback-watch-result.json` 和 `rollback-sentinel-result.json` 会在拉起子进程之前删掉；符号链接或不是普通文件就零变更。只有 pin、绝对截止和 watchdog pid 都对得上，才算这一轮已经恢复。控制器若还活着，发现 watchdog 消失也会走这条回退。回退一开始先记下 engaged；控制器若还想继续清 exit node 或启动 mihomo，会在变更前停住。完成前用现有 rollback 核对恢复。身份对不上的 mihomo 不发信号。重复 rollback 仍是幂等。exit node 仍只按官方 CLI 接受的形式恢复：对端 Tailscale IP、MagicDNS 基名、快照里的 `exit_node_cli`，再不行用 prefs 的 ExitNodeIP。StableNodeID、node key 和 `auto:any` 不会传给 `tailscale set`。
 
 sentinel 自己也是一个普通进程。accept 不安装、不加载 LaunchDaemon，也没有进程外的 KeepAlive 会在 sentinel 死后把它拉起来。因此 watchdog 和 sentinel 一起死掉时恢复仍没有保证，`guarantees_restore_if_watchdog_dies` 保持 false，`guarantees_restore_if_watchdog_and_sampler_die` 也保持 false。冲突只看 root supervisor 的 `/var/run/nmd-daemon.sock`，以及这份 state 目录里仍在跑的 watchdog 或 sentinel。inode 存在或 `lstat` 失败就在改网络前退出。这个套接字由 root `supervise` 监听，不是 run-user 采集器创建的。只读的 user LaunchAgent、以及磁盘上有但未加载的 system plist，都不构成冲突，验收不会停它们。
@@ -374,7 +401,7 @@ Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前�
 - 连续 3 次关键故障才回退
 - 不自愈循环，不安装 daemon 或自动启动，不改电源设置
 - 睡眠唤醒之后仍按绝对截止时间计算。唤醒后重读 native DNS、IPv4 默认路由、exit node 和 scutil proxy；托管状态仍正确就继续，不对就按 pin 回退。`takeover-*.json` 的 `wake.proxy` 只含 enabled 布尔表和 status/reason
-- 不保证 watchdog 自己死掉之后一定能恢复：sentinel 还活着时会回退，sentinel 也死掉则没有保证
+- 不保证 watchdog 自己死掉之后一定能恢复。sentinel 还活着时会回退；两个都死掉之后，产品里没有进程恢复，要由人执行 rollback。字段固定 false，见「谁把网络装回去」
 - 不保证 watchdog 和采样进程都被杀掉之后还能恢复
 
 ## 合并前与之后
@@ -384,7 +411,7 @@ Phase B 起，`scripts/macos_takeover.py` 把下面的清单实现为 sudo 前�
 这些还没有完成，也不阻塞把上面的纯函数当作下一步的开发基线：
 
 1. 在本仓库代码上再跑一次 Mac。用户隔离配置的结果不能代替它。App 实际发送仍没有由本 PR 观察。
-2. 只读采集在 `4044472` 上做过一次部分验收；代理交叉读取还没有复跑。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
+2. 只读采集在 `4044472` 上做过一次部分验收。代理交叉读取已于 2026-11-19 复跑，缺键不再把关闭的代理盖成未知。同秒两次 restore 的幂等风险仍在；仓库实现尚未验证。
 3. 睡眠唤醒的实机验收。2026-11-18 的那次睡眠是真的，但控制器因 `proxy_drift` 回退，而判定当时的代理表没有留下，所以不算通过。CI 仍只覆盖注入时钟。还要在写入 `wake.proxy` 的新 head 上，于 accept 会话中和常驻 residency 中再睡眠再唤醒，核对路由、DNS、系统代理（只观察、不写回）和 exit node。`sleep_wake_verified` 仍是 false。常驻 residency 还没有测。
 4. 真实 IPv6。无 AAAA 不是故障，`curl -6` 的 IPv4 映射不算通过。
 5. 过夜 23 秒 1080 窗口的根因。短测没有复现，也不等于修复。不启动 SSH。
