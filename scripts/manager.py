@@ -339,7 +339,7 @@ def activate(root):
 
 
 def _activate_macos_daemon(root):
-    """Reload the installed daemon after a read-only preflight.
+    """Reload the installed daemon after geodata ensure and a read-only preflight.
 
     ``restart`` is stop then start, and start bootstraps a root job that is
     not loaded. The user LaunchAgent is not restarted and ``on_boot`` is not
@@ -367,7 +367,7 @@ def _activate_macos_daemon(root):
             "若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。"
             "若 daemon.json 的 on_boot 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。"
             "会话若停在 active、starting 或 needs_rollback，启动会先把那次回退做完。"
-            "预检未通过时不会 stop，也不会 sudo。")
+            "缺少的地理数据会在预检前补齐；下载或预检未通过时不会 stop，也不会 sudo。")
 
 
 def bootstrap(args):
@@ -948,15 +948,18 @@ def main(argv=None):
                   "  machine capabilities | machine status --state-dir DIR\n"
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
                   "  update [--check]  快进更新代码，不部署网络、不重载守护\n"
-                  "  apply / refresh       记录当前版本；已安装守护时先做只读预检，通过后才 daemon restart。"
-                  "不部署 Linux 网络。进行中的接管会被 stop 回退；on_boot 为 true 时，新的一次开机可能开始接管\n"
+                  "  apply / refresh       记录当前版本；已安装守护时先补齐缺少的地理数据，再做只读预检，通过后才 daemon restart。"
+                  "不部署 Linux 网络。下载或预检失败不 stop。进行中的接管会被 stop 回退；on_boot 为 true 时，新的一次开机可能开始接管\n"
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
                   "  macos accept           2 分钟验收：独立 root 回退进程就绪后才改网络\n"
                   "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
                   "                         见 docs/macos-mihomo-tailscale.md\n"
                   "  macos preflight [--tier readonly|daemon|takeover]\n"
                   "                         只读预检。默认 readonly，不要求 mihomo；"
-                  "daemon 在 start/restart 之前；takeover 在改网络之前\n"
+                  "daemon 在 start/restart 之前；takeover 在改网络之前。不会下载\n"
+                  "  macos geodata ensure [--geodata-dir DIR] [--inputs FILE]\n"
+                  "                         下载生成规则缺少的 geosite.dat / geoip.metadb。"
+                  "不要 sudo。预检、help、status 和面板不会跑这一步\n"
                   "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
                   "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
                   "restart 等于先 stop 再 start。预检失败则不 stop。"
@@ -1036,6 +1039,9 @@ def main(argv=None):
         if argv[1:2] == ["preflight"]:
             from macos_preflight import main as preflight_main
             raise SystemExit(preflight_main(argv[2:]))
+        if argv[1:2] == ["geodata"]:
+            from macos_geodata import main as geodata_main
+            raise SystemExit(geodata_main(argv[2:]))
         if argv[1:2] == ["daemon"]:
             from nmd_daemon import cli_daemon
             raise SystemExit(cli_daemon(argv[2:]))

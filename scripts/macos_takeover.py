@@ -106,6 +106,8 @@ SLEEP_GAP_SECONDS = 2.0
 # a dead sentinel is not restarted. Do not flip this to True.
 GUARANTEES_RESTORE_IF_WATCHDOG_DIES = False
 DAEMON_SOCKET = "/var/run/nmd-daemon.sock"
+# geoip.dat is copied only when it is already on disk. The generated config
+# does not set geodata-mode, so mihomo reads MMDB (geoip.metadb) instead.
 GEODATA_FILES = ("geoip.metadb", "geosite.dat", "Country.mmdb", "geoip.dat")
 GEODATA_MAX_BYTES = 64 * 1024 * 1024
 
@@ -136,9 +138,10 @@ extend the session. CI does not perform a real Mac sleep.
 
 `takeover` is the longer foreground session (default 10 minutes, 8 hours at
 most, never renewed). `rollback` restores the pinned snapshot. On macOS,
-`accept` and `takeover` run `nmd macos preflight --tier takeover` before sudo;
-a fail or unknown result does not re-exec. --help and -h print this text and
-do not escalate. System proxy and bypass are never changed.
+`accept` and `takeover` run `nmd macos geodata ensure` for missing files,
+then `nmd macos preflight --tier takeover`, both before sudo. A failed
+download or a fail/unknown preflight does not re-exec. --help and -h print
+this text and do not escalate. System proxy and bypass are never changed.
 """
 
 
@@ -763,6 +766,36 @@ def config_is_direct_regular(work_dir, config_path):
     return config.parent == work and config.name not in ("", ".", "..")
 
 
+def locate_regular(directory, name):
+    """Direct regular file whose name equal-folds ``name``, or ``(None, None)``.
+
+    Symlinks are not a match. An exact-case name wins over another fold.
+    """
+    folded = name.casefold()
+    exact = None
+    other = None
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return None, None
+    for entry in entries:
+        if entry.name.casefold() != folded:
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            continue
+        found = (Path(entry.path), info)
+        if entry.name == name:
+            exact = found
+            break
+        if other is None:
+            other = found
+    return exact or other or (None, None)
+
+
 def stage_geodata(target_dir, source_dir=None):
     """Copy regular geodata next to the config. Symlinks are never followed.
 
@@ -801,14 +834,8 @@ def stage_geodata(target_dir, source_dir=None):
         if info is not None:
             missing.append(name)
             continue
-        source = source_dir / name
-        try:
-            src_info = source.lstat()
-        except OSError:
-            missing.append(name)
-            continue
-        if (stat.S_ISLNK(src_info.st_mode) or not stat.S_ISREG(src_info.st_mode)
-                or src_info.st_size > GEODATA_MAX_BYTES):
+        source, src_info = locate_regular(source_dir, name)
+        if source is None or src_info.st_size > GEODATA_MAX_BYTES:
             missing.append(name)
             continue
         flags = os.O_RDONLY | os.O_CLOEXEC
@@ -2501,7 +2528,8 @@ def main(argv=None):
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
     if argv[0] in ("accept", "takeover"):
-        # Read-only tier runs before sudo. A failure here does not re-exec.
+        # Ensure missing geodata, then the read-only tier, both before sudo.
+        # A failure here does not re-exec.
         import macos_preflight
         if macos_preflight.host_is_darwin() and os.geteuid() != 0:
             try:
@@ -2512,6 +2540,11 @@ def main(argv=None):
             if rest:
                 sys.stderr.write(HELP)
                 return 2
+            import macos_geodata
+            try:
+                macos_geodata.prepare_for_foreground(options)
+            except (OSError, ValueError, TypeError, KeyError, macos_geodata.GeodataError):
+                pass
             report = macos_preflight.for_foreground(options)
             if report.get("blocking"):
                 print(json.dumps(dict(report, refused_action=argv[0]),

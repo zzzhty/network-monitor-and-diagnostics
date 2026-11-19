@@ -44,13 +44,13 @@ monitor 单元和 mihomo 服务是两件事。`nmd monitor install` 不部署网
 - macOS：源码 CLI、只读诊断面板，以及「设置与帮助」里对自己 `monitor.json` 的编辑。可选 `nmd desktop install` 做用户级桌面壳；登录自启是 LaunchAgent，只启动这个壳。没有 monitor 服务，也没有网络部署。
 - Windows：当前用户的 CLI、SQLite 和可编辑监控配置的面板。后台是计划任务 `\NMD\Monitor`。不安装 Windows 服务，不安装桌面壳。
 
-两边都拒绝来源/通道管理、`adopt` 和 Linux 的系统网络命令。`nmd apply` / `refresh` 在 Linux 和 macOS 上是同一次事务：先标待应用，再激活本机已安装的运行面，成功后才记录版本。Linux 激活 mihomo 部署并校验；macOS 在已安装常驻守护时先做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start），不下载代理资产，不调用 `takeover-start`。预检失败则不 stop、不 sudo。若当时有进行中的接管，stop 会先按快照回退，DNS、路由或 Tailscale exit node 会回到接管前；若 `on_boot` 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。Windows 仍拒绝 `apply`。
+两边都拒绝来源/通道管理、`adopt` 和 Linux 的系统网络命令。`nmd apply` / `refresh` 在 Linux 和 macOS 上是同一次事务：先标待应用，再激活本机已安装的运行面，成功后才记录版本。Linux 激活 mihomo 部署并校验；macOS 在已安装常驻守护时，若这次重载需要地理数据，先补齐缺少的 `geosite.dat` / `geoip.metadb`，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。不下载 Linux 的 mihomo 安装包，不调用 `takeover-start`。下载或预检失败则不 stop、不 sudo。若当时有进行中的接管，stop 会先按快照回退，DNS、路由或 Tailscale exit node 会回到接管前；若 `on_boot` 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。Windows 仍拒绝 `apply`。
 
 ### 外部客户端
 
 桌面端长期用哪一款客户端仍在调研（具体软件调研中，待定）。与 Clash Verge Rev 共同使用时，外部流量由 Clash Verge Rev 管理，包括 Tailscale 网络上的出口。NMD 不部署这套客户端，也不写它的配置。
 
-Linux `config.yaml` 里可以跨平台对照的意图是：`tailscale.com` 与 `tailscale.io` 直连，tailnet `100.64.0.0/10` 和 `fd7a:115c:a1e0::/48` 直连，`GEOSITE,cn`、`GEOIP,private`、`GEOIP,CN` 直连，其余走自有 VPS。`GEOSITE` / `GEOIP` 依赖对应的 geodata，客户端是否自带这份数据，要等软件选定后再看。
+Linux `config.yaml` 里可以跨平台对照的意图是：`tailscale.com` 与 `tailscale.io` 直连，tailnet `100.64.0.0/10` 和 `fd7a:115c:a1e0::/48` 直连，`GEOSITE,cn`、`GEOIP,private`、`GEOIP,CN` 直连，其余走自有 VPS。`GEOSITE` / `GEOIP` 依赖对应的 geodata，客户端是否自带这份数据，要等软件选定后再看。macOS 实验路径另有 `nmd macos geodata ensure`：只在生成规则用到时，从与 Linux `fetch-assets.sh` 相同的 MetaCubeX `meta-rules-dat` `latest` 下载 `geosite.dat` 和 MMDB `geoip.metadb`（不下载 `geoip.dat`）。这不改变桌面客户端仍待选定的结论。
 
 这些 Linux 条目留在网关模板里，不当作桌面客户端的配置：
 

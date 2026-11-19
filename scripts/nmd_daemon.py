@@ -1238,6 +1238,24 @@ def _daemon_start():
                         "start-root"])
 
 
+def _prepare_geodata(action):
+    """Download missing geodata before the read-only gate. Never stops or sudos.
+
+    A failure is left for the following preflight to report. The service is
+    not stopped here.
+    """
+    import macos_geodata
+    import macos_preflight
+    if not macos_preflight.host_is_darwin():
+        return
+    if action not in ("start", "restart", "takeover-start"):
+        return
+    try:
+        macos_geodata.prepare_for_daemon(action)
+    except (OSError, ValueError, TypeError, KeyError, macos_geodata.GeodataError):
+        return
+
+
 def _preflight_block(action):
     """Return an exit code when read-only checks block, else None.
 
@@ -1281,6 +1299,7 @@ def cli_daemon(argv):
         print(json.dumps(reply, ensure_ascii=False, indent=2))
         return 0 if "error" not in reply else 1
     if action == "takeover-start":
+        _prepare_geodata("takeover-start")
         blocked = _preflight_block("takeover-start")
         if blocked is not None:
             return blocked
@@ -1373,6 +1392,7 @@ def cli_daemon(argv):
         print(json.dumps({"result": "daemon_uninstalled"}))
         return 0
     if action == "start":
+        _prepare_geodata("start")
         blocked = _preflight_block("start")
         if blocked is not None:
             return blocked
@@ -1384,8 +1404,10 @@ def cli_daemon(argv):
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
     if action == "restart":
-        # Checks finish before stop. A failed preflight does not bootout a
-        # healthy job and does not sudo. stop then start only runs after that.
+        # Geodata ensure, then the read-only checks, both before stop. A
+        # failed download or preflight does not bootout a healthy job and
+        # does not sudo. stop then start only runs after that.
+        _prepare_geodata("restart")
         blocked = _preflight_block("restart")
         if blocked is not None:
             return blocked

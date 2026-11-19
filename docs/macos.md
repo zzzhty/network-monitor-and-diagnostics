@@ -55,7 +55,7 @@ systemd 安装管理，面板不提供编辑。
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 诊断只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host；macOS 额外仅开放 `/api/config` 编辑自己的 monitor 配置（不启动采集） |
 | 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
-| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时先做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。预检失败不 stop、不 sudo。进行中的接管会被这次 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
+| 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。进行中的接管会被这次 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
 | 实验性自管接管（单次） | `sudo nmd macos takeover`：sudo 前台运行 mihomo 接管出口，绝对截止（默认 10 分钟、上限 8 小时，按墙钟），STOP/到期/连续 3 个故障周期幂等回退；唤醒后复查或回退。仅显式运行，无常驻组件。accept 的 sentinel 有一次实机恢复记录；睡眠唤醒尚未验收。见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md) |
 | 实验性自管接管（常驻 daemon） | `nmd macos daemon install`：root 管理器（launchd KeepAlive）常驻监督接管——无绝对截止，健康故障（默认连续 3 周期）或 mihomo 退出即自动回退，唤醒后复查托管状态且不因此启动接管，手动停止走 CLI 或面板；开机策略 `daemon.json` 的 `on_boot`（默认关）。面板归属 daemon，桌面壳自动复用。未实机验证。策略见 `DAEMON_POLICY`。 |
 
@@ -67,8 +67,8 @@ systemd 安装管理，面板不提供编辑。
 不启动后台常驻，不自动测速、修复或切换网络。唯一例外是显式 `nmd desktop autostart on`
 写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
 macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `desktop` 生命周期。
-`apply` 记录当前版本；已安装常驻守护时先做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
-它不下载代理资产，也不调用 `takeover-start`。预检失败时不会 stop，也不会 sudo，待应用状态保留。
+`apply` 记录当前版本；已安装常驻守护时，若这次重载会用到接管规则，先运行与 `nmd macos geodata ensure` 相同的补齐，再做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
+它不下载 Linux 的 mihomo 安装包，也不调用 `takeover-start`。下载失败或预检失败时不会 stop，也不会 sudo，待应用状态保留。
 若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。
 若 `daemon.json` 的 `on_boot` 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。
 会话若停在 `active`、`starting` 或 `needs_rollback`，启动会先把那次回退做完。
@@ -96,9 +96,26 @@ macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `de
 
 `tun.dns-mode: native` 需要 mihomo 1.19.33 或更新。这是文档里 native 模式的要求，不是把曾经观测到的 1.19.34 当成最低版本。`dns-mode: disabled` 没有这道下限。
 
-输出是一份 JSON：`result` 为 `pass`、`fail` 或 `unknown`。`unknown` 是探测没有得到结果，不会当成通过。退出码分别是 0、1、3。`fail` 和 `unknown` 都不会 sudo、stop、start 或改网络。失败项带一句中文的下一步，例如把官方 mihomo 或官方 Tailscale 装到哪、地理数据放哪。不会自动安装或下载，也不会打印配置正文、地址或密钥。
+输出是一份 JSON：`result` 为 `pass`、`fail` 或 `unknown`。`unknown` 是探测没有得到结果，不会当成通过。退出码分别是 0、1、3。`fail` 和 `unknown` 都不会 sudo、stop、start 或改网络。失败项带一句中文的下一步，例如把官方 mihomo 或官方 Tailscale 装到哪。缺地理数据时，下一步是下面的 `nmd macos geodata ensure`。预检本身不会安装或下载，也不会打印配置正文、地址或密钥。
 
 这些检查在本仓库里用替身和离线用例验证。它们不是实机验收，也不表示睡眠唤醒或 watchdog 恢复已经在真机上通过。
+
+## 地理数据
+
+生成配置不写 `geodata-mode`。mihomo 1.19 因此用 MMDB 做 `GEOIP`，用 `geosite.dat` 做 `GEOSITE`。`geoip.dat` 是打开 `geodata-mode` 才读的另一种格式，这条路径不下载它。目录里已有、并且带 MaxMind 标记的 `Country.mmdb` 或 `geoip.db` 算作 MMDB，不会再下一份 `geoip.metadb`。空文件、网页或截断内容不算已有数据；下载失败时原文件保持不变。`GeoSite.dat` 和 `geosite.dat` 按大小写不敏感认作同一个文件。
+
+来源与 Linux `fetch-assets.sh` 相同，都是 MetaCubeX `meta-rules-dat` 的 `latest`：`geosite.dat` 和 `geoip.metadb`。macOS 还会核对同一发布旁的 `.sha256sum`。体积不能代替这份校验。Linux 脚本的行为不变，它仍不核对校验和，也仍把站点库存成 `GeoSite.dat`。
+
+```bash
+nmd macos geodata ensure
+nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
+```
+
+不带 `--geodata-dir` 时写到当前账户的 `~/.config/mihomo`。这个目录也是 sudo 前台（`SUDO_USER` 的家目录）和 launchd（daemon 配置所有者的家目录）复制地理数据的地方。不要用 sudo 跑这条命令：它不会把文件写进 `/var/root`，也不会改 root 拥有的权限。显式目录只写该目录。规则里没有 `GEOSITE` 就不下 `geosite.dat`，没有 `GEOIP` 就不下 `geoip.metadb`。文件已经是合法的 MMDB 或 geosite 时不访问网络。
+
+`accept`、`takeover`，以及需要接管检查的 `daemon start` / `restart` / `takeover-start`（含已安装守护上的 `apply`），会在 sudo、stop、start 之前做同一步。下载或校验失败则不继续，不改路由、DNS、代理或 Tailscale，也不把版本记成已应用。`preflight`、`help`、`status` 和只读面板不会下载。
+
+这一步在仓库里用替身验证，不是实机下载验收。
 
 ## 可选：显式本机单次观测
 
