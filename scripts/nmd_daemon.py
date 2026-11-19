@@ -654,7 +654,8 @@ class RootSupervisor:
                     "geodata_staged": staged, "geodata_missing": missing}
         _, summary, snapshot_path = macos_prepare.collect_snapshot(
             "macos", self.state_dir, runner=self.runner, exists=self.exists)
-        if summary.get("has_198_18") is True or summary.get("mihomo_running") is True:
+        import macos_preflight
+        if macos_preflight.snapshot_conflict(summary, snapshot_name="kept", strict=False):
             return {"error": "preflight_failed",
                     "has_198_18": summary.get("has_198_18"),
                     "mihomo_running": summary.get("mihomo_running")}
@@ -1237,6 +1238,25 @@ def _daemon_start():
                         "start-root"])
 
 
+def _preflight_block(action):
+    """Return an exit code when read-only checks block, else None.
+
+    The report is printed before any sudo, stop, or start. Non-macOS callers
+    skip the checks so Linux tests keep the existing restart sequence.
+    """
+    import macos_preflight
+    if not macos_preflight.host_is_darwin():
+        return None
+    if action == "takeover-start":
+        report = macos_preflight.for_installed_takeover()
+    else:
+        report = macos_preflight.for_daemon_lifecycle()
+    if not report.get("blocking"):
+        return None
+    print(json.dumps(dict(report, refused_action=action), ensure_ascii=False, indent=2))
+    return macos_preflight.exit_code(report)
+
+
 def cli_daemon(argv):
     """`nmd macos daemon install|uninstall|start|stop|restart|status|takeover-start`."""
     import manager
@@ -1261,6 +1281,9 @@ def cli_daemon(argv):
         print(json.dumps(reply, ensure_ascii=False, indent=2))
         return 0 if "error" not in reply else 1
     if action == "takeover-start":
+        blocked = _preflight_block("takeover-start")
+        if blocked is not None:
+            return blocked
         if os.geteuid() != 0:
             try:
                 macos_takeover.reexec_root(Path(__file__).resolve(), ["daemon", *argv])
@@ -1350,6 +1373,9 @@ def cli_daemon(argv):
         print(json.dumps({"result": "daemon_uninstalled"}))
         return 0
     if action == "start":
+        blocked = _preflight_block("start")
+        if blocked is not None:
+            return blocked
         helper = _daemon_start()
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
@@ -1358,8 +1384,11 @@ def cli_daemon(argv):
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
     if action == "restart":
-        # stop then start. A stop error does not start, so a failed bootout
-        # cannot be followed by bootstrapping the root job.
+        # Checks finish before stop. A failed preflight does not bootout a
+        # healthy job and does not sudo. stop then start only runs after that.
+        blocked = _preflight_block("restart")
+        if blocked is not None:
+            return blocked
         stop = _daemon_stop()
         if "error" in stop:
             print(json.dumps({"result": "restart", "stop": stop}, ensure_ascii=False))

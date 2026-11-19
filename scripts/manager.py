@@ -339,28 +339,35 @@ def activate(root):
 
 
 def _activate_macos_daemon(root):
-    """Reload the installed daemon. No receipt means there is nothing to reload.
+    """Reload the installed daemon after a read-only preflight.
 
     ``restart`` is stop then start, and start bootstraps a root job that is
-    not loaded. The user LaunchAgent is not restarted. Routes, DNS, proxy,
-    Tailscale, and ``on_boot`` stay as they are.
+    not loaded. The user LaunchAgent is not restarted and ``on_boot`` is not
+    edited. Stopping an active takeover rolls the network back. A start that
+    the supervisor treats as a new boot can begin a takeover when ``on_boot``
+    is true, and a pending rollback session is finished on start.
     """
     from nmd_daemon import DaemonError, cli_daemon, daemon_receipt
-    unchanged = ("没有改路由、DNS、系统代理或 Tailscale，也没有启动接管。"
-                 "用户 LaunchAgent 不在这次重载里。")
     try:
         installed = daemon_receipt(root) is not None
     except DaemonError as exc:
         raise ManagerError("常驻守护收据无法读取；待应用状态保留。再次运行 nmd apply 重试。") from exc
     if not installed:
-        return ("未安装常驻守护，没有执行 sudo，也没有重载进程。", unchanged)
+        return ("未安装常驻守护，没有执行 sudo，也没有重载进程。",
+                "没有改路由、DNS、系统代理或 Tailscale。")
     try:
         code = cli_daemon(["restart"])
     except DaemonError as exc:
         raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。") from exc
     if code != 0:
         raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。")
-    return ("已通过 nmd macos daemon restart 重载常驻守护（先 stop 再 start）。", unchanged)
+    return ("已通过 nmd macos daemon restart 重载常驻守护（先 stop 再 start）。"
+            "用户 LaunchAgent 不在这次重载里。",
+            "这次不调用 takeover-start，也不部署 Linux 网络。"
+            "若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。"
+            "若 daemon.json 的 on_boot 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。"
+            "会话若停在 active、starting 或 needs_rollback，启动会先把那次回退做完。"
+            "预检未通过时不会 stop，也不会 sudo。")
 
 
 def bootstrap(args):
@@ -446,7 +453,8 @@ def update(root, check_only):
             print("有更新" if previous != target else "已是最新版本", flush=True)
             if setting(root, "pendingApply") == "true":
                 if nmd_platform.name() == "macos":
-                    print("当前安装仍待应用；运行 nmd apply。已安装常驻守护时，这会执行 daemon restart。", flush=True)
+                    print("当前安装仍待应用；运行 nmd apply。已安装常驻守护时，会先做只读预检，"
+                      "通过后才执行 daemon restart。", flush=True)
                 else:
                     print("当前安装仍待系统部署；运行 nmd apply 显式应用。", flush=True)
             return
@@ -475,8 +483,10 @@ def update(root, check_only):
             except Exception:
                 installed = False
             if installed:
-                print("常驻守护仍在运行旧代码；执行 nmd apply 重载"
-                      "（即 nmd macos daemon restart，先 stop 再 start）。", flush=True)
+                print("常驻守护仍在运行旧代码；执行 nmd apply 会先做只读预检，通过后才重载"
+                      "（即 nmd macos daemon restart，先 stop 再 start）。"
+                      "若当时有接管，stop 会回退网络；on_boot 为 true 时，"
+                      "新的一次开机可能开始接管。", flush=True)
 
 
 def monitor_install(root):
@@ -916,15 +926,16 @@ def main(argv=None):
         allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
         if platform == "macos":
             # User-level shell lifecycle, code update, and an explicit apply that
-            # only reloads an installed daemon. Linux network deploy and systemd
-            # stay unsupported. `macos` is the experimental takeover controller.
+            # reloads an installed daemon after preflight. That reload can roll
+            # back an active takeover. Linux network deploy and systemd stay
+            # unsupported. `macos` is the experimental takeover controller.
             allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos"}
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
                                "（「设置与帮助」页可编辑监控配置）、模拟 demo、"
                                "管理安装（bootstrap --manager-only）、代码更新、"
-                               "nmd apply / refresh（重载已安装的常驻守护，不部署网络）、"
+                               "nmd apply / refresh（预检通过后才重载已安装的常驻守护）、"
                                "用户级桌面壳与常驻守护（nmd macos daemon）；"
                                "不管理 Linux 网络部署或 systemd。")
         if command in {"help", "--help", "-h"}:
@@ -937,15 +948,19 @@ def main(argv=None):
                   "  machine capabilities | machine status --state-dir DIR\n"
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
                   "  update [--check]  快进更新代码，不部署网络、不重载守护\n"
-                  "  apply / refresh       记录当前版本；已安装守护时执行 daemon restart。"
-                  "不部署 Linux 网络，不启动接管\n"
+                  "  apply / refresh       记录当前版本；已安装守护时先做只读预检，通过后才 daemon restart。"
+                  "不部署 Linux 网络。进行中的接管会被 stop 回退；on_boot 为 true 时，新的一次开机可能开始接管\n"
                   "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
                   "  macos accept           2 分钟验收：独立 root 回退进程就绪后才改网络\n"
                   "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
                   "                         见 docs/macos-mihomo-tailscale.md\n"
+                  "  macos preflight [--tier readonly|daemon|takeover]\n"
+                  "                         只读预检。默认 readonly，不要求 mihomo；"
+                  "daemon 在 start/restart 之前；takeover 在改网络之前\n"
                   "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
                   "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
-                  "restart 等于先 stop 再 start\n"
+                  "restart 等于先 stop 再 start。预检失败则不 stop。"
+                  "进行中的接管会被这次 stop 回退\n"
                   "Linux 的网络部署与 systemd 生命周期在 macOS 不支持。")
             return
         if command == "version":
@@ -1018,6 +1033,9 @@ def main(argv=None):
         if platform != "macos":
             print(f"未知命令: {command}", file=sys.stderr)
             raise SystemExit(2)
+        if argv[1:2] == ["preflight"]:
+            from macos_preflight import main as preflight_main
+            raise SystemExit(preflight_main(argv[2:]))
         if argv[1:2] == ["daemon"]:
             from nmd_daemon import cli_daemon
             raise SystemExit(cli_daemon(argv[2:]))

@@ -135,8 +135,10 @@ are never written. The absolute deadline is wall time, so sleep does not
 extend the session. CI does not perform a real Mac sleep.
 
 `takeover` is the longer foreground session (default 10 minutes, 8 hours at
-most, never renewed). `rollback` restores the pinned snapshot. --help and -h
-print this text and do not escalate. System proxy and bypass are never changed.
+most, never renewed). `rollback` restores the pinned snapshot. On macOS,
+`accept` and `takeover` run `nmd macos preflight --tier takeover` before sudo;
+a fail or unknown result does not re-exec. --help and -h print this text and
+do not escalate. System proxy and bypass are never changed.
 """
 
 
@@ -2176,19 +2178,12 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
     ready = summary if isinstance(summary, dict) else {}
     record["snapshot"] = str(snapshot_path) if snapshot_path else None
     snapshot_name = Path(record["snapshot"]).name if record.get("snapshot") else None
-    if external_rollback and (snapshot_name is None
-                              or ready.get("has_198_18") is not False
-                              or ready.get("mihomo_running") is not False):
-        unknown = (snapshot_name is None or ready.get("has_198_18") is None
-                   or ready.get("mihomo_running") is None)
-        record["result"] = "preflight_unknown" if unknown else "preflight_failed"
-        record["preflight"] = {key: ready.get(key)
-                               for key in ("has_198_18", "mihomo_running")}
-        return record
-    if ready.get("has_198_18") is True or ready.get("mihomo_running") is True:
-        record["result"] = "preflight_failed"
-        record["preflight"] = {key: ready.get(key)
-                               for key in ("has_198_18", "mihomo_running")}
+    import macos_preflight
+    conflict = macos_preflight.snapshot_conflict(
+        ready, snapshot_name=snapshot_name, strict=bool(external_rollback))
+    if conflict is not None:
+        record["result"] = conflict["result"]
+        record["preflight"] = conflict["preflight"]
         return record
     write_pin(state_dir, snapshot_name)
     pin_holder[0] = snapshot_name
@@ -2505,6 +2500,23 @@ def main(argv=None):
     except TakeoverError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
+    if argv[0] in ("accept", "takeover"):
+        # Read-only tier runs before sudo. A failure here does not re-exec.
+        import macos_preflight
+        if macos_preflight.host_is_darwin() and os.geteuid() != 0:
+            try:
+                options, rest = _parse_takeover_args(argv[1:])
+            except TakeoverError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                return 2
+            if rest:
+                sys.stderr.write(HELP)
+                return 2
+            report = macos_preflight.for_foreground(options)
+            if report.get("blocking"):
+                print(json.dumps(dict(report, refused_action=argv[0]),
+                                 ensure_ascii=False, indent=2))
+                return macos_preflight.exit_code(report)
     try:
         if os.geteuid() != 0:
             reexec_root(Path(__file__).resolve(), argv)
