@@ -311,7 +311,7 @@ launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端�
 重新 `bootstrap` 再 `kickstart`。卸载同时 `bootout` 当前用户的 LaunchAgent。
 示例配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
 **`nmd update` 只更新磁盘代码，不重载进程。** 已安装守护时，`nmd apply`
-（`refresh` 同义）先做只读预检，通过后才执行 `nmd macos daemon restart`。
+（`refresh` 同义）若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`。
 它不跑 Linux 的网络部署，不调用 `takeover-start`，也不改 `on_boot`。
 预检失败则不 stop、不 sudo，待应用保留。若当时有进行中的接管，stop 会先按
 快照回退，路由、DNS 或 Tailscale exit node 会变。若 `on_boot` 为 true，且
@@ -340,7 +340,9 @@ node 或系统代理漂移不对，就按本次 pin 回退。直接或已经回�
 
 state 目录、mihomo 工作目录和 daemon 配置在写入或读取前按路径分量 `lstat`，不 `resolve` 整条路径。除了 root 拥有、且目标正好是 `/private/tmp`、`/private/var`、`/private/etc` 的 `/tmp`、`/var`、`/etc` 之外，任何祖先符号链接都拒绝。组或其他人可写只允许出现在 `/tmp`、`/private/tmp`、`/var/tmp`、`/private/var/tmp` 这四个 sticky 目录上；叶子目录本身有组/其他写位也拒绝。这挡的是替换父目录，挡不住检查返回之后的替换。
 
-geodata 只从显式 `--geodata-dir`，或从当前账户的 `~/.config/mihomo` 复制普通文件。`sudo` 把 HOME 设成 `/var/root`，所以 euid 0 时不用 `Path.home()`：前台用 `SUDO_USER` 的家目录，launchd 没有这个变量，就用 daemon 配置文件所有者的家目录。uid 0、目录是符号链接、祖先不安全、或缺账户时不复制任何文件，校验失败即零网络变更。显式传入的目录如果不安全，在任何变更之前直接报错。
+地理数据先由 `nmd macos geodata ensure` 补齐，再复制普通文件。复制来源是显式 `--geodata-dir`，否则是当前账户的 `~/.config/mihomo`。`sudo` 把 HOME 设成 `/var/root`，所以 euid 0 时不用 `Path.home()`：前台用 `SUDO_USER` 的家目录，launchd 没有这个变量，就用 daemon 配置文件所有者的家目录。ensure 要由这个账户自己运行，不要 sudo，这样写出来的文件和后面 root 复制的是同一目录。`--geodata-dir` 在规则来自 `--inputs` 或已安装 `daemon.json` 时都是写入目录。uid 0、目录是符号链接、祖先不安全、或缺账户时不复制任何文件。root 只在文件已经通过格式校验时继续，不会下载，也不会改权限。校验失败即零网络变更。显式传入的目录如果不安全，在任何变更之前直接报错。复制名单包含 `geoip.db`，避免只认这个别名时工作目录里没有 MMDB。
+
+生成配置不写 `geodata-mode`。mihomo 1.19 的 `GEOIP` 因此读 MMDB：`geoip.metadb`，或目录里已有且带 MaxMind 标记的 `Country.mmdb` / `geoip.db`。`geoip.dat` 只在 `geodata-mode` 打开时使用，ensure 不下载它。空文件、网页或截断内容不会被当成已经备好；下载失败时原文件保持不变，并且这次启动、重启或接管不会继续。`GEOSITE` 读 `geosite.dat`（与 `GeoSite.dat` 大小写不敏感）。下载地址与 Linux `fetch-assets.sh` 相同，是 MetaCubeX `meta-rules-dat` `latest` 上的这两个文件，并用旁边的 `.sha256sum` 核对；Linux 脚本本身不改，也不做这项核对。规则没有对应前缀时不下载那个文件。已有合法文件时不访问网络。下载失败不会替换原文件，也不会进入 sudo、stop 或改网络。`preflight` 只报告，并给出这条命令。
 
 一次 takeover 的顺序：确认 state 与 geodata 路径 → 生成配置并写入私有 state 目录 → 按上面的 argv 做 `mihomo -t`（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 把快照文件名写入 `rollback-pin.json` → 清 exit node → 启动自有进程组，并用 `ps -p <pid> -o lstart=,args=` 记下启动时间和完整 argv → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；TCP 成功不是应用成功；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过。独立 `rollback` 先读 pin（没有 pin 才用最新的普通 `pre-start-*.json`，跳过符号链接），再只在启动时间、完整 argv 和 `-d` 工作目录都与记录一致、且该 pid 仍是会话组长时发信号。对不上就不发信号。然后确认 scutil 无 198.18，再恢复 exit node、allow-lan（`=true`/`=false`）、accept-dns 和每块网卡 DNS。exit node 先按当时的 `tailscale status --json` 把 ExitNodeID 对上仍在通告出口的对端，取它的 Tailscale IP；没有 IP 才用 MagicDNS 基名。对不上时用快照里的 `exit_node_cli`，再不行用 prefs 里的 ExitNodeIP。这些都不是 CLI 接受的形式时记 `exit_node_unrestorable`，不把 StableNodeID 发给 `tailscale set`。`tailscale set` 非零时，stderr 的一行写进私有回退结果的 `failures`（凭据形如 `tskey-` 会抹掉），进程输出的 JSON 也带这个 `failures`；这一步失败不会跳过 accept-dns、allow-lan 和后面的网卡 DNS。198.18 还在时报 `rollback_blocked_dirty_dns` 并且不恢复 exit node。快照里没有可读 prefs 时不动 exit node。某一块网卡失败不会跳过后面的网卡，结果是 `rollback_incomplete`。回退不删除 state 目录里的已有文件、pin 或快照。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
 
@@ -354,7 +356,7 @@ sudo nmd macos rollback --state-dir DIR
 
 ## 两分钟验收
 
-`nmd macos accept` 是固定 2 分钟的短时入口。它不改变上面默认 10 分钟、最长 8 小时的 takeover，不加载、不安装 launchd，不改 `on_boot`，也不停止已经在跑的 run-user。`--state-dir` 必须指向这次的私有目录，不能是 `~/.local/state/nmd-monitor`。普通用户可以先准备 inputs 和这个目录；sudo 之后核对所有者、权限、祖先符号链接和路径，不从 PATH 找 sudo 或解释器。geodata 只复制普通文件。这次生成的配置把 `geo-auto-update` 写成 false，避免这两分钟里自动联网更新；其它生成路径和示例配置仍是 true。
+`nmd macos accept` 是固定 2 分钟的短时入口。它不改变上面默认 10 分钟、最长 8 小时的 takeover，不加载、不安装 launchd，不改 `on_boot`，也不停止已经在跑的 run-user。`--state-dir` 必须指向这次的私有目录，不能是 `~/.local/state/nmd-monitor`。普通用户可以先准备 inputs 和这个目录；sudo 之前若地理数据还缺，会先按上面的 ensure 补齐，sudo 之后只复制普通文件，并核对所有者、权限、祖先符号链接和路径，不从 PATH 找 sudo 或解释器。这次生成的配置把 `geo-auto-update` 写成 false，避免这两分钟里自动联网更新；其它生成路径和示例配置仍是 true。
 
 ### 谁把网络装回去
 

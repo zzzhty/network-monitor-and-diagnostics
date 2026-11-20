@@ -43,7 +43,10 @@ TIERS = ("readonly", "daemon", "takeover")
 # Documented requirement for tun.dns-mode native. Not MIHOMO_VERSION_OBSERVED.
 NATIVE_DNS_MODE_VERSION = (1, 19, 33)
 _VERSION_TEXT = ".".join(str(part) for part in NATIVE_DNS_MODE_VERSION)
-_GEOIP_NAMES = ("geoip.metadb", "Country.mmdb", "geoip.dat")
+# Equal-folded by mihomo 1.19. geoip.dat is the geodata-mode file; this
+# config leaves that flag unset, so only the MMDB names satisfy GEOIP.
+_GEOSITE_NAMES = ("geosite.dat", "GeoSite.dat")
+_GEOIP_NAMES = ("geoip.metadb", "Country.mmdb", "geoip.db")
 _CODE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 _VERSION = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b")
 
@@ -51,8 +54,10 @@ HELP = """\
 usage: nmd macos preflight [--tier readonly|daemon|takeover]
 
 Read-only checks. The default tier is readonly. Nothing is installed,
-downloaded, stopped, started, or changed. Exit 0 is pass, 1 is fail,
-3 is unknown, 2 is a usage error. unknown blocks the same way fail does.
+downloaded, stopped, started, or changed. Missing geodata is reported
+with the command `nmd macos geodata ensure`; this command does not run it.
+Exit 0 is pass, 1 is fail, 3 is unknown, 2 is a usage error.
+unknown blocks the same way fail does.
 
   readonly   panel and diagnostics. Does not require mihomo or Tailscale.
   daemon     before daemon start/restart and before nmd apply reloads one.
@@ -323,40 +328,55 @@ def probe_geodata(directory, needs_site, needs_ip):
     missing = []
     unreadable = False
 
-    def classify(name):
-        """``ok``, ``missing``, or ``unknown``. Does not follow symlinks."""
-        file = directory / name
+    def classify(names):
+        """``ok``, ``missing``, or ``unknown``. Does not follow symlinks.
+
+        A name match is case-insensitive, the same way mihomo 1.19 equal-folds
+        ``GeoSite.dat`` and the MMDB filenames. ``geoip.dat`` is not a match.
+        """
+        wanted = {name.casefold() for name in names}
         try:
-            info = file.lstat()
+            entries = list(os.scandir(directory))
         except FileNotFoundError:
             return "missing"
         except OSError:
             return "unknown"
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            return "missing"
-        if info.st_size <= 0 or info.st_size > macos_takeover.GEODATA_MAX_BYTES:
-            return "missing"
-        try:
-            readable = os.access(file, os.R_OK)
-        except OSError:
-            return "unknown"
-        if not readable:
-            return "unknown"
-        return "ok"
+        saw_unknown = False
+        for entry in entries:
+            if entry.name.casefold() not in wanted:
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                saw_unknown = True
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            if info.st_size <= 0 or info.st_size > macos_takeover.GEODATA_MAX_BYTES:
+                continue
+            try:
+                readable = os.access(entry.path, os.R_OK)
+            except OSError:
+                saw_unknown = True
+                continue
+            if not readable:
+                saw_unknown = True
+                continue
+            return "ok"
+        return "unknown" if saw_unknown else "missing"
 
     if needs_site:
-        state = classify("geosite.dat")
+        state = classify(_GEOSITE_NAMES)
         if state == "missing":
             missing.append("geosite.dat")
         elif state == "unknown":
             unreadable = True
     if needs_ip:
-        states = [classify(name) for name in _GEOIP_NAMES]
-        if "ok" not in states:
-            if "unknown" in states:
-                unreadable = True
-            else:
-                missing.append("geoip")
+        state = classify(_GEOIP_NAMES)
+        if state == "missing":
+            missing.append("geoip")
+        elif state == "unknown":
+            unreadable = True
     if missing:
         return {"status": "fail", "reason": "geodata_missing", "missing": missing}
     if unreadable:
@@ -626,6 +646,7 @@ def collect(tier, *, root=None, options=None):
         facts["tailscale_status"] = {"status": "skip", "availability": None,
                                      "reason": "not_run"}
     geo_override = options.get("geodata_dir") if foreground else None
+    facts["geodata_override"] = geo_override
     try:
         geo_dir = macos_takeover.resolve_geodata_dir(geo_override)
         geo_problem = None
@@ -865,7 +886,7 @@ def assess(tier, facts):
     geodata = facts.get("geodata") or {"status": "unknown", "reason": "not_run", "missing": []}
     if geodata.get("status") == "pass":
         checks.append(_check("geodata", "pass", required=True,
-                             summary="接管规则要用的地理数据可以读到。不会下载缺失文件。"))
+                             summary="接管规则要用的地理数据可以读到。这条预检不会下载。"))
     elif geodata.get("status") == "unknown":
         checks.append(_check(
             "geodata", "unknown", required=True, reason=geodata.get("reason"),
@@ -873,12 +894,11 @@ def assess(tier, facts):
             remediation="结果是 unknown。没有复制或下载文件。"))
     else:
         missing = geodata.get("missing") if isinstance(geodata.get("missing"), list) else []
+        import macos_geodata
         checks.append(_check(
             "geodata", "fail", required=True, reason=geodata.get("reason") or "geodata_missing",
             summary="地理数据不够用或目录不可用。" + (f" 缺：{', '.join(missing)}。" if missing else ""),
-            remediation="规则用到 GEOSITE 时需要 geosite.dat；用到 GEOIP 时需要 geoip.metadb、"
-                        "Country.mmdb 或 geoip.dat 之一。放到该账户的 ~/.config/mihomo，"
-                        "或显式指定目录。不会自动下载。",
+            remediation=macos_geodata.geodata_remediation(facts.get("geodata_override")),
             missing=missing or None))
 
     status_probe = facts.get("tailscale_status") or {"status": "unknown", "reason": "not_run"}

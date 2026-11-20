@@ -45,7 +45,7 @@
 | `nmd demo --once` / `nmd demo --port 8765` | C，创建临时合成 SQLite；后者另有 N 本地监听 | 不采集本机、不读私有来源，正常退出清理 | 无 sudo；不是零文件写入 |
 | `nmd monitor run --config FILE --state-dir DIR [--once]` | C/N，前台采集并写历史 | 读取本机元数据；主动探测由 config 决定；Linux 的 sources-dir 可启用自动评估 | 数据所属 UID；Ctrl-C 停止，已有历史保留 |
 | `nmd source select <节点ID> --confirm` | C/N，保存并 PUT selector | 改变已部署节点的运行出口，回读确认；不重启服务 | 管理者；回切需重新确认原节点 |
-| `nmd apply` / 顶层 `nmd refresh` | C/N，系统部署 | Linux：可下载资产、更新配置/DNS/服务。macOS：先记录待应用；已安装常驻守护时先做只读预检，通过后才 `nmd macos daemon restart`（先 stop 再 start）。预检失败不 stop、不 sudo。进行中的接管会被 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。与 source refresh 不同 | Linux 为 root；失败保留现场，见第 4 节。macOS 未安装守护时不执行 sudo |
+| `nmd apply` / 顶层 `nmd refresh` | C/N，系统部署 | Linux：可下载资产、更新配置/DNS/服务。macOS：先记录待应用；已安装常驻守护且这次重载需要地理数据时，先补齐缺少的文件，再做只读预检，通过后才 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。进行中的接管会被 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。与 source refresh 不同 | Linux 为 root；失败保留现场，见第 4 节。macOS 未安装守护时不执行 sudo |
 | 顶层 `start/stop/restart/enable/disable` | N，mihomo 生命周期 | 不等于 monitor 服务；启停可影响流量 | root；stop 保留 Tailscale |
 | `nmd cutover/rollback/test-stop` | N/B，旧模式切换或停机演练 | 真实 exit node/服务影响；test-stop 尽力恢复但恢复可能失败 | root；有来源注册表时 cutover/rollback 拒绝 |
 

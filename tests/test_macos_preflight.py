@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+import macos_geodata as geodata
 import macos_preflight as pf
 import macos_readonly
 import macos_takeover
@@ -37,6 +38,14 @@ VERSION_OK = {"status": "pass", "parsed": (1, 19, 33), "reason": None}
 TS_OK = {"status": "pass", "availability": "healthy", "reason": None}
 GEO_OK = {"status": "pass", "reason": "ok", "missing": []}
 INACTIVE = {"state": "inactive", "reason": "socket_absent", "on_boot": None}
+
+
+def _valid_geosite():
+    return (b"\x0a" + b"\x1d" + b"geosite-fixture-bytes-ok!!").ljust(32, b"\x00")
+
+
+def _valid_mmdb():
+    return b"\x00" * 128 + b"\xab\xcd\xefMaxMind.com"
 
 
 def one(report, check_id):
@@ -151,7 +160,8 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(report["result"], "fail")
         self.assertEqual(report["required_tiers"], ["daemon", "takeover"])
         self.assertEqual(one(report, "geodata")["status"], "fail")
-        self.assertIn("不会自动下载", one(report, "geodata")["remediation"])
+        self.assertIn("nmd macos geodata ensure", one(report, "geodata")["remediation"])
+        self.assertIn("只读预检", one(report, "geodata")["remediation"])
         self.assertTrue(report["effects"]["later_start_may_takeover_on_new_boot"])
         self.assertIn("可能开始接管", one(report, "network_effect")["summary"])
 
@@ -494,9 +504,15 @@ class ProbeTests(unittest.TestCase):
             {"status": "fail", "reason": "geodata_missing", "missing": ["geosite.dat", "geoip"]})
         (geo / "geosite.dat").write_bytes(b"x")
         (geo / "geoip.dat").write_bytes(b"y")
-        (geo / "geoip.metadb").write_bytes(b"")
+        self.assertEqual(pf.probe_geodata(geo, True, True)["status"], "fail")
+        self.assertEqual(pf.probe_geodata(geo, True, True)["missing"], ["geoip"])
+        (geo / "Country.mmdb").write_bytes(b"m")
         self.assertEqual(pf.probe_geodata(geo, True, True)["status"], "pass")
-        (geo / "geoip.metadb").unlink()
+        (geo / "geosite.dat").unlink()
+        (geo / "GeoSite.dat").write_bytes(b"x")
+        self.assertEqual(pf.probe_geodata(geo, True, False)["status"], "pass")
+        (geo / "GeoSite.dat").unlink()
+        (geo / "geosite.dat").write_bytes(b"x")
         (geo / "geosite.dat").chmod(0)
         if os.geteuid() != 0:
             unreadable = pf.probe_geodata(geo, True, True)
@@ -767,7 +783,7 @@ class LifecycleTests(_Tree):
             order.append("version")
             return {"status": "unknown", "parsed": None, "reason": "timeout"}
 
-        def geodata(*_args):
+        def geodata_probe(*_args):
             order.append("geodata")
             return {"status": "fail", "reason": "geodata_missing", "missing": ["geosite.dat"]}
 
@@ -790,10 +806,11 @@ class LifecycleTests(_Tree):
                 patch.object(macos_takeover, "resolve_geodata_dir",
                              return_value=str(self.base / "geo")), \
                 patch.object(pf, "probe_version", side_effect=version), \
-                patch.object(pf, "probe_geodata", side_effect=geodata), \
+                patch.object(pf, "probe_geodata", side_effect=geodata_probe), \
                 patch.object(pf, "probe_snapshot", side_effect=snapshot), \
                 patch.object(pf, "probe_listen", side_effect=listen), \
                 patch.object(pf, "probe_tailscale_status", side_effect=status), \
+                patch.object(geodata, "fetch_verified", side_effect=geodata.GeodataError("timeout")), \
                 patch.object(nmd_daemon, "_daemon_stop", side_effect=AssertionError("stop")), \
                 patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
                 contextlib.redirect_stdout(output):
@@ -804,7 +821,7 @@ class LifecycleTests(_Tree):
         self.assertEqual(one(report, "mihomo_version")["status"], "unknown")
         self.assertEqual(one(report, "geodata")["status"], "fail")
         self.assertEqual(report["result"], "fail")
-        self.assertIn("不会自动下载", output.getvalue())
+        self.assertIn("nmd macos geodata ensure", one(report, "geodata")["remediation"])
 
     def test_inactive_daemon_does_not_consult_takeover_probes_before_restart(self):
         self.write_config(on_boot=False, mihomo_path=self.program("mihomo"))
@@ -849,6 +866,7 @@ class LifecycleTests(_Tree):
                 patch.object(pf, "probe_tailscale_status", return_value=dict(TS_OK)), \
                 patch.object(macos_takeover, "resolve_geodata_dir",
                              return_value=str(self.state_dir)), \
+                patch.object(geodata, "fetch_verified", side_effect=geodata.GeodataError("timeout")), \
                 patch.object(nmd_daemon, "_daemon_stop", side_effect=AssertionError("stop")), \
                 patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
                 contextlib.redirect_stdout(output):
@@ -893,6 +911,8 @@ class LifecycleTests(_Tree):
             return {"result": "start"}
 
         held = {"status": "pass", "reason": None, "has_198_18": True, "mihomo_running": True}
+        (self.state_dir / "geosite.dat").write_bytes(_valid_geosite())
+        (self.state_dir / "geoip.metadb").write_bytes(_valid_mmdb())
         with self.context(), \
                 patch.object(pf, "probe_activity",
                              return_value={"state": "active", "reason": None, "on_boot": True}), \
@@ -904,6 +924,7 @@ class LifecycleTests(_Tree):
                 patch.object(pf, "probe_listen", return_value="busy"), \
                 patch.object(macos_takeover, "resolve_geodata_dir",
                              return_value=str(self.state_dir)), \
+                patch.object(geodata, "fetch_verified", side_effect=AssertionError("network")), \
                 patch.object(nmd_daemon, "_daemon_stop", side_effect=stop), \
                 patch.object(nmd_daemon, "_daemon_start", side_effect=start), \
                 patch.object(nmd_daemon, "_run_helper", side_effect=AssertionError("sudo")), \
@@ -1067,6 +1088,7 @@ class LifecycleTests(_Tree):
                 patch.object(pf, "probe_tailscale_status", return_value=dict(TS_OK)), \
                 patch.object(macos_takeover, "resolve_geodata_dir",
                              return_value=str(self.state_dir)), \
+                patch.object(geodata, "fetch_verified", side_effect=geodata.GeodataError("timeout")), \
                 patch.object(nmd_daemon, "DaemonIPCClient",
                              side_effect=AssertionError("ipc")), \
                 contextlib.redirect_stdout(output):
@@ -1119,6 +1141,8 @@ class ForegroundTests(unittest.TestCase):
                     patch.object(pf, "probe_version", side_effect=AssertionError("version")), \
                     patch.object(macos_readonly.subprocess, "Popen",
                                  side_effect=AssertionError("spawn")), \
+                    patch.object(geodata, "fetch_verified",
+                                 side_effect=geodata.GeodataError("timeout")), \
                     contextlib.redirect_stdout(output):
                 code = macos_takeover.main([
                     command, "--inputs", str(self._inputs()),
@@ -1132,7 +1156,11 @@ class ForegroundTests(unittest.TestCase):
             self.assertTrue(report["effects"]["command_may_change_network"])
             self.assertNotIn(TOKEN, output.getvalue())
             self.assertNotIn(TAILNET, output.getvalue())
-            self.assertEqual(list(geo.iterdir()), [])
+            names = {path.name for path in geo.iterdir()}
+            self.assertFalse(names & {"geosite.dat", "GeoSite.dat", "geoip.metadb",
+                                      "Country.mmdb", "geoip.dat", "geoip.db"})
+            self.assertFalse(any(name.startswith(".geosite") or name.startswith(".geoip")
+                                 for name in names))
             output.seek(0)
             output.truncate()
 
@@ -1141,8 +1169,8 @@ class ForegroundTests(unittest.TestCase):
         geo = self.base / "geo"
         state.mkdir(mode=0o700)
         geo.mkdir(mode=0o700)
-        (geo / "geosite.dat").write_bytes(b"site")
-        (geo / "geoip.metadb").write_bytes(b"ip")
+        (geo / "geosite.dat").write_bytes(_valid_geosite())
+        (geo / "geoip.metadb").write_bytes(_valid_mmdb())
         program = self.base / "mihomo"
         program.write_bytes(b"#!/bin/sh\nexit 0\n")
         program.chmod(0o755)
@@ -1161,7 +1189,8 @@ class ForegroundTests(unittest.TestCase):
                 patch.object(pf, "probe_listen", return_value="free"), \
                 patch.object(pf, "probe_version", return_value=dict(VERSION_OK)), \
                 patch.object(macos_readonly.subprocess, "Popen",
-                             side_effect=AssertionError("spawn")):
+                             side_effect=AssertionError("spawn")), \
+                patch.object(geodata, "fetch_verified", side_effect=AssertionError("network")):
             with self.assertRaises(SystemExit):
                 macos_takeover.main([
                     "takeover", "--inputs", str(self._inputs()),

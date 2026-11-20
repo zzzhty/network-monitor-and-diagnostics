@@ -858,6 +858,19 @@ class WorkdirTests(unittest.TestCase):
             self.assertFalse(planted.is_symlink())
             self.assertEqual(secret.read_bytes(), b"secret")
 
+    def test_geosite_name_match_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "src"
+            source.mkdir(mode=0o700)
+            (source / "GeoSite.dat").write_bytes(b"folded")
+            target = base / "work"
+            target.mkdir(mode=0o700)
+            staged, missing = mod.stage_geodata(target, source)
+            self.assertIn("geosite.dat", staged)
+            self.assertEqual((target / "geosite.dat").read_bytes(), b"folded")
+            self.assertNotIn("geosite.dat", missing)
+
     def test_omitted_tcp_uses_the_readonly_connector(self):
         seen = {}
 

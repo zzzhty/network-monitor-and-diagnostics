@@ -1238,6 +1238,52 @@ def _daemon_start():
                         "start-root"])
 
 
+def _prepare_geodata(action):
+    """Download missing geodata before the read-only gate. Never stops or sudos.
+
+    The returned document is ``None`` when this platform does not prepare.
+    A failure stays in that document so the caller can refuse the action
+    after preflight. Presence-only preflight accepts a nonempty invalid
+    file, and that must not become a stop.
+    """
+    import macos_geodata
+    import macos_preflight
+    if not macos_preflight.host_is_darwin():
+        return None
+    if action not in ("start", "restart", "takeover-start"):
+        return None
+    try:
+        return macos_geodata.prepare_for_daemon(action)
+    except (OSError, ValueError, TypeError, KeyError, macos_geodata.GeodataError):
+        return {"ok": False, "skipped": False, "reason": "geodata_failed"}
+
+
+def _geodata_block(action, prepared):
+    """Exit code when ensure failed, else None. Prints one JSON report."""
+    import macos_geodata
+    import macos_preflight
+    if prepared is None or not macos_geodata.blocks_action(prepared):
+        return None
+    tier = "takeover" if action == "takeover-start" else "daemon"
+    report = macos_geodata.action_refusal(action, prepared, tier=tier)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return macos_preflight.exit_code(report)
+
+
+def _mutation_gate(action):
+    """Ensure, then read-only preflight, then the ensure result.
+
+    Preflight runs even after a failed download so a missing file still gets
+    the existing report. If that report passes and the download did not, the
+    ensure failure blocks stop, sudo, and start.
+    """
+    prepared = _prepare_geodata(action)
+    blocked = _preflight_block(action)
+    if blocked is not None:
+        return blocked
+    return _geodata_block(action, prepared)
+
+
 def _preflight_block(action):
     """Return an exit code when read-only checks block, else None.
 
@@ -1281,7 +1327,7 @@ def cli_daemon(argv):
         print(json.dumps(reply, ensure_ascii=False, indent=2))
         return 0 if "error" not in reply else 1
     if action == "takeover-start":
-        blocked = _preflight_block("takeover-start")
+        blocked = _mutation_gate("takeover-start")
         if blocked is not None:
             return blocked
         if os.geteuid() != 0:
@@ -1373,7 +1419,7 @@ def cli_daemon(argv):
         print(json.dumps({"result": "daemon_uninstalled"}))
         return 0
     if action == "start":
-        blocked = _preflight_block("start")
+        blocked = _mutation_gate("start")
         if blocked is not None:
             return blocked
         helper = _daemon_start()
@@ -1384,9 +1430,11 @@ def cli_daemon(argv):
         print(json.dumps(helper, ensure_ascii=False))
         return 0 if "error" not in helper else 1
     if action == "restart":
-        # Checks finish before stop. A failed preflight does not bootout a
-        # healthy job and does not sudo. stop then start only runs after that.
-        blocked = _preflight_block("restart")
+        # Geodata ensure, then the read-only checks, both before stop. A
+        # failed download blocks even when a leftover file is nonempty,
+        # because that file can still be the wrong format. stop then start
+        # only runs after both gates pass.
+        blocked = _mutation_gate("restart")
         if blocked is not None:
             return blocked
         stop = _daemon_stop()
