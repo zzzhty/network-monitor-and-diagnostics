@@ -950,7 +950,8 @@ def main(argv=None):
                   "  monitor status --state-dir DIR\n"
                   "  gui [--state-dir DIR] [--config FILE] [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
                   "  machine capabilities | machine status --state-dir DIR\n"
-                  "  onboard --server ADDR --port PORT  或 --inputs FILE\n"
+                  "  onboard                 在交互终端里逐项填写。确认前不下载、不写配置\n"
+                  "  onboard --server ADDR --port PORT  或 --inputs FILE  非交互；非终端请用这种写法\n"
                   "                         检查官方 Tailscale 与 mihomo。缺了就停止，不写配置、不接管。\n"
                   "                         macOS 不安装 Tailscale。mihomo 不在时才放到当前用户可写的目录。\n"
                   "                         不加载守护，不把 on_boot 改成 true，不执行 apply。不要 sudo\n"
@@ -1113,7 +1114,9 @@ def main(argv=None):
         return
     if command in ("help", "--help", "-h"):
         print("通道管理：nmd channel --help（兼容 nmd source；私有配置、显式刷新和选择）\n独立诊断：nmd monitor --help | nmd gui --help | nmd machine capabilities | nmd demo\n\n"
-              "  onboard --server ADDR --port 1080  记录 Tailnet 地址。Tailscale 缺失则停止（仓库没有安装器）。\n"
+              "  onboard                 交互终端逐项填写。端口直接回车为 1080。确认前不下载、不写配置。\n"
+              "                         非终端请用 onboard --server ADDR --port 1080 或 --inputs FILE。\n"
+              "                         Tailscale 缺失则停止（仓库没有安装器）。\n"
               "                         mihomo 缺失时只跑 fetch-assets.sh 下载 deb，不 dpkg、不 setup、不 apply。\n"
               "                         /usr/bin/mihomo 仍不可执行则不写端点文件。不要 sudo\n\n"
               "NMD 生命周期：\n  install      安装当前 scope 的 monitor 单元（不自动启动）\n"

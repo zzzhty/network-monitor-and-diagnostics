@@ -54,8 +54,19 @@ _CANDIDATE_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/local/sbin")
 _DEFAULT = object()
 
 HELP = """\
-usage: nmd onboard --server ADDR --port PORT [--proxy-name NAME]
+usage: nmd onboard
+       nmd onboard --interactive
+       nmd onboard --server ADDR --port PORT [--proxy-name NAME]
        nmd onboard --inputs INPUTS.json
+
+不带参数，或显式加上 --interactive，会在交互终端里逐项询问 Tailnet 地址、
+端口和代理名。校验通过后先展示摘要，输入“是”才继续。确认之前不检查组件、
+不下载、不写配置。直接回车、EOF 或 Ctrl-C 会退出，不留下半成品。
+Linux 上端口直接回车使用 1080。代理名直接回车使用 VPS。地址没有默认值。
+不是交互终端时，不带参数会立刻失败，不会等待输入。
+
+--server / --port / --proxy-name 和 --inputs 仍是非交互写法，有参数时不询问。
+--interactive 不能和这些参数一起用。
 
 检查 Tailscale 和 mihomo。缺了或不可用就停止，不写一半的网络配置，
 也不开始接管。通过之后才记录 Tailnet SOCKS 地址。
@@ -69,6 +80,7 @@ macOS 不下载、不安装 Tailscale。mihomo 不在候选路径上时，只有
 Linux 上 Tailscale 缺失则停止：仓库没有 Tailscale 安装器。mihomo 缺失时
 只运行现有的 fetch-assets.sh 下载 deb；不执行 dpkg、setup 或 apply。
 /usr/bin/mihomo 仍然不可执行则停止，不写地址。端口必须是 1080。
+代理名只做核对，Linux 端点文件没有这个字段，不会把它写进去。
 
 不要用 root 运行。拒绝 203.0.113.20 和其他非 Tailnet 地址。Windows 不支持。
 """
@@ -94,6 +106,16 @@ def _remediation(token):
         "root_refused": "请用当前用户运行，不要 sudo。配置不会写进 /var/root。",
         "unsupported_platform": "nmd onboard 只支持 Linux 和 macOS。",
         "invalid_arguments": "用法见 nmd onboard --help。",
+        "not_a_terminal": (
+            "当前不是交互终端，不能等待输入。"
+            "请在终端运行 nmd onboard，或使用 "
+            "nmd onboard --server ADDR --port PORT，或 nmd onboard --inputs FILE。"),
+        "input_cancelled": "输入已结束。没有下载，也没有写入配置。",
+        "confirmation_declined": "未确认。没有下载，也没有写入配置。",
+        "invalid_server": "地址必须是 Tailnet 前缀里的 IP（100.64.0.0/10 或 fd7a:115c:a1e0::/48）。",
+        "invalid_port": "端口必须是 1 到 65535 的整数，且不能是 22。",
+        "invalid_proxy_name": "代理名需以字母或数字开头，最长 32，不能是 DIRECT 或 REJECT。",
+        "ssh_port_not_allowed": "端口 22 不能作为 SOCKS 端口。",
         "placeholder_inputs": "203.0.113.20 是文档占位，不能写入。换成自己的 Tailnet 地址。",
         "linux_requires_ipv4": "Linux 的现有端点文件只接受 IPv4。请改用 Tailnet 的 IPv4 地址。",
         "linux_port_fixed": "Linux 现有路径把 SOCKS 端口固定为 1080。onboard 不会另写一个端口。",
@@ -278,7 +300,24 @@ def place_user_binary(directory, binary):
     return dest
 
 
-def _parse(argv):
+class _StopInput(Exception):
+    """The person left the prompt. Nothing has been downloaded or written."""
+
+
+def _checked_inputs(raw, platform):
+    """The same checks the flag path uses, including the Linux port and family."""
+    try:
+        inputs = macos_prepare.validate_inputs(raw)
+    except ValueError as exc:
+        raise OnboardError(str(exc).split(":", 1)[0].strip() or "invalid_inputs") from None
+    if inputs["server"] == _PLACEHOLDER_SERVER:
+        raise OnboardError("placeholder_inputs")
+    if platform == "linux":
+        _linux_constraints(inputs)
+    return inputs
+
+
+def _parse(argv, platform):
     server = port = proxy_name = inputs_path = None
     seen = set()
     index = 0
@@ -315,12 +354,119 @@ def _parse(argv):
         raw = {"server": server, "port": port}
         if proxy_name is not None:
             raw["proxy_name"] = proxy_name
+    return _checked_inputs(raw, platform)
+
+
+def _interactive_argv(argv):
+    if not argv:
+        return True
+    if "--interactive" in argv:
+        if argv != ["--interactive"]:
+            raise OnboardError("invalid_arguments")
+        return True
+    return False
+
+
+def _stdin_is_tty():
     try:
-        inputs = macos_prepare.validate_inputs(raw)
-    except ValueError as exc:
-        raise OnboardError(str(exc).split(":", 1)[0].strip() or "invalid_inputs") from None
-    if inputs["server"] == _PLACEHOLDER_SERVER:
-        raise OnboardError("placeholder_inputs")
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _stdin_line():
+    line = sys.stdin.readline()
+    if line == "":
+        raise EOFError
+    return line
+
+
+def _emit_prompt(text, prompt_write):
+    if prompt_write is not None:
+        prompt_write(text)
+        return
+    sys.stderr.write(text)
+    try:
+        sys.stderr.flush()
+    except (AttributeError, OSError):
+        pass
+
+
+def prompt_inputs(platform, read_line, prompt_write=None):
+    """Ask for the address, then show it. Confirmation is required to return."""
+    def say(text):
+        _emit_prompt(text, prompt_write)
+
+    def ask(prompt):
+        say(prompt)
+        try:
+            line = read_line()
+        except (EOFError, KeyboardInterrupt) as exc:
+            say("\n")
+            raise _StopInput("input_cancelled") from exc
+        if line is None:
+            say("\n")
+            raise _StopInput("input_cancelled")
+        return str(line).strip()
+
+    def retry(token):
+        say(_remediation(token) + "请重新填写。\n")
+
+    say("逐项填写 Tailnet SOCKS。确认之前不会下载，也不会写配置。\n")
+    while True:
+        entered = ask("Tailnet 地址: ")
+        if not entered:
+            say("需要自己的 Tailnet 地址，不能留空。\n")
+            continue
+        try:
+            server = _checked_inputs({
+                "server": entered,
+                "port": LINUX_SOCKS_PORT,
+                "proxy_name": macos_prepare.DEFAULT_PROXY_NAME,
+            }, platform)["server"]
+        except OnboardError as exc:
+            retry(str(exc))
+            continue
+        break
+    while True:
+        if platform == "linux":
+            entered = ask(f"端口 [{LINUX_SOCKS_PORT}]: ")
+            if entered == "":
+                entered = str(LINUX_SOCKS_PORT)
+        else:
+            entered = ask("端口: ")
+        if not entered.isdecimal():
+            retry("invalid_port")
+            continue
+        try:
+            port = _checked_inputs({"server": server, "port": int(entered)}, platform)["port"]
+        except OnboardError as exc:
+            retry(str(exc))
+            continue
+        break
+    while True:
+        entered = ask(f"代理名称 [{macos_prepare.DEFAULT_PROXY_NAME}]: ")
+        raw = {"server": server, "port": port}
+        if entered:
+            raw["proxy_name"] = entered
+        try:
+            inputs = _checked_inputs(raw, platform)
+        except OnboardError as exc:
+            retry(str(exc))
+            continue
+        break
+    say("请核对：\n"
+        f"  地址  {inputs['server']}\n"
+        f"  端口  {inputs['port']}\n"
+        f"  代理  {inputs['proxy_name']}\n")
+    if platform == "linux":
+        say("Linux 只把地址写入当前用户的端点文件。代理名会核对，但该文件没有这个字段。\n")
+    say("确认后才会检查 Tailscale 和 mihomo，并可能下载 mihomo。"
+        "不会安装 Tailscale，也不会开始接管。\n")
+    answer = ask("确认并继续？输入“是”继续，直接回车取消: ")
+    if answer.lower() not in ("y", "yes", "是"):
+        say("\n")
+        raise _StopInput("confirmation_declined")
     return inputs
 
 
@@ -449,7 +595,8 @@ def _default_fetch():
 
 def main(argv, *, platform=None, find_tailscale=None, find_mihomo=None,
          fetch_linux_assets=None, download=None, install_directories=_DEFAULT,
-         fallback_dir=_DEFAULT, daemon_path=None, env_path=None, machine=None):
+         fallback_dir=_DEFAULT, daemon_path=None, env_path=None, machine=None,
+         stdin_is_tty=None, read_line=None, prompt_write=None):
     if any(arg in ("-h", "--help") for arg in argv):
         sys.stdout.write(HELP)
         return 0
@@ -459,9 +606,14 @@ def main(argv, *, platform=None, find_tailscale=None, find_mihomo=None,
     if platform not in ("linux", "macos"):
         return _fail("unsupported_platform", _remediation("unsupported_platform"))
     try:
-        inputs = _parse(argv)
-        if platform == "linux":
-            _linux_constraints(inputs)
+        if _interactive_argv(argv):
+            if not (_stdin_is_tty() if stdin_is_tty is None else stdin_is_tty):
+                raise OnboardError("not_a_terminal")
+            inputs = prompt_inputs(platform, read_line or _stdin_line, prompt_write)
+        else:
+            inputs = _parse(argv, platform)
+    except _StopInput as exc:
+        return _fail(str(exc), _remediation(str(exc)))
     except OnboardError as exc:
         token = str(exc)
         if token == "invalid_arguments":

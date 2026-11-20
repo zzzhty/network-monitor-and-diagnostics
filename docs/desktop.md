@@ -81,7 +81,7 @@ nmd desktop status
 nmd desktop uninstall          # 预检通过后移除整个 NMD.app 与自启 plist
 ```
 
-常驻守护不是桌面壳的下一步。新机器上的入口是 `nmd onboard`（不安装 Tailscale；mihomo 只在用户可写目录放入），其后的预检、`install` 和 `on-boot` 写在 [macos.md](macos.md) 的「新机器：实验性常驻守护」。没有一份真实地址的配置时，不要直接 `nmd macos daemon install`。
+常驻守护不是桌面壳的下一步。新机器上的入口是 `nmd onboard`（交互终端逐项填写并确认；不安装 Tailscale；mihomo 只在用户可写目录放入），其后的预检、`install` 和 `on-boot` 写在 [macos.md](macos.md) 的「新机器：实验性常驻守护」。没有一份真实地址的配置时，不要直接 `nmd macos daemon install`。
 
 - `NMD.app` 是壳二进制加 `Info.plist` 的最小应用包；标识、版本与名称读自
   `tauri.conf.json`（单一事实来源）。不启用 Tauri bundler、不引入 tauri-cli/node

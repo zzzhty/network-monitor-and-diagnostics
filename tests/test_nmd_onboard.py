@@ -62,6 +62,8 @@ class OnboardTests(unittest.TestCase):
         kwargs.setdefault("install_directories", [])
         kwargs.setdefault("fallback_dir", self.bindir)
         kwargs.setdefault("machine", "arm64")
+        kwargs.setdefault("stdin_is_tty", False)
+        kwargs.setdefault("read_line", lambda: (_ for _ in ()).throw(AssertionError("read")))
         with contextlib.ExitStack() as stack:
             for item in bombs:
                 stack.enter_context(item)
@@ -298,6 +300,8 @@ class OnboardTests(unittest.TestCase):
         code, out, err = self.invoke(["--help"], platform="windows")
         self.assertEqual(code, 0)
         self.assertIn("不下载、不安装 Tailscale", out)
+        self.assertIn("不是交互终端", out)
+        self.assertIn("确认之前不检查组件", out)
         self.assertEqual(err, "")
 
         with patch.object(nmd_platform, "name", return_value="windows"):
@@ -314,6 +318,153 @@ class OnboardTests(unittest.TestCase):
                 manager.main(["onboard", "--server", SERVER4, "--port", "1080"])
         self.assertEqual(caught.exception.code, 0)
         self.assertEqual(onboard.call_args.args[0], ["--server", SERVER4, "--port", "1080"])
+
+        with patch.object(nmd_platform, "name", return_value="macos"), \
+                patch("nmd_onboard.main", return_value=0) as onboard:
+            with self.assertRaises(SystemExit) as caught:
+                manager.main(["onboard"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(onboard.call_args.args[0], [])
+
+    def error_body(self, err):
+        start = err.rfind("\n{")
+        start = err.find("{") if start == -1 else start + 1
+        self.assertGreaterEqual(start, 0, err)
+        return json.loads(err[start:])
+
+    def answers(self, lines):
+        pending = iter(lines)
+
+        def read():
+            try:
+                return next(pending)
+            except StopIteration as exc:
+                raise EOFError from exc
+        return read
+
+    def test_interactive_retries_then_records_after_confirmation(self):
+        seen = []
+
+        def download(url):
+            self.assertIn("请核对", "".join(seen))
+            self.assertIn(SERVER, "".join(seen))
+            self.calls.append(("download", url))
+            return macho_gzip()
+
+        def tailscale(platform):
+            self.assertIn("请核对", "".join(seen))
+            return "/usr/bin/tailscale"
+
+        code, out, err = self.invoke(
+            [], platform="macos", stdin_is_tty=True,
+            read_line=self.answers([
+                "8.8.8.8", "203.0.113.20", SERVER, "22", "nope", "1081", "DIRECT", "Work", "是"]),
+            prompt_write=seen.append, download=download, find_tailscale=tailscale,
+            find_mihomo=lambda platform: None)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(SERVER, out)
+        body = json.loads(out)
+        self.assertEqual(body["result"], "configured")
+        self.assertIs(body["on_boot"], False)
+        self.assertIs(body["mihomo_installed"], True)
+        self.assertIs(body["takeover_started"], False)
+        self.assertIs(body["apply_ran"], False)
+        stored = json.loads(self.daemon.read_text(encoding="utf-8"))
+        self.assertEqual(stored["takeover"]["inputs"]["server"], SERVER)
+        self.assertEqual(stored["takeover"]["inputs"]["port"], 1081)
+        self.assertEqual(stored["takeover"]["inputs"]["proxy_name"], "Work")
+        self.assertIs(stored["takeover"]["on_boot"], False)
+        self.assertIn("请重新填写", "".join(seen))
+        self.assertTrue(self.calls)
+
+    def test_interactive_explicit_flag_and_linux_defaults(self):
+        seen = []
+        code, out, err = self.invoke(
+            ["--interactive"], platform="linux", stdin_is_tty=True,
+            read_line=self.answers([SERVER, SERVER4, "1081", "", "", "y"]),
+            prompt_write=seen.append,
+            find_tailscale=lambda platform: "/usr/bin/tailscale",
+            find_mihomo=lambda platform: "/usr/bin/mihomo")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(SERVER4, out)
+        text = "".join(seen)
+        self.assertIn("端口 [1080]", text)
+        self.assertIn("代理名会核对", text)
+        self.assertIn(SERVER4, text)
+        self.assertEqual(self.env.read_text(encoding="utf-8"), f"NMD_VPS_TS_IP={SERVER4}\n")
+        self.assertNotIn("proxy", self.env.read_text(encoding="utf-8"))
+        self.assertNotIn("fetch", self.calls)
+        self.assertNotIn("download", [item[0] for item in self.calls if isinstance(item, tuple)])
+
+    def test_cancel_eof_and_keyboard_interrupt_write_nothing(self):
+        for answers, token in (
+                (["100.64.0.8", "1081", "VPS", ""], "confirmation_declined"),
+                (["100.64.0.8", "1081", "VPS", "n"], "confirmation_declined"),
+                ([], "input_cancelled")):
+            self.calls.clear()
+            code, out, err = self.invoke(
+                [], platform="macos", stdin_is_tty=True,
+                read_line=self.answers(answers),
+                find_tailscale=AssertionError("tailscale"),
+                download=AssertionError("download"))
+            self.assertEqual(code, 1, answers)
+            self.assertEqual(out, "")
+            body = self.error_body(err)
+            self.assertEqual(body["error"], token)
+            self.assertIn("没有下载", body["remediation"])
+            self.assertNotIn("Tailnet 地址", out)
+            self.assertFalse(self.daemon.exists())
+            self.assertEqual(self.calls, [])
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        code, out, err = self.invoke(
+            ["--interactive"], platform="linux", stdin_is_tty=True, read_line=interrupt,
+            fetch_linux_assets=AssertionError("fetch"),
+            find_tailscale=AssertionError("tailscale"))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.error_body(err)["error"], "input_cancelled")
+        self.assertFalse(self.env.exists())
+
+    def test_non_tty_does_not_read_and_flags_still_skip_prompts(self):
+        code, out, err = self.invoke(
+            [], platform="macos", stdin_is_tty=False,
+            read_line=AssertionError("read"),
+            find_tailscale=AssertionError("tailscale"))
+        self.assertEqual(code, 1)
+        body = json.loads(err)
+        self.assertEqual(body["error"], "not_a_terminal")
+        self.assertIn("--inputs", body["remediation"])
+        self.assertNotIn("Tailnet 地址", err)
+        self.assertFalse(self.daemon.exists())
+
+        code, out, err = self.invoke(
+            ["--interactive"], platform="linux", stdin_is_tty=False,
+            read_line=AssertionError("read"))
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "not_a_terminal")
+
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux",
+            stdin_is_tty=True, read_line=AssertionError("read"),
+            find_tailscale=lambda platform: "/usr/bin/tailscale",
+            find_mihomo=lambda platform: "/usr/bin/mihomo")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.env.read_text(encoding="utf-8"), f"NMD_VPS_TS_IP={SERVER4}\n")
+
+        code, out, err = self.invoke(
+            ["--interactive", "--server", SERVER4], platform="macos",
+            stdin_is_tty=True, read_line=AssertionError("read"))
+        self.assertEqual(code, 2)
+        self.assertIn("不能和这些参数一起用", err)
+        self.assertFalse(self.daemon.exists())
+
+        with patch.object(nmd_onboard.os, "geteuid", return_value=0):
+            code, out, err = self.invoke(
+                [], platform="macos", stdin_is_tty=True, read_line=AssertionError("read"))
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "root_refused")
 
     def write_inputs(self):
         path = self.base / "inputs.json"

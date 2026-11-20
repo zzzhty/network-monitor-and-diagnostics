@@ -145,6 +145,24 @@ macOS 拒绝不带 `--manager-only` 的 bootstrap，也不部署 Linux 网络或
 
 不要 sudo。下面的地址只说明形状，不要原样复制。`onboard` 只检查它落在 Tailnet 前缀里，不会分辨这是不是你的机器：
 
+在交互终端里直接运行即可。地址没有默认值，macOS 上端口也没有默认值。代理名直接回车是 `VPS`。不要照抄下面会话里的形状地址。确认之前不下载、不写 `daemon.json`。直接回车、EOF 或 Ctrl-C 退出，不留下文件。
+
+```text
+nmd onboard
+逐项填写 Tailnet SOCKS。确认之前不会下载，也不会写配置。
+Tailnet 地址: fd7a:115c:a1e0::abcd
+端口: 1081
+代理名称 [VPS]:
+请核对：
+  地址  fd7a:115c:a1e0::abcd
+  端口  1081
+  代理  VPS
+确认后才会检查 Tailscale 和 mihomo，并可能下载 mihomo。不会安装 Tailscale，也不会开始接管。
+确认并继续？输入“是”继续，直接回车取消: 是
+```
+
+`nmd onboard --interactive` 是同一引导。不是交互终端时，这两条都会立刻失败，不会等待输入。脚本用下面的非交互写法：
+
 ```bash
 nmd onboard --server fd7a:115c:a1e0::abcd --port 1081 --proxy-name VPS
 nmd onboard --inputs /path/to/inputs.json
@@ -160,7 +178,7 @@ inputs 文件只有当前用户可读写，形状与 `init` 相同：
 }
 ```
 
-顺序是固定的。先检查参数：占位地址 `203.0.113.20`、非 Tailnet 地址、端口 22 或不是整数，都在探测组件之前失败。然后找官方 Tailscale；没有或不可用就停，不下载 mihomo，也不写 `daemon.json`。Tailscale 可用而 mihomo 不在候选路径上时，才按上一节放到用户可写目录。放好或已经存在之后，才把地址写入管理安装记录的 `configDir/daemon.json`（默认 `~/.config/nmd/daemon.json`）。新建的父目录是 0700，文件是 0600。新建时 `on_boot` 是 JSON 布尔 `false`，`profile` 留空。已有合法文件只更新 `inputs`，原来的 `on_boot` 保持不动，包括已经是 `true` 的情况；这条命令不会因此加载守护或开始接管。二进制不在候选目录里时，把它的绝对路径写进 `takeover.mihomo_path`。失败、符号链接、组或其他人可写的目录，都不改这份文件。root 会被拒绝，避免写进 `/var/root`。成功时的 JSON 不重复打印地址，也不把 `loaded_daemon`、`takeover_started`、`apply_ran` 写成 true。
+顺序是固定的。地址先在本地校验；交互模式还要等确认。占位地址 `203.0.113.20`、非 Tailnet 地址、端口 22 或不是整数，都在探测组件之前失败。校验通过（交互模式则还要确认）之后才找官方 Tailscale；没有或不可用就停，不下载 mihomo，也不写 `daemon.json`。Tailscale 可用而 mihomo 不在候选路径上时，才按上一节放到用户可写目录。放好或已经存在之后，才把地址写入管理安装记录的 `configDir/daemon.json`（默认 `~/.config/nmd/daemon.json`）。新建的父目录是 0700，文件是 0600。新建时 `on_boot` 是 JSON 布尔 `false`，`profile` 留空。已有合法文件只更新 `inputs`，原来的 `on_boot` 保持不动，包括已经是 `true` 的情况；这条命令不会因此加载守护或开始接管。二进制不在候选目录里时，把它的绝对路径写进 `takeover.mihomo_path`。失败、符号链接、组或其他人可写的目录，都不改这份文件。root 会被拒绝，避免写进 `/var/root`。成功时的 JSON 不重复打印地址，也不把 `loaded_daemon`、`takeover_started`、`apply_ran` 写成 true。
 
 `nmd macos daemon init` 仍是只写配置、不检查 Tailscale、不下载 mihomo 的下一层命令。已有文件或符号链接时它不覆盖。相对的 `--mihomo` 会失败且不创建文件。
 
