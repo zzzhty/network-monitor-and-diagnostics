@@ -30,6 +30,7 @@ CLI、SQLite 历史、事件/空窗逻辑及只读 GUI 复用现有实现。macO
 可用的链路状态、IPv4 路由指纹与默认路由条数；缺失信息明确为未知，systemd 服务不可用。
 真实本机采样需另行显式运行前台 `monitor run`；本次验证仅用 fixtures 与回环服务。
 使用方式、状态目录限制和实验边界见 [macOS 使用说明](docs/macos.md)。
+在一台新的 Mac 上部署实验性常驻守护的命令顺序，以及 nmd 自己装不了的前提（官方 Tailscale、官方 mihomo、真实 Tailnet 地址），见该说明里的「新机器：实验性常驻守护」。这不是与 Clash Verge Rev 一起用时的默认监控路径。
 下文的安装、后台服务和网络管理流程仍仅针对 Linux；macOS CLI 会提前拒绝这些命令。
 
 ## Windows 本机采集

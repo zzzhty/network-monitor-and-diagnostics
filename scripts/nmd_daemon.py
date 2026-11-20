@@ -48,13 +48,27 @@ SUPPRESS_BOOT_RESULTS = ("stopped", "critical_failures", "mihomo_exited",
                          "takeover_error", "preflight_failed")
 
 HELP = """\
-usage: sudo python3 scripts/nmd_daemon.py supervise --config daemon.json --state-dir DIR
+usage: nmd macos daemon install|uninstall|start|stop|restart|status|takeover-start|takeover-stop
+       nmd macos daemon init --inputs INPUTS.json [--mihomo PATH]
+       nmd macos daemon on-boot [on|off|status]
+       sudo python3 scripts/nmd_daemon.py supervise --config daemon.json --state-dir DIR
        python3 scripts/nmd_daemon.py run-user --config daemon.json
 
-The root supervisor owns the takeover (fresh snapshot before every start,
-health-driven rollback, panic recovery, no absolute deadline); the user
-daemon supervises the collector and serves the dashboard. install/uninstall
-and the launchd lifecycle arrive with the install stage.
+init writes a private daemon.json from a tailnet inputs file. on_boot is
+JSON false. It does not install, load, or start launchd, and it does not
+change routes, DNS, proxy, or Tailscale. The placeholder 203.0.113.20 is
+refused, and an existing daemon.json is left untouched.
+
+on-boot reads or writes takeover.on_boot in the existing daemon.json. on
+stores JSON true, off stores JSON false, and a bare on-boot or status
+prints the current boolean. It does not start, stop, install, sudo, or
+load the LaunchDaemon, and it does not begin a takeover. A later
+`nmd macos daemon start` or `nmd apply` can start a takeover only when
+the supervisor treats that start as a new boot. install, start, restart,
+and apply do not change this field.
+
+Do not run init or on-boot as root. A missing or invalid daemon.json is
+an error: on-boot does not create one.
 """
 
 
@@ -1303,16 +1317,250 @@ def _preflight_block(action):
     return macos_preflight.exit_code(report)
 
 
+_DAEMON_ACTIONS = ("install", "uninstall", "start", "stop", "restart",
+                     "status", "takeover-start", "takeover-stop")
+_ON_BOOT_COMMAND = "nmd macos daemon on-boot"
+_INIT_COMMAND = "nmd macos daemon init"
+_INIT_INTERVAL = 20
+_INIT_CRITICAL = 3
+_ERROR_TOKEN = re.compile(r"[A-Za-z0-9_]{1,64}\Z")
+
+
+def _print_json(payload, *, error=False):
+    print(json.dumps(payload, ensure_ascii=False, indent=2),
+          file=sys.stderr if error else sys.stdout)
+
+
+def _error_token(exc, fallback):
+    text = str(exc).split(":", 1)[0].strip()
+    if _ERROR_TOKEN.fullmatch(text):
+        return text
+    return fallback
+
+
+def _refuse_root_config(command):
+    """Config writes stay out of /var/root. Help is handled by the caller."""
+    if os.geteuid() != 0:
+        return None
+    _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": command,
+                 "error": "root_refused"}, error=True)
+    return 1
+
+
+def _daemon_config_path():
+    import manager
+    return Path(default_daemon_config_path(manager.ROOT))
+
+
+def cli_on_boot(argv):
+    """Read or set takeover.on_boot. The file is the only side effect."""
+    refused = _refuse_root_config(_ON_BOOT_COMMAND)
+    if refused is not None:
+        return refused
+    if len(argv) > 1 or (argv and argv[0] not in ("on", "off", "status")):
+        sys.stderr.write(HELP)
+        return 2
+    mode = argv[0] if argv else "status"
+    path = _daemon_config_path()
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _ON_BOOT_COMMAND,
+                     "error": "daemon_config_missing", "path": str(path)}, error=True)
+        return 1
+    except OSError:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _ON_BOOT_COMMAND,
+                     "error": "config_unreadable", "path": str(path)}, error=True)
+        return 1
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _ON_BOOT_COMMAND,
+                     "error": "config_not_regular", "path": str(path)}, error=True)
+        return 1
+    try:
+        config = load_daemon_config(path, expected_uid=os.geteuid())
+    except DaemonError as exc:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _ON_BOOT_COMMAND,
+                     "error": _error_token(exc, "invalid_config"),
+                     "path": str(path)}, error=True)
+        return 1
+    current = config["takeover"]["on_boot"]
+    changed = False
+    if mode != "status":
+        desired = mode == "on"
+        if current is not desired:
+            try:
+                _prepare_config_replace(path)
+                updated = {
+                    "schema_version": config["schema_version"],
+                    "dashboard": dict(config["dashboard"]),
+                    "takeover": dict(config["takeover"], on_boot=desired),
+                }
+                write_daemon_config(path, updated)
+            except DaemonError as exc:
+                _print_json({"schema_version": DAEMON_SCHEMA_VERSION,
+                             "command": _ON_BOOT_COMMAND,
+                             "error": _error_token(exc, "invalid_config"),
+                             "path": str(path)}, error=True)
+                return 1
+            changed = True
+            current = desired
+    _print_json(_on_boot_report(path, current, changed))
+    return 0
+
+
+def _on_boot_report(path, current, changed):
+    return {
+        "schema_version": DAEMON_SCHEMA_VERSION,
+        "command": _ON_BOOT_COMMAND,
+        "on_boot": current,
+        "changed": changed,
+        "path": str(path),
+        "loaded_daemon": False,
+        "takeover_started": False,
+        "note": ("只读取或写入了 daemon.json 的 takeover.on_boot。"
+                 "没有加载 LaunchDaemon，也没有开始接管。"
+                 "之后的 nmd macos daemon start 或 nmd apply，"
+                 "只有在管理器把这次启动当成新的一次开机时才可能马上接管。"),
+    }
+
+
+def _prepare_config_replace(path):
+    """Re-check the leaf immediately before the atomic replace.
+
+    ``os.replace`` swaps the directory entry, but a symlink parent would
+    still be followed while the path is resolved. The load above already
+    rejected that shape; this repeats the check against a swap.
+    """
+    path = Path(path)
+    _require_trusted_path(path)
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise DaemonError("config_not_regular")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise DaemonError("config_group_or_world_writable")
+    if info.st_uid != os.geteuid():
+        raise DaemonError("config_owner_changed")
+
+
+def _parse_init(argv):
+    inputs_path = mihomo = None
+    seen = set()
+    index = 0
+    while index < len(argv):
+        flag = argv[index]
+        if flag not in ("--inputs", "--mihomo") or flag in seen or index + 1 >= len(argv):
+            raise DaemonError("invalid_arguments")
+        value = argv[index + 1]
+        if not value or value.startswith("-"):
+            raise DaemonError("invalid_arguments")
+        seen.add(flag)
+        index += 2
+        if flag == "--inputs":
+            inputs_path = value
+        else:
+            mihomo = value
+    if inputs_path is None:
+        raise DaemonError("invalid_arguments")
+    if mihomo is not None and not Path(mihomo).is_absolute():
+        raise DaemonError("invalid_mihomo_path")
+    try:
+        raw = macos_takeover._load_trusted_json(inputs_path)
+        inputs = macos_prepare.validate_inputs(raw)
+    except (macos_takeover.TakeoverError, ValueError, OSError) as exc:
+        raise DaemonError(_error_token(exc, "invalid_inputs")) from None
+    if inputs["server"] == macos_coexist.PLACEHOLDER_SOCKS_HOST:
+        raise DaemonError("placeholder_inputs")
+    return inputs, mihomo
+
+
+def cli_daemon_init(argv):
+    """Create daemon.json from real inputs. Never installs or starts."""
+    refused = _refuse_root_config(_INIT_COMMAND)
+    if refused is not None:
+        return refused
+    try:
+        inputs, mihomo = _parse_init(argv)
+    except DaemonError as exc:
+        if str(exc) == "invalid_arguments":
+            sys.stderr.write(HELP)
+            return 2
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _INIT_COMMAND,
+                     "error": _error_token(exc, "invalid_inputs")}, error=True)
+        return 1
+    path = _daemon_config_path()
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _INIT_COMMAND,
+                     "error": "config_unreadable", "path": str(path)}, error=True)
+        return 1
+    else:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _INIT_COMMAND,
+                     "error": "daemon_config_exists", "path": str(path)}, error=True)
+        return 1
+    config = {
+        "schema_version": DAEMON_SCHEMA_VERSION,
+        "dashboard": {"port": DEFAULT_DASHBOARD_PORT},
+        "takeover": {
+            "inputs": inputs,
+            "profile": None,
+            "on_boot": False,
+            "check_interval_seconds": _INIT_INTERVAL,
+            "critical_failures": _INIT_CRITICAL,
+            "mihomo_path": mihomo,
+            "state_dir": None,
+        },
+    }
+    try:
+        _require_trusted_path(path)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise DaemonError("daemon_config_exists")
+        write_daemon_config(path, config)
+        loaded = load_daemon_config(path, expected_uid=os.geteuid())
+    except DaemonError as exc:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _INIT_COMMAND,
+                     "error": _error_token(exc, "invalid_config"),
+                     "path": str(path)}, error=True)
+        return 1
+    if loaded["takeover"]["on_boot"] is not False:
+        _print_json({"schema_version": DAEMON_SCHEMA_VERSION, "command": _INIT_COMMAND,
+                     "error": "invalid_on_boot", "path": str(path)}, error=True)
+        return 1
+    _print_json({
+        "schema_version": DAEMON_SCHEMA_VERSION,
+        "command": _INIT_COMMAND,
+        "result": "daemon_config_written",
+        "path": str(path),
+        "on_boot": False,
+        "installed": False,
+        "loaded_daemon": False,
+        "takeover_started": False,
+        "note": ("已写入 daemon.json，takeover.on_boot 为 JSON false。"
+                 "没有安装或加载 LaunchDaemon，没有开始接管，也没有改网络。"
+                 "安装用 nmd macos daemon install；改开机策略用 nmd macos daemon on-boot。"),
+    })
+    return 0
+
+
 def cli_daemon(argv):
-    """`nmd macos daemon install|uninstall|start|stop|restart|status|takeover-start`."""
+    """`nmd macos daemon` lifecycle, plus init and on-boot config edits."""
     import manager
     if any(arg in ("-h", "--help") for arg in argv):
         sys.stdout.write(HELP)
         return 0
-    if not argv or argv[0] not in ("install", "uninstall", "start", "stop", "restart",
-                                   "status", "takeover-start", "takeover-stop"):
+    if not argv or argv[0] not in (*_DAEMON_ACTIONS, "on-boot", "init"):
         sys.stderr.write(HELP)
         return 2
+    if argv[0] == "on-boot":
+        return cli_on_boot(argv[1:])
+    if argv[0] == "init":
+        return cli_daemon_init(argv[1:])
     if len(argv) != 1:
         sys.stderr.write(HELP)
         return 2

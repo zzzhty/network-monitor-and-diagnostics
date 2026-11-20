@@ -764,8 +764,9 @@ def assess(tier, facts):
             checks.append(_check(
                 "daemon_config", "fail", required=True, reason="absent",
                 summary="没有 daemon.json，常驻守护起不来。",
-                remediation="按 examples/macos-daemon.json 写成仅当前用户可读写的配置。"
-                            "不会自动填入真实地址。"))
+                remediation="准备一份自己的 Tailnet 地址 inputs（不要用 203.0.113.20），"
+                            "再运行 nmd macos daemon init --inputs。不会自动填入真实地址，"
+                            "也不会用占位地址生成配置。"))
         elif config_problem in ("unreadable",):
             checks.append(_check(
                 "daemon_config", "unknown", required=True, reason=config_problem,

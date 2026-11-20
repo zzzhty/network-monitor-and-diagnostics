@@ -430,8 +430,9 @@ def bootstrap(args):
             install_links(root, bindir, scope == "user" and not args.no_path)
             if args.manager_only:
                 if nmd_platform.name() == "macos":
-                    print("管理安装已就绪；可选：nmd macos daemon install 安装常驻守护，"
-                          "或 nmd desktop install 安装桌面壳。不部署网络。", flush=True)
+                    print("管理安装已就绪。常驻守护要先写入真实地址的 daemon.json，"
+                          "顺序见 docs/macos.md。可选：nmd desktop install 安装桌面壳。"
+                          "不部署网络。", flush=True)
                 else:
                     print("管理安装已就绪；运行 nmd monitor install 安装采集服务。网络配置仅由 nmd apply 显式应用。", flush=True)
             else:
@@ -960,9 +961,16 @@ def main(argv=None):
                   "  macos geodata ensure [--geodata-dir DIR] [--inputs FILE]\n"
                   "                         下载生成规则缺少的 geosite.dat / geoip.metadb。"
                   "不要 sudo。预检、help、status 和面板不会跑这一步\n"
+                  "  macos daemon init --inputs FILE [--mihomo PATH]\n"
+                  "                         用真实 Tailnet 地址写入 daemon.json。on_boot 固定为 JSON false。"
+                  "不安装、不加载、不 sudo，拒绝占位地址 203.0.113.20，不覆盖已有文件\n"
+                  "  macos daemon on-boot [on|off|status]\n"
+                  "                         只读写 daemon.json 的 takeover.on_boot（JSON 布尔）。"
+                  "不加载守护，也不开始接管。不要 sudo。"
+                  "之后的 start 或 apply 只有在被当成新的一次开机时才可能马上接管\n"
                   "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
                   "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
-                  "restart 等于先 stop 再 start。预检失败则不 stop。"
+                  "这些动作不改 on_boot。restart 等于先 stop 再 start。预检失败则不 stop。"
                   "进行中的接管会被这次 stop 回退\n"
                   "Linux 的网络部署与 systemd 生命周期在 macOS 不支持。")
             return

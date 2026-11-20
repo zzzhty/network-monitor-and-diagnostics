@@ -303,13 +303,14 @@ LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复
 `macos_coexist.DAEMON_POLICY`；单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠
 既有 preflight 双向失败关闭。健康检查含 Tailscale status 和配置里的 VPS SOCKS
 TCP 连接；TCP 成功只说明端口接受了握手，不是应用成功，HTTP 200 不在这项检查里。
+新机器上的顺序见 [macos.md](macos.md) 的「新机器：实验性常驻守护」。nmd 不安装官方 Tailscale 或 mihomo，也不用占位地址生成配置。`nmd macos daemon init --inputs FILE` 把真实 Tailnet 地址写成 `daemon.json`，`on_boot` 固定为 JSON false；不要 sudo，不覆盖已有文件。开机策略用 `nmd macos daemon on-boot on|off|status` 读写 `takeover.on_boot`。这条命令只改这个 JSON 布尔值，不加载 LaunchDaemon，也不开始接管。之后的 `daemon start` 或 `nmd apply` 只有在管理器把这次启动当成新的一次开机时才可能马上接管。
 安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|restart|status|
 takeover-start|takeover-stop`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
-launchctl；面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`restart`
+launchctl；这些动作不改 `on_boot`。面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`restart`
 等于先 `stop` 再 `start`；`stop` 失败则不 `start`。`stop` 会
 `bootout` 系统任务，`start` 在 `kickstart` 发现任务未加载时用已安装的 plist
 重新 `bootstrap` 再 `kickstart`。卸载同时 `bootout` 当前用户的 LaunchAgent。
-示例配置 `examples/macos-daemon.json`（占位地址，install/start 拒绝占位）。
+示例配置 `examples/macos-daemon.json`（占位地址 `203.0.113.20`，`init` / `install` / `start` 都拒绝占位，不会拿它生成一份可用配置）。
 **`nmd update` 只更新磁盘代码，不重载进程。** 已安装守护时，`nmd apply`
 （`refresh` 同义）若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`。
 它不跑 Linux 的网络部署，不调用 `takeover-start`，也不改 `on_boot`。

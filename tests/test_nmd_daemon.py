@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -903,6 +904,19 @@ class DaemonInstallTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.manager.main(["macos", "daemon", "status"])
 
+    def test_install_start_and_restart_do_not_rewrite_on_boot(self):
+        path = self.config_dir / "daemon.json"
+        before = path.read_bytes()
+        self.assertIn(b'"on_boot": false', before)
+        self.assertNotIn(b'"on_boot": "false"', before)
+        self.assertEqual(self.run_cli("install")[0], 0)
+        self.assertEqual(path.read_bytes(), before)
+        with patch("macos_preflight.host_is_darwin", return_value=False):
+            self.assertEqual(self.run_cli("start")[0], 0)
+            self.assertEqual(self.run_cli("restart")[0], 0)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIs(d.load_daemon_config(path)["takeover"]["on_boot"], False)
+
 
 class DaemonRestartTests(unittest.TestCase):
     """restart is stop then start. No sudo, launchctl, or socket is used."""
@@ -1067,6 +1081,353 @@ class WakeResidencyTests(unittest.TestCase):
         self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
         self.assertNotIn("nodekey:", json.dumps(table.mutations))
         self.assertFalse(sup.config["takeover"]["on_boot"])
+
+
+class DaemonOnBootTests(unittest.TestCase):
+    """on-boot and init touch daemon.json only. No sudo, launchd, or takeover."""
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.base = Path(holder.name)
+        self.path = self.base / "config" / "daemon.json"
+        self.path.parent.mkdir(mode=0o700)
+        d.write_daemon_config(self.path, CONFIG)
+        patcher = patch.object(d, "default_daemon_config_path", return_value=self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_inputs(self, payload, name="inputs.json"):
+        path = self.base / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+
+    def invoke(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        bombs = (
+            patch.object(d.subprocess, "run", side_effect=AssertionError("subprocess")),
+            patch.object(d, "_run_helper", side_effect=AssertionError("helper")),
+            patch.object(d, "_daemon_start", side_effect=AssertionError("start")),
+            patch.object(d, "_daemon_stop", side_effect=AssertionError("stop")),
+            patch.object(d, "install_root_plist", side_effect=AssertionError("plist")),
+            patch.object(d, "DaemonIPCClient", side_effect=AssertionError("ipc")),
+            patch("macos_takeover.reexec_root", side_effect=AssertionError("reexec")),
+            patch("macos_takeover.execute_mutating", side_effect=AssertionError("mutate")),
+            patch("macos_geodata.prepare_for_daemon", side_effect=AssertionError("geodata")),
+            patch("macos_preflight.for_daemon_lifecycle", side_effect=AssertionError("preflight")),
+            patch("macos_preflight.for_installed_takeover",
+                  side_effect=AssertionError("takeover-preflight")),
+            patch("manager.apply", side_effect=AssertionError("apply")),
+            patch("manager._activate_macos_daemon", side_effect=AssertionError("activate")),
+        )
+        with contextlib.ExitStack() as stack:
+            for item in bombs:
+                stack.enter_context(item)
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = d.cli_daemon(list(argv))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_boot_policy_defaults_stay_closed(self):
+        policy = macos_coexist.DAEMON_POLICY
+        self.assertIs(policy["takeover_on_boot_default"], False)
+        self.assertIs(policy["same_boot_keepalive_restart_never_resumes"], True)
+        self.assertIs(policy["wake_does_not_start_takeover"], True)
+        self.assertIs(policy["auto_retry_after_rollback"], False)
+        self.assertIs(policy["retries_incomplete_rollback"], True)
+
+    def test_help_names_init_and_on_boot_without_reading_config(self):
+        digest = self.path.read_bytes()
+        with patch.object(d.os, "geteuid", return_value=0), \
+                patch.object(d.Path, "home", side_effect=AssertionError("home")), \
+                patch.object(d, "write_daemon_config", side_effect=AssertionError("write")), \
+                patch.object(d, "load_daemon_config", side_effect=AssertionError("load")):
+            code, out, err = self.invoke(["on-boot", "--help"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("on-boot [on|off|status]", out)
+        self.assertIn("init --inputs", out)
+        self.assertIn("203.0.113.20", out)
+        self.assertEqual(err, "")
+        self.assertEqual(self.path.read_bytes(), digest)
+
+    def test_root_refuses_before_home_or_write(self):
+        with patch.object(d.os, "geteuid", return_value=0), \
+                patch.object(d.Path, "home", side_effect=AssertionError("home")), \
+                patch.object(d, "default_daemon_config_path", side_effect=AssertionError("path")), \
+                patch.object(d, "write_daemon_config", side_effect=AssertionError("write")), \
+                patch.object(d, "load_daemon_config", side_effect=AssertionError("load")):
+            for argv in (["on-boot"], ["on-boot", "on"], ["on-boot", "off"],
+                         ["on-boot", "true"],
+                         ["init", "--inputs", str(self.base / "missing.json")]):
+                code, out, err = self.invoke(argv)
+                self.assertEqual(code, 1, argv)
+                self.assertEqual(out, "", argv)
+                self.assertEqual(json.loads(err)["error"], "root_refused", argv)
+        self.assertFalse((self.base / "var-root").exists())
+
+    def test_on_off_and_status_round_trip_a_json_boolean(self):
+        digest = self.path.read_bytes()
+        code, out, err = self.invoke(["on-boot"])
+        self.assertEqual(code, 0, err)
+        body = json.loads(out)
+        self.assertIs(body["on_boot"], False)
+        self.assertIs(body["changed"], False)
+        self.assertIs(body["loaded_daemon"], False)
+        self.assertIs(body["takeover_started"], False)
+        self.assertIn("没有加载 LaunchDaemon", body["note"])
+        self.assertIn("新的一次开机", body["note"])
+        self.assertEqual(self.path.read_bytes(), digest)
+
+        code, out, err = self.invoke(["on-boot", "status"])
+        self.assertEqual(code, 0, err)
+        self.assertIs(json.loads(out)["changed"], False)
+        self.assertEqual(self.path.read_bytes(), digest)
+
+        with patch.object(d, "write_daemon_config", side_effect=AssertionError("write")):
+            code, out, err = self.invoke(["on-boot", "off"])
+        self.assertEqual(code, 0, err)
+        self.assertIs(json.loads(out)["on_boot"], False)
+        self.assertIs(json.loads(out)["changed"], False)
+
+        code, out, err = self.invoke(["on-boot", "on"])
+        self.assertEqual(code, 0, err)
+        turned = json.loads(out)
+        self.assertIs(turned["on_boot"], True)
+        self.assertIs(turned["changed"], True)
+        self.assertIs(turned["loaded_daemon"], False)
+        self.assertIs(turned["takeover_started"], False)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn('"on_boot": true', text)
+        self.assertNotIn('"on_boot": "true"', text)
+        stored = json.loads(text)
+        self.assertIs(stored["takeover"]["on_boot"], True)
+        self.assertEqual(stored["takeover"]["inputs"], CONFIG["takeover"]["inputs"])
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode) & 0o777, 0o600)
+        self.assertEqual(self.path.stat().st_uid, os.geteuid())
+        self.assertEqual(self.path.lstat().st_nlink, 1)
+
+        with patch.object(d, "write_daemon_config", side_effect=AssertionError("write")):
+            code, out, err = self.invoke(["on-boot", "on"])
+        self.assertEqual(code, 0, err)
+        self.assertIs(json.loads(out)["changed"], False)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), text)
+
+        code, out, err = self.invoke(["on-boot", "off"])
+        self.assertEqual(code, 0, err)
+        self.assertIs(json.loads(out)["on_boot"], False)
+        self.assertIs(json.loads(out)["changed"], True)
+        self.assertIn('"on_boot": false', self.path.read_text(encoding="utf-8"))
+        self.assertIs(d.load_daemon_config(self.path)["takeover"]["on_boot"], False)
+
+    def test_on_boot_rejects_string_booleans_and_leaves_the_file(self):
+        before = self.path.read_bytes()
+        for word in ("true", "false", "yes", "1", "on-boot"):
+            code, out, err = self.invoke(["on-boot", word])
+            self.assertEqual(code, 2, word)
+            self.assertEqual(out, "", word)
+            self.assertIn("on-boot [on|off|status]", err)
+            self.assertEqual(self.path.read_bytes(), before, word)
+        code, _, _ = self.invoke(["on-boot", "on", "please"])
+        self.assertEqual(code, 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_on_boot_refuses_missing_invalid_symlink_and_foreign_files(self):
+        self.path.unlink()
+        code, out, err = self.invoke(["on-boot", "on"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"], "daemon_config_missing")
+        self.assertFalse(self.path.exists())
+
+        self.path.write_text("{oops", encoding="utf-8")
+        os.chmod(self.path, 0o600)
+        broken = self.path.read_bytes()
+        code, _, err = self.invoke(["on-boot", "status"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_invalid_json")
+        self.assertEqual(self.path.read_bytes(), broken)
+
+        raw = json.loads(json.dumps(CONFIG))
+        for bad in ("true", "false", 1, 0):
+            raw["takeover"]["on_boot"] = bad
+            self.path.write_text(json.dumps(raw), encoding="utf-8")
+            os.chmod(self.path, 0o600)
+            snapshot = self.path.read_bytes()
+            code, _, err = self.invoke(["on-boot", "on"])
+            self.assertEqual(code, 1, bad)
+            self.assertEqual(json.loads(err)["error"], "invalid_on_boot", bad)
+            self.assertEqual(self.path.read_bytes(), snapshot, bad)
+
+        d.write_daemon_config(self.path, CONFIG)
+        os.chmod(self.path, 0o666)
+        writable = self.path.read_bytes()
+        code, _, err = self.invoke(["on-boot", "off"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_group_or_world_writable")
+        self.assertEqual(self.path.read_bytes(), writable)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode) & 0o777, 0o666)
+
+        os.chmod(self.path, 0o600)
+        if os.geteuid() != 0:
+            with patch.object(d.os, "geteuid", return_value=os.geteuid() + 1):
+                code, _, err = self.invoke(["on-boot"])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(err)["error"], "config_owner_changed")
+            self.assertIn(b'"on_boot": false', self.path.read_bytes())
+
+        target = self.base / "other.json"
+        target.write_text('{"secret": true}\n', encoding="utf-8")
+        self.path.unlink()
+        self.path.symlink_to(target)
+        code, _, err = self.invoke(["on-boot", "on"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_not_regular")
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"secret": true}\n')
+        self.assertTrue(self.path.is_symlink())
+
+    def test_on_boot_does_not_follow_a_symlink_parent(self):
+        real = self.base / "real"
+        real.mkdir(mode=0o700)
+        moved = real / "daemon.json"
+        self.path.replace(moved)
+        link = self.base / "via"
+        link.symlink_to(real, target_is_directory=True)
+        dest = link / "daemon.json"
+        before = moved.read_bytes()
+        with patch.object(d, "default_daemon_config_path", return_value=dest):
+            code, _, err = self.invoke(["on-boot", "on"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_not_regular")
+        self.assertEqual(moved.read_bytes(), before)
+        self.assertIs(json.loads(moved.read_text(encoding="utf-8"))["takeover"]["on_boot"], False)
+
+    def test_init_writes_a_private_config_and_refuses_placeholders(self):
+        self.path.unlink()
+        inputs = self.write_inputs({
+            "proxy_name": "VPS", "server": "fd7a:115c:a1e0::abcd", "port": 1081})
+        code, out, err = self.invoke(["init", "--inputs", str(inputs),
+                                   "--mihomo", "/usr/local/bin/mihomo"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("fd7a:115c:a1e0::abcd", out)
+        self.assertNotIn("203.0.113.20", out)
+        body = json.loads(out)
+        self.assertEqual(body["result"], "daemon_config_written")
+        self.assertIs(body["on_boot"], False)
+        self.assertIs(body["installed"], False)
+        self.assertIs(body["loaded_daemon"], False)
+        self.assertIs(body["takeover_started"], False)
+        loaded = d.load_daemon_config(self.path, expected_uid=os.geteuid())
+        self.assertIs(loaded["takeover"]["on_boot"], False)
+        self.assertIsNone(loaded["takeover"]["profile"])
+        self.assertIsNone(loaded["takeover"]["state_dir"])
+        self.assertEqual(loaded["takeover"]["mihomo_path"], "/usr/local/bin/mihomo")
+        self.assertEqual(loaded["takeover"]["inputs"]["server"], "fd7a:115c:a1e0::abcd")
+        self.assertEqual(loaded["dashboard"]["port"], 8765)
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertIn('"on_boot": false', raw)
+        self.assertNotIn('"on_boot": "false"', raw)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode) & 0o777, 0o600)
+        self.assertEqual(self.path.stat().st_uid, os.geteuid())
+        self.assertFalse(self.path.is_symlink())
+
+        code, _, err = self.invoke(["init", "--inputs", str(inputs)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "daemon_config_exists")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), raw)
+
+    def test_init_refuses_placeholder_relative_mihomo_and_unsafe_paths(self):
+        self.path.unlink()
+        placeholder = self.write_inputs(
+            {"proxy_name": "VPS", "server": "203.0.113.20", "port": 1080},
+            name="placeholder.json")
+        code, out, err = self.invoke(["init", "--inputs", str(placeholder)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"], "placeholder_inputs")
+        self.assertNotIn("203.0.113.20", out + err)
+        self.assertFalse(self.path.exists())
+
+        mixed = self.write_inputs(
+            {"server": "203.0.113.20", "port": 1081}, name="mixed.json")
+        code, _, err = self.invoke(["init", "--inputs", str(mixed)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "placeholder_server_requires_placeholder_port")
+        self.assertFalse(self.path.exists())
+
+        public = self.write_inputs({"server": "8.8.8.8", "port": 1080}, name="public.json")
+        code, _, err = self.invoke(["init", "--inputs", str(public)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "invalid_server")
+        self.assertFalse(self.path.exists())
+
+        text_port = self.write_inputs(
+            {"server": "fd7a:115c:a1e0::abcd", "port": "1081"}, name="text-port.json")
+        code, _, err = self.invoke(["init", "--inputs", str(text_port)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "invalid_port")
+        self.assertFalse(self.path.exists())
+
+        good = self.write_inputs(
+            {"server": "fd7a:115c:a1e0::abcd", "port": 1081}, name="good.json")
+        code, _, err = self.invoke(["init", "--inputs", str(good), "--mihomo", "mihomo"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "invalid_mihomo_path")
+        self.assertFalse(self.path.exists())
+
+        code, _, err = self.invoke(["init"])
+        self.assertEqual(code, 2)
+        self.assertIn("init --inputs", err)
+        self.assertFalse(self.path.exists())
+
+        unsafe = self.base / "unsafe"
+        unsafe.mkdir(mode=0o700)
+        os.chmod(unsafe, 0o777)
+        with patch.object(d, "default_daemon_config_path", return_value=unsafe / "daemon.json"):
+            code, _, err = self.invoke(["init", "--inputs", str(good)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_group_or_world_writable")
+        self.assertFalse((unsafe / "daemon.json").exists())
+
+        real = self.base / "real"
+        real.mkdir(mode=0o700)
+        link = self.base / "via"
+        link.symlink_to(real, target_is_directory=True)
+        with patch.object(d, "default_daemon_config_path", return_value=link / "daemon.json"):
+            code, _, err = self.invoke(["init", "--inputs", str(good)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_not_regular")
+        self.assertFalse((real / "daemon.json").exists())
+
+    def test_init_creates_a_private_parent_when_the_directory_is_missing(self):
+        nested = self.base / "fresh" / "nmd" / "daemon.json"
+        inputs = self.write_inputs(
+            {"server": "100.64.0.1", "port": 1080}, name="v4.json")
+        with patch.object(d, "default_daemon_config_path", return_value=nested):
+            code, out, err = self.invoke(["init", "--inputs", str(inputs)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("100.64.0.1", out)
+        self.assertEqual(stat.S_IMODE(nested.parent.stat().st_mode) & 0o777, 0o700)
+        self.assertEqual(stat.S_IMODE(nested.parent.parent.stat().st_mode) & 0o777, 0o700)
+        self.assertEqual(stat.S_IMODE(nested.stat().st_mode) & 0o777, 0o600)
+        self.assertIs(json.loads(nested.read_text(encoding="utf-8"))["takeover"]["on_boot"], False)
+
+    def test_existing_daemon_actions_still_reject_a_second_word(self):
+        for action in d._DAEMON_ACTIONS:
+            self.assertEqual(self.invoke([action, "extra"])[0], 2, action)
+        self.assertEqual(self.invoke([])[0], 2)
+        self.assertEqual(self.invoke(["bogus"])[0], 2)
+
+    def test_manager_forwards_on_boot_only_on_macos(self):
+        import manager
+        with patch.object(manager.nmd_platform, "name", return_value="macos"), \
+                patch("nmd_daemon.cli_daemon", return_value=0) as cli:
+            with self.assertRaises(SystemExit) as ctx:
+                manager.main(["macos", "daemon", "on-boot", "status"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(cli.call_args.args, (["on-boot", "status"],))
+        with patch.object(manager.nmd_platform, "name", return_value="linux"):
+            with self.assertRaises(SystemExit):
+                manager.main(["macos", "daemon", "on-boot", "on"])
 
 
 class SourceSafetyTests(unittest.TestCase):
