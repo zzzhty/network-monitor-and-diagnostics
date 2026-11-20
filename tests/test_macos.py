@@ -173,6 +173,10 @@ class SafeMacOSCLITests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn('apply / refresh', text)
         self.assertIn('restart 等于先 stop 再 start', text)
+        self.assertIn('daemon init --inputs', text)
+        self.assertIn('daemon on-boot', text)
+        self.assertIn('203.0.113.20', text)
+        self.assertIn('不改 on_boot', text)
         self.assertNotIn('apply 与 systemd', text)
 
     def test_linux_apply_deploys_then_verifies_inside_the_same_transaction(self):

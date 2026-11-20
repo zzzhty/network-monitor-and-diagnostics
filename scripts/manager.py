@@ -430,8 +430,9 @@ def bootstrap(args):
             install_links(root, bindir, scope == "user" and not args.no_path)
             if args.manager_only:
                 if nmd_platform.name() == "macos":
-                    print("管理安装已就绪；可选：nmd macos daemon install 安装常驻守护，"
-                          "或 nmd desktop install 安装桌面壳。不部署网络。", flush=True)
+                    print("管理安装已就绪。常驻守护要先写入真实地址的 daemon.json，"
+                          "顺序见 docs/macos.md。可选：nmd desktop install 安装桌面壳。"
+                          "不部署网络。", flush=True)
                 else:
                     print("管理安装已就绪；运行 nmd monitor install 安装采集服务。网络配置仅由 nmd apply 显式应用。", flush=True)
             else:
@@ -896,6 +897,9 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     command = argv[0] if argv else "help"
     platform = nmd_platform.name()
+    if command == "onboard":
+        from nmd_onboard import main as onboard_main
+        raise SystemExit(onboard_main(argv[1:]))
     service_actions = {"install", "uninstall", "start", "stop", "restart", "enable", "disable", "logs", "service-status"}
     if platform == "windows":
         rejected = set(SERVICE_COMMANDS) | set(MUTATING_COMMANDS) | {
@@ -929,7 +933,7 @@ def main(argv=None):
             # reloads an installed daemon after preflight. That reload can roll
             # back an active takeover. Linux network deploy and systemd stay
             # unsupported. `macos` is the experimental takeover controller.
-            allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos"}
+            allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos", "onboard"}
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
@@ -946,6 +950,11 @@ def main(argv=None):
                   "  monitor status --state-dir DIR\n"
                   "  gui [--state-dir DIR] [--config FILE] [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
                   "  machine capabilities | machine status --state-dir DIR\n"
+                  "  onboard                 在交互终端里逐项填写。确认前不下载、不写配置\n"
+                  "  onboard --server ADDR --port PORT  或 --inputs FILE  非交互；非终端请用这种写法\n"
+                  "                         检查官方 Tailscale 与 mihomo。缺了就停止，不写配置、不接管。\n"
+                  "                         macOS 不安装 Tailscale。mihomo 不在时才放到当前用户可写的目录。\n"
+                  "                         不加载守护，不把 on_boot 改成 true，不执行 apply。不要 sudo\n"
                   "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
                   "  update [--check]  快进更新代码，不部署网络、不重载守护\n"
                   "  apply / refresh       记录当前版本；已安装守护时先补齐缺少的地理数据，再做只读预检，通过后才 daemon restart。"
@@ -960,9 +969,16 @@ def main(argv=None):
                   "  macos geodata ensure [--geodata-dir DIR] [--inputs FILE]\n"
                   "                         下载生成规则缺少的 geosite.dat / geoip.metadb。"
                   "不要 sudo。预检、help、status 和面板不会跑这一步\n"
+                  "  macos daemon init --inputs FILE [--mihomo PATH]\n"
+                  "                         用真实 Tailnet 地址写入 daemon.json。on_boot 固定为 JSON false。"
+                  "不安装、不加载、不 sudo，拒绝占位地址 203.0.113.20，不覆盖已有文件\n"
+                  "  macos daemon on-boot [on|off|status]\n"
+                  "                         只读写 daemon.json 的 takeover.on_boot（JSON 布尔）。"
+                  "不加载守护，也不开始接管。不要 sudo。"
+                  "之后的 start 或 apply 只有在被当成新的一次开机时才可能马上接管\n"
                   "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
                   "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
-                  "restart 等于先 stop 再 start。预检失败则不 stop。"
+                  "这些动作不改 on_boot。restart 等于先 stop 再 start。预检失败则不 stop。"
                   "进行中的接管会被这次 stop 回退\n"
                   "Linux 的网络部署与 systemd 生命周期在 macOS 不支持。")
             return
@@ -1097,7 +1113,13 @@ def main(argv=None):
         bootstrap(parser.parse_args(argv[1:]))
         return
     if command in ("help", "--help", "-h"):
-        print("通道管理：nmd channel --help（兼容 nmd source；私有配置、显式刷新和选择）\n独立诊断：nmd monitor --help | nmd gui --help | nmd machine capabilities | nmd demo\n\nNMD 生命周期：\n  install      安装当前 scope 的 monitor 单元（不自动启动）\n"
+        print("通道管理：nmd channel --help（兼容 nmd source；私有配置、显式刷新和选择）\n独立诊断：nmd monitor --help | nmd gui --help | nmd machine capabilities | nmd demo\n\n"
+              "  onboard                 交互终端逐项填写。端口直接回车为 1080。确认前不下载、不写配置。\n"
+              "                         非终端请用 onboard --server ADDR --port 1080 或 --inputs FILE。\n"
+              "                         Tailscale 缺失则停止（仓库没有安装器）。\n"
+              "                         mihomo 缺失时只跑 fetch-assets.sh 下载 deb，不 dpkg、不 setup、不 apply。\n"
+              "                         /usr/bin/mihomo 仍不可执行则不写端点文件。不要 sudo\n\n"
+              "NMD 生命周期：\n  install      安装当前 scope 的 monitor 单元（不自动启动）\n"
               "  update --check  拉取 main 并查看可用更新\n  update       校验、快进更新代码（不 apply）\n"
               "  apply / refresh  重新应用当前版本，不拉取远端\n"
               "  monitor install/start/stop/restart/enable/disable/logs/service-status/uninstall\n"
