@@ -134,7 +134,7 @@ expected_egress_ip 验收；来源模式不会读取本机旧 VPS 覆盖值，cu
 拥有并设为 0600，系统安装可用 root:root、0600；管理员也能读取该文件。
 也可通过同名环境变量配置；文件可读时以文件为准。非 root 的 verify 可使用仅当前账户可读的
 `NMD_LOCAL_ENV` 文件或显式变量；经过
-sudo 时以该私有文件为准，不能假定 sudo 保留环境变量。部署不会改写这份本机数据。
+sudo 时以该私有文件为准，不能假定 sudo 保留环境变量。部署不会改写这份本机数据。`nmd onboard` 也不会写 `/etc/mihomo/nmd-local.env`。它把 Tailnet 的 IPv4 记到当前用户自己的 `nmd-local.env`（已记录的 configDir，否则 `~/.config/nmd`），端口固定 1080。官方 Tailscale 不在 `/usr/bin/tailscale` 或 `/usr/local/bin/tailscale` 时，命令在下载之前停止；这个仓库没有 Tailscale 安装器。mihomo 不在 `/usr/bin/mihomo` 时，它只运行现有的 `fetch-assets.sh` 把 deb 下载到 checkout，不执行 `dpkg`、`setup` 或 `apply`，也不改 DNS、路由或代理。deb 落地之后二进制仍不可执行，则不写端点文件。已有文件里的 `NMD_VPS_PUB` 若仍是文档前缀（`192.0.2.`、`198.51.100.`、`203.0.113.`），同样在下载之前停止，不改写该文件。
 
 文件只接受这两个变量的字面 IPv4 赋值（可带单/双引号）、空行和独立注释，不执行
 shell、export、变量替换或命令替换。旧 VPS 的部署、verify/cutover/rollback/test-stop
@@ -148,6 +148,7 @@ Actions 日志或产物中的旧值；公开前需要单独处理这些表面。
 
 | 命令 | 行为 |
 |---|---|
+| `onboard` | 记下 Tailnet IPv4。不安装 Tailscale；mihomo 缺失时只下载 deb，不 dpkg、不 apply、不写 /etc |
 | `install` / `monitor install` | 安装当前 scope 的 monitor 单元，不自动启动/启用，不部署网络 |
 | `update --check` | fetch origin/main，显示更新；不改 checkout 或运行配置 |
 | `update` | 拒绝脏目录/分叉 → fetch → 临时候选代码语法校验 → Git 快进；不下载资产、不 apply、不重启 |

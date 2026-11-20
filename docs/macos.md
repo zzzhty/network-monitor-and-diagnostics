@@ -120,16 +120,16 @@ nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
 
 ## 新机器：实验性常驻守护
 
-这是显式选择的实验路径，不是与 Clash Verge Rev 共同使用时的默认监控。默认路径不部署 mihomo，不改 DNS、路由或系统代理。下面的顺序没有在本仓库的实机上跑过。nmd 不能从零装完一台 Mac：官方 Tailscale、官方 mihomo，以及你自己的 Tailnet SOCKS 地址，都要先在外面准备好。
+这是显式选择的实验路径，不是与 Clash Verge Rev 共同使用时的默认监控。默认路径不部署 mihomo，不改 DNS、路由或系统代理。下面的顺序没有在本仓库的实机上跑过。入口是 `nmd onboard`。它不能从零装完一台 Mac：官方 Tailscale 仍要自己安装，Tailnet SOCKS 地址也要自己提供。mihomo 只有在已经存在当前用户可写的目录时才会被放进去；放不进去就停，不写 `daemon.json`，也不开始接管。
 
 `install`、`start`、`restart` 和 `apply` 都不改 `takeover.on_boot`。`DAEMON_POLICY` 里 `takeover_on_boot_default` 仍是 false。同一次开机里的 KeepAlive 重启，以及睡眠唤醒，都不会因为这个标志再开一轮接管。
 
 ### nmd 装不了的前提
 
 - 机器上已有 Python 3.9+、Git 和 Bash。`./install.sh --manager-only` 会再用 Git 克隆一份独立的 `main` 到 `~/.nmd`。凭证用你已经配好的 Git，命令行里不放 token。
-- 官方 Tailscale。nmd 不安装、不登录、不执行 `tailscale set`。命令需要出现在下面之一：`/Applications/Tailscale.app/Contents/MacOS/Tailscale`、`/usr/local/bin/tailscale`、`/opt/homebrew/bin/tailscale`、`/usr/bin/tailscale`。真正接管之前，客户端要已经连上。
-- 官方 mihomo，nmd 不下载。放在 `/usr/local/bin/mihomo`、`/opt/homebrew/bin/mihomo` 或 `/usr/local/sbin/mihomo`，否则在 init 时用 `--mihomo` 传入绝对路径。实验 profile 的 `tun.dns-mode` 是 `native`，需要 mihomo 1.19.33 或更新。Homebrew 只是把二进制放到上述路径的一种办法，nmd 不调用 `brew`。
-- 一份你自己的 SOCKS 输入。`server` 必须是 Tailnet 地址（`100.64.0.0/10` 或 `fd7a:115c:a1e0::/48`），`port` 是 1–65535 且不能是 22。`examples/macos-daemon.json` 和 `examples/macos-mihomo-takeover.inputs.example.json` 里的 `203.0.113.20` 是文档占位，`init` 和 `install` 都拒绝它，也不会拿它生成一份新配置。
+- 官方 Tailscale。`onboard` 不下载、不安装、不登录，也不执行 `tailscale set`。命令需要已经出现在下面之一：`/Applications/Tailscale.app/Contents/MacOS/Tailscale`、`/usr/local/bin/tailscale`、`/opt/homebrew/bin/tailscale`、`/usr/bin/tailscale`。缺了或不可执行时命令停止，并说明要自己安装官方客户端。真正接管之前，客户端要已经连上。
+- 官方 mihomo。已经在 `/usr/local/bin/mihomo`、`/opt/homebrew/bin/mihomo` 或 `/usr/local/sbin/mihomo` 且可执行时，`onboard` 直接用它，不再下载。否则只在当前用户拥有、且组和其他人不可写的目录里放一份：先看已经存在的 `/opt/homebrew/bin`、`/usr/local/bin`，再看 `~/.local/bin`（没有就建成 0700）。二进制来自与 `fetch-assets.sh` 同一条 `VER=` 的 MetaCubeX 发布，资源名是 `mihomo-darwin-<arch>-<VER>.gz`。`fetch-assets.sh` 本身只下 Linux deb，macOS 不跑它，也不调用 `brew`，也不使用 sudo。下载失败、解开后不是 Mach-O，或没有这样的目录，命令停止，不写配置。这一步只检查 gzip 和 Mach-O 文件头，发布页没有校验和文件，`fetch-assets.sh` 也不核对 deb。实验 profile 的 `tun.dns-mode` 是 `native`，接管预检仍要求 mihomo 1.19.33 或更新；`fetch-assets.sh` 钉住的版本可能更旧，放进去之后预检仍可能失败。需要更新的版本时，先自己把官方二进制放到上述候选路径，`onboard` 看到可执行文件就不会再下载。
+- 一份你自己的 SOCKS 输入。`server` 必须是 Tailnet 地址（`100.64.0.0/10` 或 `fd7a:115c:a1e0::/48`），`port` 是 1–65535 且不能是 22。`examples/macos-daemon.json` 和 `examples/macos-mihomo-takeover.inputs.example.json` 里的 `203.0.113.20` 是文档占位，`onboard`、`init` 和 `install` 都拒绝它，也不会拿它生成一份新配置。
 
 ### 1. 管理安装
 
@@ -141,9 +141,16 @@ nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
 
 macOS 拒绝不带 `--manager-only` 的 bootstrap，也不部署 Linux 网络或采集服务。结束后按它打印的方式把 `~/.local/bin` 放进 PATH，然后用 PATH 里的 `nmd`。源码目录里的 `./nmd macos daemon install` 会在安装检查时被拒绝。
 
-### 2. 写入 daemon.json
+### 2. 用 onboard 记下地址
 
-自己写一份 inputs，权限保持只有当前用户可读写。下面的地址只说明形状。`init` 只检查它落在 Tailnet 前缀里，不会分辨这是不是你的机器，所以不要原样复制：
+不要 sudo。下面的地址只说明形状，不要原样复制。`onboard` 只检查它落在 Tailnet 前缀里，不会分辨这是不是你的机器：
+
+```bash
+nmd onboard --server fd7a:115c:a1e0::abcd --port 1081 --proxy-name VPS
+nmd onboard --inputs /path/to/inputs.json
+```
+
+inputs 文件只有当前用户可读写，形状与 `init` 相同：
 
 ```json
 {
@@ -153,13 +160,17 @@ macOS 拒绝不带 `--manager-only` 的 bootstrap，也不部署 Linux 网络或
 }
 ```
 
+顺序是固定的。先检查参数：占位地址 `203.0.113.20`、非 Tailnet 地址、端口 22 或不是整数，都在探测组件之前失败。然后找官方 Tailscale；没有或不可用就停，不下载 mihomo，也不写 `daemon.json`。Tailscale 可用而 mihomo 不在候选路径上时，才按上一节放到用户可写目录。放好或已经存在之后，才把地址写入管理安装记录的 `configDir/daemon.json`（默认 `~/.config/nmd/daemon.json`）。新建的父目录是 0700，文件是 0600。新建时 `on_boot` 是 JSON 布尔 `false`，`profile` 留空。已有合法文件只更新 `inputs`，原来的 `on_boot` 保持不动，包括已经是 `true` 的情况；这条命令不会因此加载守护或开始接管。二进制不在候选目录里时，把它的绝对路径写进 `takeover.mihomo_path`。失败、符号链接、组或其他人可写的目录，都不改这份文件。root 会被拒绝，避免写进 `/var/root`。成功时的 JSON 不重复打印地址，也不把 `loaded_daemon`、`takeover_started`、`apply_ran` 写成 true。
+
+`nmd macos daemon init` 仍是只写配置、不检查 Tailscale、不下载 mihomo 的下一层命令。已有文件或符号链接时它不覆盖。相对的 `--mihomo` 会失败且不创建文件。
+
 ```bash
 nmd macos daemon init --inputs /path/to/inputs.json
 nmd macos daemon init --inputs /path/to/inputs.json --mihomo /absolute/path/to/mihomo
 nmd macos daemon on-boot
 ```
 
-`init` 只把校验过的配置原子写到管理安装记录的 `configDir/daemon.json`（默认 `~/.config/nmd/daemon.json`）。新建的父目录是 0700，文件是 0600，所有者是当前用户。`on_boot` 固定写成 JSON 布尔 `false`，`profile` 留空（运行时用仓库里的实验 profile）。不要 sudo：root 会被拒绝，避免写进 `/var/root`。已有文件或符号链接时不覆盖。占位地址、非 Tailnet 地址、字符串端口、相对的 `--mihomo`，都失败且不创建文件。`on-boot` 不带参数时只打印当前值，此时应是 `false`。
+`on-boot` 不带参数时只打印当前值。刚由 `onboard` 或 `init` 新建的文件应是 `false`。
 
 ### 3. 地理数据和预检
 

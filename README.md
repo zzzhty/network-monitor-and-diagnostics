@@ -30,7 +30,7 @@ CLI、SQLite 历史、事件/空窗逻辑及只读 GUI 复用现有实现。macO
 可用的链路状态、IPv4 路由指纹与默认路由条数；缺失信息明确为未知，systemd 服务不可用。
 真实本机采样需另行显式运行前台 `monitor run`；本次验证仅用 fixtures 与回环服务。
 使用方式、状态目录限制和实验边界见 [macOS 使用说明](docs/macos.md)。
-在一台新的 Mac 上部署实验性常驻守护的命令顺序，以及 nmd 自己装不了的前提（官方 Tailscale、官方 mihomo、真实 Tailnet 地址），见该说明里的「新机器：实验性常驻守护」。这不是与 Clash Verge Rev 一起用时的默认监控路径。
+在一台新的 Mac 上，实验性常驻守护的入口是 `nmd onboard`。它不安装官方 Tailscale；mihomo 只在当前用户可写的目录里从官方发布放入，放不进去就停，不写配置、不接管。命令顺序见该说明里的「新机器：实验性常驻守护」。这不是与 Clash Verge Rev 一起用时的默认监控路径。
 下文的安装、后台服务和网络管理流程仍仅针对 Linux；macOS CLI 会提前拒绝这些命令。
 
 ## Windows 本机采集
@@ -149,6 +149,10 @@ sudo -u nmd-monitor /opt/nmd/nmd gui
 原有条件，并理解这些命令会影响真实网络；安装 scope 不会把它们变成用户级网络服务。
 
 ```bash
+nmd onboard --server ADDR --port 1080
+                     # 记下 Tailnet 地址。Tailscale 不在时停止（仓库没有安装器）。
+                     # mihomo 不在 /usr/bin/mihomo 时只跑 fetch-assets.sh 下载 deb，
+                     # 不 dpkg、不 setup、不 apply；二进制仍不可执行则不写端点文件
 nmd status           # 安装 scope、版本、网络待应用状态及服务/Tailscale/DNS/路由
 nmd apply            # 显式下载缺少的代理资产、部署当前网络配置并验证；refresh 为同义命令
 nmd check            # 校验网络配置
@@ -161,6 +165,8 @@ nmd disable
 nmd logs
 nmd test-stop        # 临时停 mihomo 验证 Tailscale，结束时恢复原运行状态
 ```
+
+`nmd onboard` 在 Linux 上把 `NMD_VPS_TS_IP` 写到当前用户的端点文件（已记录的 `configDir/nmd-local.env`，否则是 `~/.config/nmd/nmd-local.env`），不写 `/etc/mihomo/nmd-local.env`，也不填文档占位的公网地址。端口只能是现有路径里的 1080，地址只能是 Tailnet 的 IPv4。它不执行 `apply`。macOS 上的同名命令见 [docs/macos.md](docs/macos.md)，不下载 Tailscale。
 
 `nmd update` 不再隐式部署网络，即使显示待应用也不会自动重试 apply。
 macOS 的 `nmd apply` / `refresh` 不做上面的 Linux 网络部署。它记录当前版本；已安装常驻守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。若当时有进行中的接管，这次 stop 会按快照回退路由、DNS 或 Tailscale exit node；`on_boot` 为 true 时，新的一次开机可能开始接管。见 [docs/macos.md](docs/macos.md) 与 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。
