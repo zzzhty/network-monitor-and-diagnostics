@@ -303,7 +303,7 @@ LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复
 `macos_coexist.DAEMON_POLICY`；单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠
 既有 preflight 双向失败关闭。健康检查含 Tailscale status 和配置里的 VPS SOCKS
 TCP 连接；TCP 成功只说明端口接受了握手，不是应用成功，HTTP 200 不在这项检查里。
-新机器上的顺序见 [macos.md](macos.md) 的「新机器：实验性常驻守护」。入口是 `nmd onboard`：交互终端里逐项填写并确认后才继续；不下载或安装官方 Tailscale；mihomo 缺失时只在当前用户可写的目录放入与 `fetch-assets.sh` 同一发布的 darwin 二进制，放不进去就不写配置。不用占位地址。`nmd macos daemon init --inputs FILE` 仍只写 `daemon.json`，不下载，`on_boot` 固定为 JSON false；不要 sudo，不覆盖已有文件。开机策略用 `nmd macos daemon on-boot on|off|status` 读写 `takeover.on_boot`。这条命令只改这个 JSON 布尔值，不加载 LaunchDaemon，也不开始接管。`onboard` 也不会把 `on_boot` 从 false 改成 true。之后的 `daemon start` 或 `nmd apply` 只有在管理器把这次启动当成新的一次开机时才可能马上接管。
+新机器上的顺序见 [macos.md](macos.md) 的「新机器：实验性常驻守护」。入口是 `nmd onboard`：交互终端里逐项填写并确认后才继续；不下载或安装官方 Tailscale；mihomo 缺失时只在当前用户可写的目录放入单独固定版本的官方 Darwin 二进制；已有二进制需要通过 native DNS 版本检查，不兼容就不写配置。不用占位地址。`nmd macos daemon init --inputs FILE` 仍只写 `daemon.json`，不下载，`on_boot` 固定为 JSON false；不要 sudo，不覆盖已有文件。开机策略用 `nmd macos daemon on-boot on|off|status` 读写 `takeover.on_boot`。这条命令只改这个 JSON 布尔值，不加载 LaunchDaemon，也不开始接管。`onboard` 也不会把 `on_boot` 从 false 改成 true。之后的 `daemon start` 或 `nmd apply` 只有在管理器把这次启动当成新的一次开机时才可能马上接管。
 安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|restart|status|
 takeover-start|takeover-stop`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
 launchctl；这些动作不改 `on_boot`。面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`restart`
