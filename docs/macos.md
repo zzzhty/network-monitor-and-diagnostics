@@ -16,19 +16,19 @@ macOS 是桌面机。NMD 在这里的定位是监控（monitor）和诊断（dia
 ```bash
 cd ~/Projects/network-monitor-and-diagnostics
 ./nmd machine capabilities
-./nmd demo --once
-./nmd demo --port 8765
+./nmd monitor status --dry-run
+./nmd gui --dry-run --port 8765
 ```
 
-`--once` 输出合成快照 JSON 后退出，不启动 HTTP 服务。普通 demo 在前台绑定
-`127.0.0.1:8765`，浏览器手动访问 `http://127.0.0.1:8765/`；Ctrl+C 关闭并自动清理
-临时状态目录。所有样本带 `synthetic: true`，快照标记 `collector.data_origin: demo`，
-页面始终显示“模拟演示”，采集器卡片显示“模拟样本”。未启动真实采集器、没有主动探测，
-也不读取 HOME 下的出口来源、代理、VPN 或其他网络工具配置。
-演示记录只生成一次，稍后显示过期属于预期行为，不会后台刷新假数据。
+`monitor status --dry-run` 输出合成快照 JSON 后退出，不启动 HTTP 服务。
+`gui --dry-run` 在前台绑定 `127.0.0.1:8765`，浏览器手动访问 `http://127.0.0.1:8765/`；
+Ctrl+C 关闭并自动清理临时状态目录。所有样本带 `synthetic: true`，快照标记
+`collector.data_origin: demo`，页面始终显示“模拟演示”，采集器卡片显示“模拟样本”。
+未启动真实采集器、没有主动探测，也不读取 HOME 下的出口来源、代理、VPN 或其他网络工具配置。
+合成记录只生成一次，稍后显示过期属于预期行为，不会后台刷新假数据。
 
 只读面板与采集器独立。启动普通 `gui` 或刷新页面不会启动采集；`monitor status` 只读取
-已有 SQLite，状态不存在时返回 `no_data` 且不创建目录。Linux 的新出口控制界面与自动故障切换保留。macOS 和 demo 的出口控制按钮禁用，
+已有 SQLite，状态不存在时返回 `no_data` 且不创建目录。Linux 的新出口控制界面与自动故障切换保留。macOS 和 `--dry-run` 的出口控制按钮禁用，
 macOS 拒绝通道保存/重命名、策略、测速和选择等五类出口 POST 端点及 `monitor run --sources-dir`，不会执行来源自动评估。
 macOS 的 `/api/sources` 固定为
 未配置状态，不读取私有来源注册表或查询控制器。
@@ -285,4 +285,4 @@ bash -n nmd
 
 Channel 扩展仍不开放 macOS 来源配置：`nmd channel` 与 `nmd source` 均提前拒绝，
 GUI 的 `channel_management` 为 false，新建/重命名接口在读取私有来源前拒绝。
-安全 demo 不读取真实通道，也不会因为新通道模型开始自动探测或切换。
+`gui --dry-run` 与 `monitor status --dry-run` 不读取真实通道，也不会因为新通道模型开始自动探测或切换。

@@ -11,7 +11,7 @@ macOS 源码诊断、状态存储及只读面板已加入实验支持，见 [mac
 Linux、macOS 与 Windows 的本机信息通过 `scripts/nmd_platform.py` 隔离，采集周期、SQLite、事件、
 空窗与 HTTP API 继续共用。Windows 用当前用户的计划任务代替 systemd，见 [windows.md](windows.md)。
 下述 systemd 与网络管理部分仅适用于 Linux。
-`./nmd demo` 提供自动清理的临时合成数据演示，始终显示模拟标识，不运行真实采集。
+`./nmd monitor status --dry-run` 打印自动清理的临时合成快照，`./nmd gui --dry-run` 用同一份数据显示面板。两者都标成模拟数据，不运行真实采集。
 
 ## 能力边界
 
@@ -65,7 +65,7 @@ GUI 仅绑定本机回环地址，不提供公网监听选项。不要通过反�
 每周期内评估自动切换并把事件写入 `auto_events`；采集器自身永远不因评估失败中断，
 周期预算按评估耗时扩展以保持新鲜度判定准确。CAPABILITIES 的 `read_only_gui` 因此为
 false，`local_egress_control` 与 `channel_management` 为 true，`network_mutations` 仍为 false
-（网络部署不变）。macOS/demo 两项管理能力均关闭。候选为任意 2..8 个按优先级排序的
+（网络部署不变）。macOS 与 `--dry-run` 两项管理能力均关闭。候选为任意 2..8 个按优先级排序的
 明确节点，手动选择统一暂停策略，不自动替换候选；兼容迁移与稳定 ID 见出口通道文档。
 
 ## 场景配置不是网络模式

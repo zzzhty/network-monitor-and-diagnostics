@@ -11,21 +11,21 @@ Channel 管理连接来源，Node 表示实际出口，Policy 只引用两个明
 中的节点，不再要求“一条订阅 + 一条 Tailnet”。`nmd channel` 与旧 `nmd source` 共用后端。
 Linux GUI 可添加/重命名并管理明确主备；保存只写私有配置，不自动刷新、探测、部署或切换。
 添加、订阅刷新、网络 apply、节点选择仍是独立动作。macOS 面板可编辑监控配置（仅写用户
-自己的 monitor.json，不启动采集）；出口控制仍仅 Linux，demo 完全只读。
+自己的 monitor.json，不启动采集）；出口控制仍仅 Linux，`--dry-run` 完全只读。
 
 ## macOS 实验性只读诊断
 
 源码 CLI 与浏览器面板现支持 macOS；需要已有的 Python 3.9+ 与 Bash，无原生 `.app` 包装。
-本节默认不安装服务、不配置代理，也不接管系统流量；例外是两条显式的实验路径：`sudo nmd macos takeover`（单次 sudo 前台、绝对截止、幂等回退）与 `nmd macos daemon install`（Paseo 式常驻守护：root 管理器监督接管、健康驱动回退、面板归属 daemon，默认关），见 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。先用安全演示查看现有面板：
+本节默认不安装服务、不配置代理，也不接管系统流量；例外是两条显式的实验路径：`sudo nmd macos takeover`（单次 sudo 前台、绝对截止、幂等回退）与 `nmd macos daemon install`（Paseo 式常驻守护：root 管理器监督接管、健康驱动回退、面板归属 daemon，默认关），见 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。先用合成数据查看现有面板：
 
 ```bash
 cd ~/Projects/network-monitor-and-diagnostics
 ./nmd machine capabilities
-./nmd demo --once          # 临时合成快照 JSON；不运行真实采集或 HTTP 服务
-./nmd demo --port 8765     # 前台只读演示，浏览器访问 http://127.0.0.1:8765/
+./nmd monitor status --dry-run   # 临时合成快照 JSON；不运行真实采集或 HTTP 服务
+./nmd gui --dry-run --port 8765  # 前台只读面板，浏览器访问 http://127.0.0.1:8765/
 ```
 
-演示只使用自动清理的临时数据库；页面明确标记模拟样本，不读取真实出口来源或网络工具配置。
+`--dry-run` 只使用自动清理的临时数据库；页面明确标记模拟样本，不读取真实出口来源或网络工具配置。
 CLI、SQLite 历史、事件/空窗逻辑及只读 GUI 复用现有实现。macOS 的本机适配器只提供接口名称、
 可用的链路状态、IPv4 路由指纹与默认路由条数；缺失信息明确为未知，systemd 服务不可用。
 真实本机采样需另行显式运行前台 `monitor run`；本次验证仅用 fixtures 与回环服务。

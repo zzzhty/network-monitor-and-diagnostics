@@ -893,10 +893,84 @@ def installation_status(root):
           f"工作区: {'有修改' if git(root, 'status', '--porcelain') else '干净'}", flush=True)
 
 
+MACOS_HELP = """\
+NMD macOS：默认只做监控和诊断，不接管流量
+
+监控和诊断
+  monitor config-check --config FILE
+  monitor run --config FILE --state-dir DIR [--once]
+  monitor status [--state-dir DIR] [--dry-run]
+                                       --dry-run 打印合成快照后退出，不读本机、不建状态目录
+  gui [--state-dir DIR] [--config FILE] [--port PORT] [--dry-run]
+                                       面板可在「设置与帮助」编辑监控配置。
+                                       --dry-run 用合成数据打开面板，不采集本机、不读来源配置
+  machine capabilities | machine status --state-dir DIR
+  desktop install|uninstall|status|autostart on|off
+                                       用户级桌面壳，见 docs/desktop.md
+
+安装、更新、应用
+  bootstrap --manager-only             建立管理安装。macOS 必须带 --manager-only
+  update [--check]                     快进代码。不部署网络，不重载守护
+  apply / refresh                      记录当前版本。已安装守护时先补齐缺少的地理数据，
+                                       再做只读预检，通过后才 daemon restart。
+                                       restart 等于先 stop 再 start。下载或预检失败不 stop。
+                                       不部署 Linux 网络，不改 on_boot，不调用 takeover-start。
+                                       用户 LaunchAgent 不在这次重载里。
+                                       进行中的接管会被 stop 回退。
+                                       on_boot 为 true 时，新的一次开机可能开始接管
+
+实验性常驻守护（按下面的顺序；不是与外部客户端一起用时的默认路径）
+  onboard                              交互终端逐项填写。确认前不下载、不写配置
+  onboard --server ADDR --port PORT
+  onboard --inputs FILE                非交互。不安装 Tailscale。mihomo 不在时才放到
+                                       当前用户可写目录。不加载守护，不把 on_boot 改成 true，
+                                       不执行 apply。不要 sudo
+  macos geodata ensure [--geodata-dir DIR] [--inputs FILE]
+                                       下载缺少的 geosite.dat / geoip.metadb。不要 sudo。
+                                       预检、help、status 和面板不会跑这一步
+  macos preflight [--tier readonly|daemon|takeover]
+                                       只读预检。默认 readonly，不要求 mihomo。不会下载
+  macos daemon init --inputs FILE [--mihomo PATH]
+                                       写入 daemon.json。on_boot 固定为 JSON false。
+                                       拒绝占位地址 203.0.113.20。不覆盖已有文件。不要 sudo
+  macos daemon on-boot [on|off|status]
+                                       只读写 takeover.on_boot。不加载守护，也不开始接管。
+                                       不要 sudo。之后的 start 或 apply 只有在被当成新的一次开机时
+                                       才可能马上接管
+  macos daemon install|uninstall|start|stop|restart|status|takeover-start|takeover-stop
+                                       root supervisor 与用户 daemon。这些动作不改 on_boot。
+                                       restart 等于先 stop 再 start。预检失败则不 stop。
+                                       进行中的接管会被这次 stop 回退
+  macos accept                         2 分钟验收：独立 root 回退进程就绪后才改网络
+  macos takeover|rollback              实验性 sudo 前台接管。见 docs/macos-mihomo-tailscale.md
+
+Linux 的网络部署与 systemd 生命周期在 macOS 不支持。
+子命令一览：nmd macos
+"""
+
+MACOS_SUBCOMMANDS = """\
+nmd macos 子命令。这是实验路径，不是默认监控。总览见 nmd help。
+
+  geodata ensure [--geodata-dir DIR] [--inputs FILE]
+  preflight [--tier readonly|daemon|takeover]
+  daemon init --inputs FILE [--mihomo PATH]
+  daemon on-boot [on|off|status]
+  daemon install|uninstall|start|stop|restart|status|takeover-start|takeover-stop
+  accept --inputs FILE --state-dir DIR
+  takeover --inputs FILE
+  rollback [--state-dir DIR]
+
+restart 等于先 stop 再 start。install、start、restart 和 apply 不改 on_boot。
+init 拒绝占位地址 203.0.113.20。某一条的参数：nmd macos <子命令> --help
+"""
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     command = argv[0] if argv else "help"
     platform = nmd_platform.name()
+    if command == "demo":
+        raise ManagerError("没有 demo 命令。合成数据用 nmd gui --dry-run，或 nmd monitor status --dry-run。")
     if command == "onboard":
         from nmd_onboard import main as onboard_main
         raise SystemExit(onboard_main(argv[1:]))
@@ -910,15 +984,14 @@ def main(argv=None):
                 "网络部署、出口来源、systemd 和桌面壳安装不在此平台。")
         if command in {"help", "--help", "-h"}:
             print("NMD Windows：本机采集与诊断（不接管流量）\n"
-                  "  demo [--once] [--port PORT]  临时合成数据演示\n"
                   "  monitor config-check --config FILE\n"
                   "  monitor run --config FILE [--state-dir DIR] [--once]  前台采集\n"
-                  "  monitor status [--state-dir DIR]\n"
+                  "  monitor status [--state-dir DIR] [--dry-run]  --dry-run 只打印合成快照\n"
                   "  monitor install    登记当前用户的计划任务，不启动、不设登录触发\n"
                   "  monitor enable     登录时启动；不立即采集\n"
                   "  monitor disable    取消登录触发；不停止正在运行的采集\n"
                   "  monitor start|stop|restart|service-status|logs|uninstall\n"
-                  "  gui [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
+                  "  gui [--port PORT] [--dry-run]  面板可编辑监控配置；--dry-run 只用合成数据\n"
                   "  machine capabilities | machine status\n"
                   "  bootstrap          当前用户安装（不要加 --system）\n"
                   "  update [--check]   快进更新代码，不部署网络、不重启任务\n"
@@ -927,7 +1000,7 @@ def main(argv=None):
                   "计划任务在登录后运行，不等同于开机即采集。详见 docs/windows.md。")
             return
     if platform not in ("linux", "windows"):
-        allowed = {"monitor", "gui", "machine", "demo", "help", "--help", "-h", "version"}
+        allowed = {"monitor", "gui", "machine", "help", "--help", "-h", "version"}
         if platform == "macos":
             # User-level shell lifecycle, code update, and an explicit apply that
             # reloads an installed daemon after preflight. That reload can roll
@@ -937,50 +1010,13 @@ def main(argv=None):
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
-                               "（「设置与帮助」页可编辑监控配置）、模拟 demo、"
+                               "（「设置与帮助」页可编辑监控配置）、"
                                "管理安装（bootstrap --manager-only）、代码更新、"
                                "nmd apply / refresh（预检通过后才重载已安装的常驻守护）、"
                                "用户级桌面壳与常驻守护（nmd macos daemon）；"
                                "不管理 Linux 网络部署或 systemd。")
         if command in {"help", "--help", "-h"}:
-            print("NMD macOS：只读诊断（不接管流量）与用户级桌面壳\n"
-                  "  demo [--once] [--port PORT]  临时合成数据演示，不采集本机、不读取来源配置\n"
-                  "  monitor config-check --config FILE\n"
-                  "  monitor run --config FILE --state-dir DIR [--once]  显式前台采集\n"
-                  "  monitor status --state-dir DIR\n"
-                  "  gui [--state-dir DIR] [--config FILE] [--port PORT]  面板可在「设置与帮助」编辑监控配置\n"
-                  "  machine capabilities | machine status --state-dir DIR\n"
-                  "  onboard                 在交互终端里逐项填写。确认前不下载、不写配置\n"
-                  "  onboard --server ADDR --port PORT  或 --inputs FILE  非交互；非终端请用这种写法\n"
-                  "                         检查官方 Tailscale 与 mihomo。缺了就停止，不写配置、不接管。\n"
-                  "                         macOS 不安装 Tailscale。mihomo 不在时才放到当前用户可写的目录。\n"
-                  "                         不加载守护，不把 on_boot 改成 true，不执行 apply。不要 sudo\n"
-                  "  bootstrap --manager-only  建立管理安装（macOS 必须 --manager-only）\n"
-                  "  update [--check]  快进更新代码，不部署网络、不重载守护\n"
-                  "  apply / refresh       记录当前版本；已安装守护时先补齐缺少的地理数据，再做只读预检，通过后才 daemon restart。"
-                  "不部署 Linux 网络。下载或预检失败不 stop。进行中的接管会被 stop 回退；on_boot 为 true 时，新的一次开机可能开始接管\n"
-                  "  desktop install/uninstall/status/autostart on|off  桌面壳，见 docs/desktop.md\n"
-                  "  macos accept           2 分钟验收：独立 root 回退进程就绪后才改网络\n"
-                  "  macos takeover|rollback  实验性 sudo 前台接管（绝对截止，STOP/到期幂等回退），\n"
-                  "                         见 docs/macos-mihomo-tailscale.md\n"
-                  "  macos preflight [--tier readonly|daemon|takeover]\n"
-                  "                         只读预检。默认 readonly，不要求 mihomo；"
-                  "daemon 在 start/restart 之前；takeover 在改网络之前。不会下载\n"
-                  "  macos geodata ensure [--geodata-dir DIR] [--inputs FILE]\n"
-                  "                         下载生成规则缺少的 geosite.dat / geoip.metadb。"
-                  "不要 sudo。预检、help、status 和面板不会跑这一步\n"
-                  "  macos daemon init --inputs FILE [--mihomo PATH]\n"
-                  "                         用真实 Tailnet 地址写入 daemon.json。on_boot 固定为 JSON false。"
-                  "不安装、不加载、不 sudo，拒绝占位地址 203.0.113.20，不覆盖已有文件\n"
-                  "  macos daemon on-boot [on|off|status]\n"
-                  "                         只读写 daemon.json 的 takeover.on_boot（JSON 布尔）。"
-                  "不加载守护，也不开始接管。不要 sudo。"
-                  "之后的 start 或 apply 只有在被当成新的一次开机时才可能马上接管\n"
-                  "  macos daemon install/uninstall/start/stop/restart/status/takeover-start/takeover-stop\n"
-                  "                         常驻守护（root supervisor + 用户 daemon），默认不自动接管；"
-                  "这些动作不改 on_boot。restart 等于先 stop 再 start。预检失败则不 stop。"
-                  "进行中的接管会被这次 stop 回退\n"
-                  "Linux 的网络部署与 systemd 生命周期在 macOS 不支持。")
+            print(MACOS_HELP, end="")
             return
         if command == "version":
             if argv[1:]:
@@ -1061,16 +1097,23 @@ def main(argv=None):
         if argv[1:2] == ["daemon"]:
             from nmd_daemon import cli_daemon
             raise SystemExit(cli_daemon(argv[2:]))
+        if len(argv) == 1 or argv[1] in {"help", "-h", "--help"}:
+            print(MACOS_SUBCOMMANDS, end="")
+            return
+        if argv[1] not in {"accept", "takeover", "rollback",
+                           "rollback-watch", "rollback-sentinel"}:
+            print(MACOS_SUBCOMMANDS, end="", file=sys.stderr)
+            raise SystemExit(2)
         from macos_takeover import main as takeover_cli
         raise SystemExit(takeover_cli(argv[1:]))
-    if command in {"monitor", "gui", "machine", "demo"}:
+    if command in {"monitor", "gui", "machine"}:
         # Observability also works in an uninstalled checkout, without sudo.
         from observability import main as observe
         try:
             kwargs = {"sources_dir": None}
-            if platform == "linux" and command != "demo":
+            if platform == "linux":
                 kwargs["sources_dir"] = source_directory(ROOT)
-            if (platform == "linux" and command != "demo"
+            if (platform == "linux"
                     and (ROOT / ".git").is_dir() and setting(ROOT, "home") == str(ROOT)):
                 scope = scope_of(ROOT)
                 kwargs = {"state_dir": Path(setting(ROOT, "stateDir")),
@@ -1085,7 +1128,7 @@ def main(argv=None):
                         raise ManagerError("系统 monitor 尚未安装；管理员先运行 nmd monitor install。")
                     if _euid() != account.pw_uid:
                         raise ManagerError("系统监控数据仅限 nmd-monitor UID；GUI/读取请由管理员以该身份运行，或使用个人模式。不会放宽权限。")
-            elif (platform == "windows" and command != "demo"
+            elif (platform == "windows"
                     and (ROOT / ".git").is_dir() and setting(ROOT, "home") == str(ROOT)):
                 kwargs = {"state_dir": Path(setting(ROOT, "stateDir")),
                           "config_file": Path(setting(ROOT, "configDir")) / "monitor.json",
@@ -1113,7 +1156,7 @@ def main(argv=None):
         bootstrap(parser.parse_args(argv[1:]))
         return
     if command in ("help", "--help", "-h"):
-        print("通道管理：nmd channel --help（兼容 nmd source；私有配置、显式刷新和选择）\n独立诊断：nmd monitor --help | nmd gui --help | nmd machine capabilities | nmd demo\n\n"
+        print("通道管理：nmd channel --help（兼容 nmd source；私有配置、显式刷新和选择）\n独立诊断：nmd monitor --help | nmd gui --help | nmd machine capabilities\n合成数据：nmd monitor status --dry-run | nmd gui --dry-run\n\n"
               "  onboard                 交互终端逐项填写。端口直接回车为 1080。确认前不下载、不写配置。\n"
               "                         非终端请用 onboard --server ADDR --port 1080 或 --inputs FILE。\n"
               "                         Tailscale 缺失则停止（仓库没有安装器）。\n"

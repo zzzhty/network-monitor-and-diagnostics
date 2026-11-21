@@ -404,6 +404,8 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     run.add_argument("--once", action="store_true")
     status = actions.add_parser("status", help="read recorded state without starting probes")
     status.add_argument("--state-dir", type=Path, default=state_dir or default_state_dir())
+    status.add_argument("--dry-run", action="store_true",
+                        help="print a synthetic snapshot and exit; do not read the host or a state directory")
     check = actions.add_parser("config-check", help="validate configuration without sending probes")
     check.add_argument("--config", type=Path, required=config_file is None, default=config_file)
     gui = commands.add_parser("gui", help="local browser dashboard with node switching; collector is separate")
@@ -411,26 +413,27 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     gui.add_argument("--config", type=Path, default=config_file,
                      help="monitor config file editable on the dashboard (macOS and Windows)")
     gui.add_argument("--port", type=int, default=8765)
+    gui.add_argument("--dry-run", action="store_true",
+                     help="serve a synthetic dashboard; no host collection or private sources")
     machine = commands.add_parser("machine", help="versioned machine-readable interface")
     machine.add_argument("action", choices=["capabilities", "status"])
     machine.add_argument("--state-dir", type=Path, default=state_dir or default_state_dir())
-    demo = commands.add_parser("demo", help="temporary synthetic dashboard; no host collection or private sources")
-    demo.add_argument("--once", action="store_true", help="print a synthetic snapshot and exit without a server")
-    demo.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
     if (args.command == "monitor" and args.action == "run"
             and args.sources_dir is not None and nmd_platform.name() != "linux"):
         parser.error("automatic egress source control is unsupported on this platform")
-    if args.command == "demo":
-        if not 0 <= args.port <= 65535:
-            parser.error("port must be between 0 and 65535")
-        with demo_state() as state:
-            if args.once:
+    if getattr(args, "dry_run", False):
+        if args.command == "monitor" and args.action == "status":
+            with demo_state() as state:
                 print_json(nmd_monitor.read_snapshot(state))
-            else:
+            return
+        if args.command == "gui":
+            if not 0 <= args.port <= 65535:
+                parser.error("port must be between 0 and 65535")
+            with demo_state() as state:
                 print("模拟演示：所有样本均为合成数据，不代表本机网络状态。", flush=True)
                 serve_dashboard(args.port, state, sources_dir=None, config_path=None)
-        return
+            return
     if args.command == "machine" and args.action == "capabilities":
         print_json(nmd_platform.capabilities())
     elif args.command == "machine" or (args.command == "monitor" and args.action == "status"):

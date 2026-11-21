@@ -112,7 +112,7 @@ class PortableEntryTests(unittest.TestCase):
             self.assertEqual(caps['platform'], nmd_platform.name())
             self.assertFalse(caps['network_mutations'])
             self.assertFalse(caps['native_desktop'])
-            result = subprocess.run([str(entry), 'demo', '--once'], env=env,
+            result = subprocess.run([str(entry), 'monitor', 'status', '--dry-run'], env=env,
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             snapshot = json.loads(result.stdout)
@@ -134,18 +134,43 @@ class SafeMacOSCLITests(unittest.TestCase):
                          GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull))
         env.start(); self.addCleanup(env.stop)
 
-    def test_demo_once_is_synthetic_and_never_observes_host_or_reads_sources(self):
+    def test_status_dry_run_is_synthetic_and_never_observes_host_or_reads_sources(self):
         output = io.StringIO()
         with patch.object(nmd_monitor, 'sample_probe', side_effect=AssertionError('real collection')), \
                 patch.object(manager, 'source_directory', side_effect=AssertionError('private sources')), \
                 patch.object(manager, 'setting', side_effect=AssertionError('installed settings')), \
                 redirect_stdout(output):
-            manager.main(['demo', '--once'])
+            manager.main(['monitor', 'status', '--dry-run'])
         snapshot = json.loads(output.getvalue())
         self.assertEqual(snapshot['collector']['data_origin'], 'demo')
         self.assertTrue(snapshot['samples'])
         self.assertTrue(all(sample['synthetic'] for sample in snapshot['samples']))
         self.assertEqual(snapshot['collector']['state'], 'fresh')
+
+    def test_gui_dry_run_serves_synthetic_state_without_reading_the_host(self):
+        seen = {}
+
+        def serve(port, state_dir, sources_dir=None, config_path=None, **kwargs):
+            seen['snapshot'] = nmd_monitor.read_snapshot(state_dir)
+            seen['sources_dir'] = sources_dir
+            seen['config_path'] = config_path
+            seen['port'] = port
+
+        with patch.object(nmd_monitor, 'sample_probe', side_effect=AssertionError('real collection')), \
+                patch.object(observability, 'serve_dashboard', side_effect=serve), \
+                redirect_stdout(io.StringIO()):
+            manager.main(['gui', '--dry-run', '--port', '9'])
+        self.assertEqual(seen['port'], 9)
+        self.assertIsNone(seen['sources_dir'])
+        self.assertIsNone(seen['config_path'])
+        self.assertEqual(seen['snapshot']['collector']['data_origin'], 'demo')
+        self.assertTrue(all(sample['synthetic'] for sample in seen['snapshot']['samples']))
+
+    def test_demo_command_is_rejected(self):
+        with patch.object(nmd_monitor, 'sample_probe', side_effect=AssertionError('real collection')), \
+                patch.object(observability, 'serve_dashboard', side_effect=AssertionError('server')):
+            with self.assertRaisesRegex(manager.ManagerError, '--dry-run'):
+                manager.main(['demo', '--once'])
 
     def test_macos_lifecycle_and_network_commands_fail_before_any_side_effect(self):
         # apply/refresh are allowed: they reload an installed daemon and do not
@@ -177,7 +202,35 @@ class SafeMacOSCLITests(unittest.TestCase):
         self.assertIn('daemon on-boot', text)
         self.assertIn('203.0.113.20', text)
         self.assertIn('不改 on_boot', text)
+        self.assertLess(text.index('监控和诊断'), text.index('安装、更新、应用'))
+        self.assertLess(text.index('安装、更新、应用'), text.index('实验性常驻守护'))
+        self.assertLess(text.index('onboard'), text.index('macos geodata ensure'))
+        self.assertLess(text.index('macos geodata ensure'), text.index('macos preflight'))
+        self.assertLess(text.index('macos daemon init'), text.index('macos daemon on-boot'))
+        self.assertLess(text.index('macos daemon on-boot'), text.index('macos daemon install'))
         self.assertNotIn('apply 与 systemd', text)
+
+    def test_macos_subcommand_index_does_not_enter_takeover(self):
+        for args in (['macos'], ['macos', 'help'], ['macos', '--help']):
+            output = io.StringIO()
+            with self.subTest(args=args), \
+                    patch('macos_takeover.main', side_effect=AssertionError('takeover')), \
+                    redirect_stdout(output):
+                manager.main(args)
+            text = output.getvalue()
+            self.assertIn('geodata ensure', text)
+            self.assertIn('preflight', text)
+            self.assertIn('daemon on-boot', text)
+            self.assertIn('rollback', text)
+
+    def test_unknown_macos_subcommand_lists_entries_and_does_not_enter_takeover(self):
+        error = io.StringIO()
+        with patch('macos_takeover.main', side_effect=AssertionError('takeover')), \
+                patch('sys.stderr', error):
+            with self.assertRaises(SystemExit) as caught:
+                manager.main(['macos', 'nope'])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('geodata ensure', error.getvalue())
 
     def test_linux_apply_deploys_then_verifies_inside_the_same_transaction(self):
         calls = []

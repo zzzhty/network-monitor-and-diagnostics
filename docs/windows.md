@@ -109,7 +109,7 @@ nmd uninstall               # 再去掉 nmd.cmd 和用户 PATH 中的命令目�
 cd D:\Projects\network-monitor-and-diagnostics
 python -c "import sys; print(sys.version); print(sys.executable)"
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\nmd.ps1 machine capabilities
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\nmd.ps1 demo --once
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\nmd.ps1 monitor status --dry-run
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\nmd.ps1 monitor config-check --config .\examples\monitor-local.json
 $state = Join-Path $env:LOCALAPPDATA 'nmd-monitor-preview'
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\nmd.ps1 monitor run --config .\examples\monitor-local.json --state-dir $state --once

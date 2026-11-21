@@ -42,7 +42,7 @@
 | `nmd install` / `monitor install` | C，安装/修复采集单元与配置 | 不 start/enable，不部署网络 | 管理者；uninstall 保留配置与历史 |
 | `nmd monitor start/stop/restart/enable/disable` | N，本地采集服务 | start/restart 后会写历史，并按配置探测/自动评估；enable 不等于 start 或 lingering | 管理者；对应停止/启动操作仍需检查状态 |
 | `nmd gui` | N，启动回环 HTTP 服务 | 不启动采集器；Linux 浏览页面会轮询 sources 并 GET 本地控制器；按钮另可保存通道/策略、更新订阅、测速或切换 | 诊断数据 UID；停止进程关闭面板，不撤销按钮已完成的动作 |
-| `nmd demo --once` / `nmd demo --port 8765` | C，创建临时合成 SQLite；后者另有 N 本地监听 | 不采集本机、不读私有来源，正常退出清理 | 无 sudo；不是零文件写入 |
+| `nmd monitor status --dry-run` / `nmd gui --dry-run` | C，创建临时合成 SQLite；后者另有 N 本地监听 | 不采集本机、不读私有来源，正常退出清理 | 无 sudo；不是零文件写入 |
 | `nmd monitor run --config FILE --state-dir DIR [--once]` | C/N，前台采集并写历史 | 读取本机元数据；主动探测由 config 决定；Linux 的 sources-dir 可启用自动评估 | 数据所属 UID；Ctrl-C 停止，已有历史保留 |
 | `nmd source select <节点ID> --confirm` | C/N，保存并 PUT selector | 改变已部署节点的运行出口，回读确认；不重启服务 | 管理者；回切需重新确认原节点 |
 | `nmd onboard` | C，用户自己的端点文件或 `daemon.json`；失败不写 | 无参数或 `--interactive` 只在交互终端逐项询问，确认前不下载、不写。Linux：Tailscale 缺失则停。mihomo 缺失时只下载 `fetch-assets.sh` 的 deb，不 dpkg、不 setup、不 apply、不改 DNS。macOS：不下载 Tailscale；mihomo 只在用户可写目录放入单独固定版本的官方 Darwin 二进制；已有版本不兼容则停止。不加载守护，不把 `on_boot` 改成 true，不接管 | 不要 sudo。非终端请用 `--server`/`--inputs`。Windows 直接拒绝。占位地址不写 |
@@ -53,7 +53,7 @@
 源码边界：[manager.py](../scripts/manager.py)、[local-setup.sh](../local-setup.sh)、
 [egress_sources.py](../scripts/egress_sources.py)、[observability.py](../scripts/observability.py)。
 `machine capabilities` 描述平台能力；实际面板还须看 `/api/capabilities` 的有效能力。
-Linux GUI 有保存 Channel、重命名、更新订阅、策略、测速、选择六类 POST 路由；macOS 和 demo 拒绝这些写/控制请求。
+Linux GUI 有保存 Channel、重命名、更新订阅、策略、测速、选择六类 POST 路由；macOS 和 `--dry-run` 拒绝这些写/控制请求。
 
 ## 2. 从已有证据开始
 
@@ -172,7 +172,7 @@ Store 打开旧库时幂等创建；行数与时间窗口取交集，仍保留�
 
 ### 3.6 macOS 能力缺失
 
-macOS 支持源码 help/version、demo、monitor config-check/run/status、gui、machine
+macOS 支持源码 help/version、monitor config-check/run/status、gui（两者都可加 `--dry-run`）、machine
 capabilities/status，以及管理安装（bootstrap --manager-only）、代码更新 update 与
 用户级桌面壳 desktop（见 desktop.md）；source/channel、网络管理、systemd 动作与
 monitor 安装仍提前拒绝。这里“只读诊断”指不管理网络/系统服务，前台采集仍会写私有历史。

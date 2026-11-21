@@ -212,7 +212,7 @@ def capabilities():
         limitations = []
     return dict(schema_version=1, component='nmd-observability', read_only_gui=platform != 'linux',
                 local_egress_control=platform == 'linux',
-                commands=['monitor run', 'monitor status', 'monitor config-check', 'gui', 'demo'],
+                commands=['monitor run', 'monitor status', 'monitor config-check', 'gui'],
                 platform=platform, supported_platforms=['linux', 'macos', 'windows'],
                 network_mutations=False, native_desktop=False,
                 local_observations=dict(interfaces=platform in ('linux', 'macos', 'windows'),
