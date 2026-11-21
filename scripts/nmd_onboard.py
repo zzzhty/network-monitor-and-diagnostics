@@ -6,8 +6,8 @@ writes a user-owned env file. It does not run ``dpkg``, ``setup``, or
 ``apply``, and this repository has no Tailscale installer.
 
 macOS never downloads or installs Tailscale. When mihomo is missing it may
-place the official darwin binary from the same GitHub release as
-``fetch-assets.sh`` into a directory the current user can write, without
+place the separately pinned official darwin binary into a directory the
+current user can write, without
 sudo. A missing component, a failed download, or an invalid address stops
 the command before any config is written.
 """
@@ -48,7 +48,7 @@ _MACHO = (
 )
 _DOC_PREFIXES = ("192.0.2.", "198.51.100.", "203.0.113.")
 _ENV_LINE = re.compile(r"^(NMD_VPS_PUB|NMD_VPS_TS_IP)=([0-9.]+)$")
-_VERSION = re.compile(r"^VER=(v\d+\.\d+\.\d+)\s*$", re.MULTILINE)
+DARWIN_MIHOMO_VERSION = (1, 19, 34)
 _RELEASE = "https://github.com/MetaCubeX/mihomo/releases/download/"
 _CANDIDATE_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/local/sbin")
 _DEFAULT = object()
@@ -73,8 +73,9 @@ Linux 上端口直接回车使用 1080。代理名直接回车使用 VPS。地�
 
 macOS 不下载、不安装 Tailscale。mihomo 不在候选路径上时，只有存在当前用户
 可写的目录（优先 /opt/homebrew/bin，其次 /usr/local/bin，否则 ~/.local/bin）
-才会从与 fetch-assets.sh 相同的官方发布下载 darwin 包并放入该目录。
-下载失败或没有可写目录则停止，不写 daemon.json。on_boot 保持 false，
+才会下载单独固定版本的官方 darwin 包并放入该目录。
+下载失败、没有可写目录，或已有二进制不满足 native DNS 版本要求时停止，不写 daemon.json。
+on_boot 保持 false，
 不加载 LaunchDaemon，不执行 nmd apply。
 
 Linux 上 Tailscale 缺失则停止：仓库没有 Tailscale 安装器。mihomo 缺失时
@@ -126,6 +127,11 @@ def _remediation(token):
         "mihomo_missing": (
             "没有可执行的 mihomo，而且没能放到用户可写目录。"
             "请自行安装官方 mihomo 后重试。没有写入配置。"),
+        "mihomo_native_dns_version_unsupported": (
+            "已有 mihomo 不满足 macOS native DNS 的最低版本要求。"
+            "请自行更新官方二进制后重试；onboard 不会覆盖它，也没有写入配置。"),
+        "mihomo_native_dns_version_unknown": (
+            "无法确认已有 mihomo 的版本；请检查 mihomo -v 并重试。没有写入配置。"),
         "mihomo_unusable": "mihomo 路径不可用。onboard 不会覆盖它，也不会继续。",
         "mihomo_download_failed": (
             "官方 mihomo 发布包没有下载成功。没有写入配置，也没有开始接管。"),
@@ -144,13 +150,19 @@ def _remediation(token):
     return text.get(token, "命令已停止，没有写入网络配置。")
 
 
-def release_version(root=None):
-    """The version pin in fetch-assets.sh. macOS uses the same release."""
-    script = Path(root or Path(__file__).resolve().parents[1]) / "fetch-assets.sh"
-    match = _VERSION.search(script.read_text(encoding="utf-8"))
-    if match is None:
-        raise OnboardError("mihomo_version_unknown")
-    return match.group(1)
+def darwin_release_version():
+    if DARWIN_MIHOMO_VERSION < macos_preflight.NATIVE_DNS_MODE_VERSION:
+        raise OnboardError("mihomo_native_dns_version_unsupported")
+    return "v" + ".".join(map(str, DARWIN_MIHOMO_VERSION))
+
+
+def _require_native_dns_version(path, probe):
+    result = probe(path)
+    parsed = result.get("parsed")
+    if result.get("status") != "pass" or not isinstance(parsed, tuple):
+        raise OnboardError("mihomo_native_dns_version_unknown")
+    if parsed < macos_preflight.NATIVE_DNS_MODE_VERSION:
+        raise OnboardError("mihomo_native_dns_version_unsupported")
 
 
 def darwin_asset_url(version, machine):
@@ -490,7 +502,7 @@ def _outside_repository(path):
         raise OnboardError("config_not_regular")
 
 
-def _write_daemon(path, inputs, mihomo):
+def _write_daemon(path, inputs, mihomo, *, installed, probe_version):
     path = Path(path)
     _outside_repository(path)
     try:
@@ -531,6 +543,15 @@ def _write_daemon(path, inputs, mihomo):
     if config["takeover"]["on_boot"] is True and info is None:
         raise OnboardError("invalid_on_boot")
     nmd_daemon._require_trusted_path(path)
+    takeover = config["takeover"]
+    effective_mihomo = takeover["mihomo_path"] or mihomo
+    profile = takeover["profile"]
+    native_dns = profile is None or profile["dns_mode"]["selected"] == "native"
+    # Existing binaries (including a preserved explicit path) need a bounded
+    # version probe. Newly placed assets use the checked official release pin;
+    # do not start a downloaded program during onboarding.
+    if native_dns and (not installed or effective_mihomo != mihomo):
+        _require_native_dns_version(effective_mihomo, probe_version)
     if info is None:
         macos_prepare._create_private_parents(path.parent)
     nmd_daemon.write_daemon_config(path, config)
@@ -596,7 +617,7 @@ def _default_fetch():
 def main(argv, *, platform=None, find_tailscale=None, find_mihomo=None,
          fetch_linux_assets=None, download=None, install_directories=_DEFAULT,
          fallback_dir=_DEFAULT, daemon_path=None, env_path=None, machine=None,
-         stdin_is_tty=None, read_line=None, prompt_write=None):
+         stdin_is_tty=None, read_line=None, prompt_write=None, probe_version=None):
     if any(arg in ("-h", "--help") for arg in argv):
         sys.stdout.write(HELP)
         return 0
@@ -651,7 +672,8 @@ def main(argv, *, platform=None, find_tailscale=None, find_mihomo=None,
     try:
         if platform == "macos":
             path = Path(daemon_path) if daemon_path is not None else _daemon_path()
-            on_boot = _write_daemon(path, inputs, mihomo)
+            on_boot = _write_daemon(path, inputs, mihomo, installed=installed,
+                                    probe_version=probe_version or macos_preflight.probe_version)
             extra = {"on_boot": on_boot}
         else:
             path = Path(env_path) if env_path is not None else _env_path()
@@ -741,7 +763,7 @@ def _ensure_mihomo(platform, *, find_mihomo, fetch_linux_assets, download,
     directory = choose_install_dir(directories, fallback)
     if directory is None:
         raise OnboardError("mihomo_install_unavailable")
-    version = release_version()
+    version = darwin_release_version()
     url = darwin_asset_url(version, machine or os.uname().machine)
     blob = (download or curl_bytes)(url)
     binary = unpack_darwin_gzip(blob)

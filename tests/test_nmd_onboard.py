@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import macos_coexist
+import macos_preflight
 import nmd_daemon
 import nmd_onboard
 import nmd_platform
@@ -62,6 +63,7 @@ class OnboardTests(unittest.TestCase):
         kwargs.setdefault("install_directories", [])
         kwargs.setdefault("fallback_dir", self.bindir)
         kwargs.setdefault("machine", "arm64")
+        kwargs.setdefault("probe_version", lambda path: {"status": "pass", "parsed": (1, 19, 33)})
         kwargs.setdefault("stdin_is_tty", False)
         kwargs.setdefault("read_line", lambda: (_ for _ in ()).throw(AssertionError("read")))
         with contextlib.ExitStack() as stack:
@@ -71,18 +73,77 @@ class OnboardTests(unittest.TestCase):
                 code = nmd_onboard.main(list(argv), **kwargs)
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_release_url_matches_fetch_assets_version(self):
-        version = nmd_onboard.release_version(ROOT)
+    def test_darwin_release_assets_and_linux_defaults(self):
+        version = nmd_onboard.darwin_release_version()
+        self.assertGreaterEqual(nmd_onboard.DARWIN_MIHOMO_VERSION,
+                                macos_preflight.NATIVE_DNS_MODE_VERSION)
+        self.assertEqual(version, "v1.19.34")
+        for host, arch in (("arm64", "arm64"), ("x86_64", "amd64")):
+            with self.subTest(host=host):
+                self.assertEqual(nmd_onboard.darwin_asset_url(version, host),
+                                 "https://github.com/MetaCubeX/mihomo/releases/download/"
+                                 f"v1.19.34/mihomo-darwin-{arch}-v1.19.34.gz")
         text = (ROOT / "fetch-assets.sh").read_text(encoding="utf-8")
-        self.assertIn(f"VER={version}", text)
         self.assertIn("mihomo-linux-$ARCH-$VER.deb", text)
-        url = nmd_onboard.darwin_asset_url(version, "arm64")
-        self.assertEqual(
-            url,
-            f"https://github.com/MetaCubeX/mihomo/releases/download/{version}/"
-            f"mihomo-darwin-arm64-{version}.gz")
         self.assertIn("VPS_PORT=1080", (ROOT / "local-setup.sh").read_text(encoding="utf-8"))
         self.assertEqual(nmd_onboard.LINUX_SOCKS_PORT, 1080)
+
+    def test_existing_old_or_unknown_mihomo_is_not_overwritten(self):
+        for result, error in (
+                ({"status": "pass", "parsed": (1, 19, 30)}, "unsupported"),
+                ({"status": "unknown", "parsed": None}, "unknown"),
+                ({"status": "unknown", "parsed": (1, 19, 34)}, "unknown")):
+            with self.subTest(result=result):
+                code, out, err = self.invoke(
+                    ["--server", SERVER4, "--port", "1081"], platform="macos",
+                    find_tailscale=lambda platform: "/usr/local/bin/tailscale",
+                    find_mihomo=lambda platform: "/usr/local/bin/mihomo",
+                    probe_version=lambda path: result,
+                    download=AssertionError("do not replace an existing binary"))
+                self.assertEqual(code, 1, err)
+                self.assertEqual(out, "")
+                self.assertEqual(json.loads(err)["error"], f"mihomo_native_dns_version_{error}")
+                self.assertFalse(self.daemon.exists())
+
+    def test_existing_config_checks_its_preserved_mihomo_override(self):
+        old = str(self.bindir / "mihomo")
+        nmd_daemon.write_daemon_config(self.daemon, {
+            "schema_version": 1, "dashboard": {"port": 8765},
+            "takeover": {"inputs": {"proxy_name": "VPS", "server": SERVER4, "port": 1080},
+                         "profile": None, "on_boot": False, "check_interval_seconds": 20,
+                         "critical_failures": 3, "mihomo_path": old, "state_dir": None}})
+        original = self.daemon.read_bytes()
+        probes = []
+
+        def probe(path):
+            probes.append(path)
+            return {"status": "pass", "parsed": (1, 19, 30)}
+
+        code, _, err = self.invoke(
+            ["--server", SERVER, "--port", "1081"], platform="macos",
+            find_tailscale=lambda platform: "/usr/local/bin/tailscale",
+            find_mihomo=lambda platform: "/usr/local/bin/mihomo", probe_version=probe)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(probes, [old])
+        self.assertEqual(self.daemon.read_bytes(), original)
+
+    def test_existing_disabled_dns_profile_does_not_require_native_version(self):
+        profile = json.loads((ROOT / "examples/macos-mihomo-coexist.experiment.json").read_text())
+        self.assertEqual(profile["dns_mode"]["selected"], "native")
+        profile["dns_mode"]["selected"] = "disabled"
+        profile["dns_mode"]["system_dns"] = None
+        original = {"schema_version": 1, "dashboard": {"port": 8765},
+                    "takeover": {"inputs": {"proxy_name": "VPS", "server": SERVER4, "port": 1080},
+                                 "profile": profile, "on_boot": False, "check_interval_seconds": 20,
+                                 "critical_failures": 3, "mihomo_path": None, "state_dir": None}}
+        nmd_daemon.write_daemon_config(self.daemon, original)
+        code, _, err = self.invoke(
+            ["--server", SERVER, "--port", "1081"], platform="macos",
+            find_tailscale=lambda platform: "/usr/local/bin/tailscale",
+            find_mihomo=lambda platform: "/usr/local/bin/mihomo",
+            probe_version=lambda path: self.fail("disabled DNS has no native version gate"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(nmd_daemon.load_daemon_config(self.daemon)["takeover"]["profile"], profile)
 
     def test_macos_stops_when_tailscale_is_missing_and_does_not_download(self):
         code, out, err = self.invoke(
@@ -116,7 +177,7 @@ class OnboardTests(unittest.TestCase):
         self.assertIs(body["takeover_started"], False)
         self.assertIs(body["apply_ran"], False)
         self.assertEqual(self.calls[0][0], "download")
-        self.assertIn("mihomo-darwin-arm64-", self.calls[0][1])
+        self.assertTrue(self.calls[0][1].endswith("/v1.19.34/mihomo-darwin-arm64-v1.19.34.gz"))
         self.assertNotIn("fetch", self.calls)
         binary = self.bindir / "mihomo"
         self.assertEqual(stat.S_IMODE(binary.stat().st_mode) & 0o777, 0o755)
