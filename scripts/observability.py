@@ -302,6 +302,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if "error" in reply:
             self.json_response(503, {"schema_version": 1, "error": "daemon_unavailable"})
             return
+        import nmd_daemon
+        if not nmd_daemon.stop_result_finished(reply):
+            self.json_response(409, {"schema_version": 1, "error": "rollback_incomplete",
+                                     "daemon": reply})
+            return
         self.json_response(200, {"result": "stop_requested", "daemon": reply})
 
     def do_POST(self):

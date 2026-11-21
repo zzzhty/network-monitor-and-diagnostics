@@ -183,6 +183,22 @@ class DaemonEndpointTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(json.loads(body)['error'], 'daemon_unavailable')
 
+    def test_incomplete_stop_is_a_conflict_not_a_success(self):
+        self.bridge.stop_reply = {"result": "rollback_incomplete", "reason": "manual_stop"}
+        status, body = self.request('/api/daemon/takeover/stop', method='POST', body={})
+        self.assertEqual(status, 409)
+        payload = json.loads(body)
+        self.assertEqual(payload['error'], 'rollback_incomplete')
+        self.assertEqual(payload['daemon']['result'], 'rollback_incomplete')
+
+    def test_finished_stop_results_stay_successful(self):
+        for result in ("rollback_restored", "not_active", "stopped"):
+            with self.subTest(result=result):
+                self.bridge.stop_reply = {"result": result}
+                status, body = self.request('/api/daemon/takeover/stop', method='POST', body={})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(json.loads(body)['result'], 'stop_requested')
+
     def test_without_a_bridge_the_routes_stay_closed(self):
         self.server.daemon_client = None
         status, _ = self.request('/api/daemon/status')

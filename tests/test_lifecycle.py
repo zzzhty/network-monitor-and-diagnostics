@@ -315,6 +315,44 @@ class LifecycleTests(LifecycleFixture, unittest.TestCase):
         self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), old)
         self.assertEqual(self.event_lines(), before)
 
+    def test_failed_fast_forward_restores_the_previous_pending_flag(self):
+        self.assert_ok(self.install("--manager-only"))
+        head = self.git(self.root, "rev-parse", "HEAD")
+        self.git(self.root, "config", "nmd.appliedRevision", head)
+        scripts = self.root / "scripts"
+        marker = self.source / "scripts/nmd_platform.py"
+        for previous in ("unset", "false", "true"):
+            with self.subTest(previous=previous):
+                if previous == "unset":
+                    subprocess.run(
+                        ["git", "-C", str(self.root), "config", "--unset", "nmd.pendingApply"],
+                        env=self.env, capture_output=True)
+                else:
+                    self.git(self.root, "config", "nmd.pendingApply", previous)
+                marker.write_text(marker.read_text(encoding="utf-8") + f"\n# {previous}\n",
+                                  encoding="utf-8")
+                self.commit(previous)
+                self.git(self.source, "push", "origin", "main")
+                before = (scripts / "nmd_platform.py").read_text(encoding="utf-8")
+                os.chmod(scripts, 0o555)
+                try:
+                    result = self.invoke("update")
+                finally:
+                    os.chmod(scripts, 0o755)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+                self.assertEqual((scripts / "nmd_platform.py").read_text(encoding="utf-8"), before)
+                self.assertEqual(self.git(self.root, "status", "--porcelain"), "")
+                got = subprocess.run(
+                    ["git", "-C", str(self.root), "config", "--get", "nmd.pendingApply"],
+                    env=self.env, capture_output=True, text=True)
+                if previous == "unset":
+                    self.assertNotEqual(got.returncode, 0)
+                    self.assertEqual(got.stdout.strip(), "")
+                else:
+                    self.assertEqual(got.stdout.strip(), previous)
+                self.assertEqual(self.git(self.root, "config", "nmd.appliedRevision"), head)
+
     def test_invalid_python_candidate_and_remote_failure_leave_old_installation(self):
         self.assert_invalid_candidate_preserves_installation("python")
 

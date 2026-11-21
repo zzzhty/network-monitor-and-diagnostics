@@ -144,6 +144,8 @@ def _remediation(token):
             "仓库里的 dpkg -i 写在 setup/apply 里，那些命令还会改 DNS。"
             "onboard 不会执行 dpkg、setup 或 apply。请自行安装到 /usr/bin/mihomo 后重试。"),
         "config_not_regular": "配置路径不是当前用户拥有的普通文件。没有覆盖它。",
+        "config_group_or_world_writable": (
+            "端点文件或其父目录可被其他用户替换。没有改写，也没有下载。"),
         "config_unreadable": "现有配置读不出来。没有改它。",
         "env_invalid": "现有端点文件含有允许之外的内容。没有改写。",
     }
@@ -593,6 +595,9 @@ def _read_env(path):
 def _write_linux_env(path, server):
     path = Path(path)
     _outside_repository(path)
+    # The same-address return writes nothing, but it still has to refuse an
+    # untrusted path. A later run must not treat that file as already checked.
+    nmd_daemon._require_trusted_path(path)
     existing = _read_env(path)
     if existing is not None and existing.get("NMD_VPS_TS_IP") == server:
         return False
@@ -653,6 +658,7 @@ def main(argv, *, platform=None, find_tailscale=None, find_mihomo=None,
         try:
             env_target = Path(env_path) if env_path is not None else _env_path()
             _outside_repository(env_target)
+            nmd_daemon._require_trusted_path(env_target)
             _read_env(env_target)
         except OnboardError as exc:
             return _fail(str(exc), _remediation(str(exc)))

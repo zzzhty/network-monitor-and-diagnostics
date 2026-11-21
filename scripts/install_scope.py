@@ -234,6 +234,49 @@ def _service_access(path, uid, gid, directory=False):
         raise ScopeError(f"nmd-monitor 服务账户无法读取: {path}")
 
 
+def _mkdir_private(path, mode):
+    """Create missing directories at ``mode`` regardless of umask.
+
+    Only components that did not exist are chmodded, and only through a
+    no-follow directory fd. An existing group-writable directory stays as it
+    is so the caller can refuse it instead of repairing it.
+    """
+    path = Path(path)
+    missing = []
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise ScopeError(f"安装路径不能含符号链接: {current}")
+        break
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, mode)
+        except FileExistsError:
+            info = directory.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ScopeError(f"安装路径不能含符号链接: {directory}")
+            continue
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(directory, flags)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
+
 def _directory(path, mode, uid, gid=None, private=False):
     _plain_path(path)
     for parent in path.parents:
@@ -251,10 +294,9 @@ def _directory(path, mode, uid, gid=None, private=False):
         if not path.is_dir() or info.st_uid != uid or bad_mode:
             raise ScopeError(f"目录的所有者或权限不安全，未修改: {path}")
         return
-    path.mkdir(parents=True, mode=mode)
-    path.chmod(mode)
+    _mkdir_private(path, mode)
     if gid is not None:
-        os.chown(path, uid, gid)
+        os.chown(path, uid, gid, follow_symlinks=False)
 
 
 def _atomic_write(path, text, mode, uid=None, gid=None):

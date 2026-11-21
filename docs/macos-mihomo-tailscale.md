@@ -291,13 +291,12 @@ admin 组可用；面板按钮同路经）+ 开机策略（`daemon.json` 的 `on
 关；同 boot 的 KeepAlive 重启永不自动续接，防振荡）。用户 daemon（登录
 LaunchAgent）监督采集线程（配置变更即重载）并常驻面板（复用
 `DashboardServer`）；桌面壳经既有复用路径连接，不再 spawn。每次接管前——
-包括开机——**重新快照**，新的一次接管不拿上一次的快照当切网前状态。切网前
-把本次快照文件名写入 `rollback-pin.json`，再清 exit node；中途崩溃时回退用的
+包括开机——**重新快照**，新的一次接管不拿上一次的快照当切网前状态。只有这次快照里的 prefs 状态是 `observed`（含明确的空出口）才把快照文件名写入 `rollback-pin.json` 并清 exit node。prefs 缺失、命令失败，或 `tailscale debug prefs` / `scutil --dns` 非零退出（即使 stdout 像一份结果、error 为空）都不是可恢复观察，这时零网络变更，不写 pin。切网之后中途崩溃时回退用的
 就是这份 pin（会话文件里的 `snapshot_name` 同一份），而不是清掉 exit node
 之后新拍到的快照。root 启动时先按会话回收残留：
 `active`、`starting` 和 `needs_rollback` 都先回退。回退结果不是
-`rollback_restored`（native DNS 仍有 198.18、prefs 读不到、exit node 无法
-安全写回、或某一块网卡 DNS 失败）时阶段留在 `needs_rollback`，管理器稍后重试
+`rollback_restored`（native DNS 仍有 198.18、快照里没有可读 prefs、现场 prefs 读不到、exit node 无法
+安全写回、或某一块网卡 DNS 失败）时阶段留在 `needs_rollback`，结果是 `rollback_incomplete` 而不是 `rollback_restored`。管理器稍后重试
 这一次恢复，**不会**因此再开一轮接管，`takeover.start` 在此期间返回
 `rollback_pending`。恢复完成后也不自动再接管。原先的 `critical_failures` 等开机抑制结果在这次恢复里保留，不会被改写成 `recovered_leftovers`，因此 `on_boot` 不会在恢复刚完成时再开一轮接管。策略清单见
 `macos_coexist.DAEMON_POLICY`；单次路径的 `ROLLBACK_POLICY` 不变，两者互斥靠
@@ -307,7 +306,7 @@ TCP 连接；TCP 成功只说明端口接受了握手，不是应用成功，HTT
 安装/卸载/生命周期：`nmd macos daemon install|uninstall|start|stop|restart|status|
 takeover-start|takeover-stop`（收据独立 `daemonReceipt`，sudo 只用于 root plist 与
 launchctl；这些动作不改 `on_boot`。面板只能停接管，启动需 `takeover-start` 的 uid-0 对端）。`restart`
-等于先 `stop` 再 `start`；`stop` 失败则不 `start`。`stop` 会
+等于先 `stop` 再 `start`；`stop` 失败则不 `start`。`stop` 和 `takeover-stop` 只有在回退结果是 `rollback_restored`，或当时没有进行中的接管（`not_active`，或切网前的 `stopped`）时才以退出码 0 结束。回退不完整、解析器仍有 198.18，或等待超时是失败，并且不会 bootout 仍在回退的管理器。阶段已是 `needs_rollback` 时，再次 stop 会再试一次回退；仍未完成则继续失败，不 bootout。成功的 `stop` 才会
 `bootout` 系统任务，`start` 在 `kickstart` 发现任务未加载时用已安装的 plist
 重新 `bootstrap` 再 `kickstart`。卸载同时 `bootout` 当前用户的 LaunchAgent。
 示例配置 `examples/macos-daemon.json`（占位地址 `203.0.113.20`，`init` / `install` / `start` 都拒绝占位，不会拿它生成一份可用配置）。
@@ -345,7 +344,7 @@ state 目录、mihomo 工作目录和 daemon 配置在写入或读取前按路�
 
 生成配置不写 `geodata-mode`。mihomo 1.19 的 `GEOIP` 因此读 MMDB：`geoip.metadb`，或目录里已有且带 MaxMind 标记的 `Country.mmdb` / `geoip.db`。`geoip.dat` 只在 `geodata-mode` 打开时使用，ensure 不下载它。空文件、网页或截断内容不会被当成已经备好；下载失败时原文件保持不变，并且这次启动、重启或接管不会继续。`GEOSITE` 读 `geosite.dat`（与 `GeoSite.dat` 大小写不敏感）。下载地址与 Linux `fetch-assets.sh` 相同，是 MetaCubeX `meta-rules-dat` `latest` 上的这两个文件，并用旁边的 `.sha256sum` 核对；Linux 脚本本身不改，也不做这项核对。规则没有对应前缀时不下载那个文件。已有合法文件时不访问网络。下载失败不会替换原文件，也不会进入 sudo、stop 或改网络。`preflight` 只报告，并给出这条命令。
 
-一次 takeover 的顺序：确认 state 与 geodata 路径 → 生成配置并写入私有 state 目录 → 按上面的 argv 做 `mihomo -t`（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 把快照文件名写入 `rollback-pin.json` → 清 exit node → 启动自有进程组，并用 `ps -p <pid> -o lstart=,args=` 记下启动时间和完整 argv → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；TCP 成功不是应用成功；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过。独立 `rollback` 先读 pin（没有 pin 才用最新的普通 `pre-start-*.json`，跳过符号链接），再只在启动时间、完整 argv 和 `-d` 工作目录都与记录一致、且该 pid 仍是会话组长时发信号。对不上就不发信号。然后确认 scutil 无 198.18，再恢复 exit node、allow-lan（`=true`/`=false`）、accept-dns 和每块网卡 DNS。exit node 先按当时的 `tailscale status --json` 把 ExitNodeID 对上仍在通告出口的对端，取它的 Tailscale IP；没有 IP 才用 MagicDNS 基名。对不上时用快照里的 `exit_node_cli`，再不行用 prefs 里的 ExitNodeIP。这些都不是 CLI 接受的形式时记 `exit_node_unrestorable`，不把 StableNodeID 发给 `tailscale set`。`tailscale set` 非零时，stderr 的一行写进私有回退结果的 `failures`（凭据形如 `tskey-` 会抹掉），进程输出的 JSON 也带这个 `failures`；这一步失败不会跳过 accept-dns、allow-lan 和后面的网卡 DNS。198.18 还在时报 `rollback_blocked_dirty_dns` 并且不恢复 exit node。快照里没有可读 prefs 时不动 exit node。某一块网卡失败不会跳过后面的网卡，结果是 `rollback_incomplete`。回退不删除 state 目录里的已有文件、pin 或快照。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
+一次 takeover 的顺序：确认 state 与 geodata 路径 → 生成配置并写入私有 state 目录 → 按上面的 argv 做 `mihomo -t`（失败即止，零变更）→ Phase A 快照与前置断言（scutil 已无 198.18、无 mihomo 进程）→ 只有 prefs 已观察（含明确的空出口）才把快照文件名写入 `rollback-pin.json` 并清 exit node；prefs 读失败则零网络变更 → 启动自有进程组，并用 `ps -p <pid> -o lstart=,args=` 记下启动时间和完整 argv → 就绪轮询（native DNS 登记）→ watchdog（20 秒周期：Tailscale status + 经系统路径对 VPS SOCKS 的 TCP；TCP 成功不是应用成功；任一关键检查失败的周期记一次故障，连续 3 个故障周期回退；全过的周期重置计数）→ STOP / 到期 / 故障阈任一触发回退。绝对截止默认 10 分钟、上限 8 小时、到期不续期；Ctrl-C（SIGINT/SIGTERM）即回退。回退幂等：flock 序列化同秒重复回退，每步先读现状一致即跳过。独立 `rollback` 先读 pin（没有 pin 才用最新的普通 `pre-start-*.json`，跳过符号链接），再只在启动时间、完整 argv 和 `-d` 工作目录都与记录一致、且该 pid 仍是会话组长时发信号。对不上就不发信号。然后确认 scutil 无 198.18，再恢复 exit node、allow-lan（`=true`/`=false`）、accept-dns 和每块网卡 DNS。exit node 先按当时的 `tailscale status --json` 把 ExitNodeID 对上仍在通告出口的对端，取它的 Tailscale IP；没有 IP 才用 MagicDNS 基名。对不上时用快照里的 `exit_node_cli`，再不行用 prefs 里的 ExitNodeIP。这些都不是 CLI 接受的形式时记 `exit_node_unrestorable`，不把 StableNodeID 发给 `tailscale set`。`tailscale set` 非零时，stderr 的一行写进私有回退结果的 `failures`（凭据形如 `tskey-` 会抹掉），进程输出的 JSON 也带这个 `failures`；这一步失败不会跳过 accept-dns、allow-lan 和后面的网卡 DNS。198.18 还在时报 `rollback_blocked_dirty_dns` 并且不恢复 exit node。快照里没有可读 prefs 时不动 exit node。某一块网卡失败不会跳过后面的网卡，结果是 `rollback_incomplete`。回退不删除 state 目录里的已有文件、pin 或快照。运行记录与心跳写入同一 state 目录（`takeover-*.json`、`watchdog-heartbeat`）。
 
 ```bash
 sudo nmd macos takeover --inputs /path/to/inputs.json --minutes 10 \

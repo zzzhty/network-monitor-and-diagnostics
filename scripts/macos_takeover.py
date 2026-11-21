@@ -920,17 +920,20 @@ def scutil_has_no_198_18(runner=None, deadline_seconds=CLEANUP_TIMEOUT_SECONDS,
     A single unreadable ``scutil`` is not a reason to abort the whole restore.
     It stays "not confirmed" until the deadline, and the caller then refuses
     to put the old exit node back on top of a resolver it could not check.
+    Non-zero exits, empty output, and runner errors are all unreadable.
     """
     sleep = sleep or time.sleep
     now = now or time.monotonic
     stop_at = now() + deadline_seconds
     while True:
         try:
-            _, text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
+            code, text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
         except TakeoverError:
             confirmed = None
         else:
-            confirmed = macos_prepare._parse_scutil_dns(0, text, None)["has_198_18"]
+            # A non-zero exit is not a clean resolver list, even when stdout
+            # parses and the runner recorded no error string.
+            confirmed = macos_prepare._parse_scutil_dns(code, text, None)["has_198_18"]
         if confirmed is False:
             return True
         if now() >= stop_at:
@@ -991,8 +994,11 @@ def restore_tailscale(prefs, tailscale_path, runner=None, mutator=None, *,
 
     If the snapshot could not read prefs at all, nothing is restored here:
     clearing whatever exit node happens to be set now would be a destructive
-    guess, not a restore. A live prefs read that fails is reported and also
-    changes nothing; the caller treats that as an incomplete rollback.
+    guess, not a restore. A live prefs read that fails — including a non-zero
+    exit with stdout and no runner error — is reported and also changes
+    nothing. That failure is not an empty exit. The caller treats either
+    case as an incomplete rollback. An observed document whose exit keys are
+    present and blank is a real empty exit and may match without a write.
 
     The exit-node argument is an IP or a MagicDNS base name. One failed
     ``tailscale set`` does not skip accept-dns, allow-lan, or later NIC DNS.
@@ -1006,6 +1012,13 @@ def restore_tailscale(prefs, tailscale_path, runner=None, mutator=None, *,
         current = read_prefs(tailscale_path, runner=runner)
     except TakeoverError as exc:
         return ["prefs_unreadable"], [{"step": "prefs", "error": str(exc), "detail": exc.detail}]
+    if not isinstance(current, dict) or current.get("status") != "observed":
+        # A failed live read is not an empty exit. Do not clear or rewrite
+        # from it, and do not treat the two failures as a match.
+        reason = current.get("reason") if isinstance(current, dict) else None
+        return ["prefs_unreadable"], [{
+            "step": "prefs", "error": reason or "prefs_unreadable", "detail": None,
+        }]
     if macos_prepare.exits_match(prefs, current):
         want_id, want_ip = macos_prepare.exit_identity(prefs)
         steps.append("exit_node_already_set" if want_id or want_ip else "exit_node_was_empty")
@@ -1075,8 +1088,8 @@ def restore_service_dns(services, runner=None, mutator=None):
 
 
 def read_prefs(tailscale_path, runner=None):
-    _, text = read_state([tailscale_path, "debug", "prefs"], runner=runner)
-    return macos_prepare._parse_prefs(0, text, None)
+    code, text = read_state([tailscale_path, "debug", "prefs"], runner=runner)
+    return macos_prepare._parse_prefs(code, text, None)
 
 
 def observe_takeover_state(runner, *, tailscale_path):
@@ -1440,7 +1453,8 @@ def stop_owned_mihomo(state_dir, runner=None):
 
 
 def _rollback_incomplete(steps):
-    if "prefs_unreadable" in steps or "exit_node_unrestorable" in steps:
+    if ("prefs_unreadable" in steps or "prefs_unavailable_in_snapshot" in steps
+            or "exit_node_unrestorable" in steps):
         return True
     return any(step.endswith(":failed") for step in steps)
 
@@ -2214,6 +2228,9 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
         record["result"] = conflict["result"]
         record["preflight"] = conflict["preflight"]
         return record
+    if not macos_preflight.observed_exit_snapshot(ready):
+        record["result"] = "snapshot_prefs_unavailable"
+        return record
     write_pin(state_dir, snapshot_name)
     pin_holder[0] = snapshot_name
     step("snapshot_taken")
@@ -2354,8 +2371,8 @@ def takeover(*, inputs, profile=None, minutes=DEFAULT_MINUTES,
             if external_rollback and _mutation_blocked(state_dir, snapshot_name):
                 record["result"] = _engaged_result(deadline_unix)
                 return record
-            _, dns_text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
-            parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
+            dns_code, dns_text = read_state(["/usr/sbin/scutil", "--dns"], runner=runner)
+            parsed = macos_prepare._parse_scutil_dns(dns_code, dns_text, None)
             if parsed["has_198_18"] is True:
                 break
             if not process.alive():

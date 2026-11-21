@@ -82,6 +82,23 @@ def exit_code(report):
     return 1
 
 
+def observed_exit_snapshot(summary):
+    """True only when the pre-cutover ``debug prefs`` read succeeded.
+
+    The summary stores that status string. ``observed`` includes an explicit
+    empty exit: the keys were present and blank, so there is something to
+    restore. A missing document, a non-zero exit, or a runner error is not a
+    restore source. Callers must not pin or clear the exit node unless this
+    is true.
+    """
+    if not isinstance(summary, dict):
+        return False
+    tailscale = summary.get("tailscale")
+    if not isinstance(tailscale, dict):
+        return False
+    return tailscale.get("prefs") == "observed"
+
+
 def snapshot_conflict(summary, *, snapshot_name, strict):
     """The existing ready/unknown split, in one place.
 
