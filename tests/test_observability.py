@@ -1,5 +1,7 @@
 """Read-only loopback API and independent source-checkout CLI contract."""
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import http.client
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -7,11 +9,116 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+import manager
 import observability
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux system-scope account gate")
+class InstalledSystemDryRunTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / ".git").mkdir()
+        self.state = self.root / "state"
+        self.config = self.root / "config"
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(manager, "ROOT", self.root))
+        stack.enter_context(patch.object(manager.nmd_platform, "name", return_value="linux"))
+        stack.enter_context(patch.object(manager, "_euid", return_value=1000))
+        self.scope = stack.enter_context(patch.object(manager, "scope_of", return_value="system"))
+        self.setting = stack.enter_context(patch.object(manager, "setting", side_effect=lambda root, key: {
+            "home": str(self.root), "stateDir": str(self.state),
+            "configDir": str(self.config),
+        }[key]))
+        self.sources = stack.enter_context(patch.object(manager, "source_directory",
+                                                        return_value=self.root / "private"))
+        self.account = stack.enter_context(patch("pwd.getpwnam", return_value=Mock(pw_uid=123)))
+        stack.enter_context(patch.object(observability.nmd_monitor, "sample_probe",
+                                         side_effect=AssertionError("real probe")))
+
+    def assert_no_install_resolution(self):
+        self.setting.assert_not_called()
+        self.scope.assert_not_called()
+        self.sources.assert_not_called()
+        self.account.assert_not_called()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_status_dry_run_only_reads_and_removes_disposable_state(self):
+        self.account.side_effect = KeyError("missing system monitor")
+        output = io.StringIO()
+        with patch.object(observability.nmd_monitor, "read_snapshot",
+                          wraps=observability.nmd_monitor.read_snapshot) as read, redirect_stdout(output):
+            manager.main(["monitor", "status", "--state-dir", str(self.state), "--dry-run"])
+        snapshot = json.loads(output.getvalue())
+        self.assertEqual(snapshot["collector"]["data_origin"], "demo")
+        self.assertTrue(snapshot["samples"])
+        self.assertTrue(all(row["synthetic"] for row in snapshot["samples"]))
+        read.assert_called_once()
+        temporary_state = read.call_args.args[0]
+        self.assertNotEqual(temporary_state, self.state)
+        self.assertFalse(temporary_state.exists())
+        self.assert_no_install_resolution()
+
+    def test_gui_abbreviated_dry_run_ignores_both_explicit_paths(self):
+        def serve(port, state_dir, *, sources_dir, config_path):
+            self.assertEqual(port, 9)
+            self.assertNotEqual(state_dir, self.state)
+            self.assertTrue((state_dir / "monitor.sqlite3").is_file())
+            self.assertIsNone(sources_dir)
+            self.assertIsNone(config_path)
+            snapshot = observability.nmd_monitor.read_snapshot(state_dir)
+            self.assertEqual(snapshot["collector"]["data_origin"], "demo")
+            self.assertTrue(snapshot["samples"])
+            self.assertTrue(all(row["synthetic"] for row in snapshot["samples"]))
+
+        with patch.object(observability, "serve_dashboard", side_effect=serve) as dashboard, \
+                redirect_stdout(io.StringIO()):
+            manager.main(["gui", "--state-dir", str(self.state), "--config", str(self.config),
+                          "--port", "9", "--dry"])
+        dashboard.assert_called_once()
+        self.assertFalse(dashboard.call_args.args[1].exists())
+        self.assert_no_install_resolution()
+
+    def test_invalid_dry_run_neither_dispatches_nor_resolves_install(self):
+        for argv in (["monitor", "status", "--dry-run", "--bogus"],
+                     ["gui", "--dry-run", "--port", "65536"],
+                     ["gui", "--dry-run=x"]):
+            with self.subTest(argv=argv), patch.object(observability, "demo_state") as demo, \
+                    patch.object(observability, "main") as real, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as exc:
+                    manager.main(argv)
+                self.assertEqual(exc.exception.code, 2)
+                demo.assert_not_called()
+                real.assert_not_called()
+        self.assert_no_install_resolution()
+
+    def test_real_data_stays_gated_and_flag_text_in_value_is_not_an_opt_in(self):
+        for argv in (["monitor", "status"], ["gui"], ["gui", "--config=--dry-run"]):
+            with self.subTest(argv=argv), patch.object(observability, "demo_state") as demo, \
+                    patch.object(observability, "main") as observe:
+                with self.assertRaisesRegex(manager.ManagerError, "仅限 nmd-monitor UID"):
+                    manager.main(argv)
+                demo.assert_not_called()
+                observe.assert_not_called()
+        self.assertEqual(self.account.call_count, 3)
+
+    def test_authorized_installed_config_default_is_preserved(self):
+        self.account.return_value.pw_uid = 1000
+        for command in ("config-check", "run"):
+            with self.subTest(command=command), \
+                    patch.object(observability.nmd_monitor, "load_config",
+                                 return_value={"probes": []}) as read_config, \
+                    patch.object(observability.nmd_monitor, "collect"), redirect_stdout(io.StringIO()):
+                argv = ["monitor", command] + (["--once"] if command == "run" else [])
+                manager.main(argv)
+                read_config.assert_called_once_with(self.config / "monitor.json")
 
 
 class DashboardAPITests(unittest.TestCase):

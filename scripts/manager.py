@@ -1108,8 +1108,10 @@ def main(argv=None):
         raise SystemExit(takeover_cli(argv[1:]))
     if command in {"monitor", "gui", "machine"}:
         # Observability also works in an uninstalled checkout, without sudo.
-        from observability import main as observe
+        from observability import main as observe, run_synthetic_if_requested
         try:
+            if run_synthetic_if_requested(argv):
+                return
             kwargs = {"sources_dir": None}
             if platform == "linux":
                 kwargs["sources_dir"] = source_directory(ROOT)
