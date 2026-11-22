@@ -259,6 +259,37 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(sup.mutations, [])
         self.assertNotEqual(sup.status()["phase"], d.PHASE_ACTIVE)
 
+    def test_unobserved_prefs_do_not_clear_or_mark_rolled_back(self):
+        empty_looking = json.dumps({
+            "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": False, "RouteAll": False,
+            "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        })
+        for reply in ((1, "", None), (1, empty_looking, None), (1, "", "prefs_failed")):
+            with self.subTest(reply=reply):
+                table = Table()
+                table.prefs_reply = reply
+                sup = make_supervisor(self.state, table)
+                result = sup.dispatch({"cmd": "takeover.start"}, 0)
+                self.assertEqual(result["error"], "snapshot_prefs_unavailable")
+                self.assertNotEqual(result.get("prefs"), "observed")
+                self.assertEqual(sup.mutations, [])
+                self.assertFalse((self.state / "rollback-pin.json").exists())
+                self.assertEqual(sup.status()["phase"], d.PHASE_DIRECT)
+
+    def test_observed_empty_exit_still_clears_and_can_roll_back(self):
+        table = Table(process_alive=False)
+        table.prefs_reply = (0, json.dumps({
+            "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": False, "RouteAll": False,
+            "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        }), None)
+        sup = make_supervisor(self.state, table)
+        result = sup.dispatch({"cmd": "takeover.start"}, 0)
+        self.assertEqual(result["error"], "mihomo_exited_early")
+        self.assertIn([TS, "set", "--exit-node="], sup.mutations)
+        self.assertEqual(sup.last_rollback["result"], "rollback_restored")
+        self.assertIn("exit_node_was_empty", sup.last_rollback["steps"])
+        self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
+
     def test_failed_validation_reports_the_stage_and_detail(self):
         table = Table()
         sup = make_supervisor(self.state, table,
@@ -409,6 +440,143 @@ class SupervisorTests(unittest.TestCase):
         reply = d.DaemonIPCClient(self.state / "cli.sock").stop_takeover()
         self.assertEqual(reply["result"], "rollback_restored")
         self.assertEqual(reply["reason"], "manual_stop")
+
+    def _serve(self, sup):
+        server = d.DaemonIPCServer(self.state / "cli.sock", sup.dispatch, group=None).bind()
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        thread = threading.Thread(target=server.serve_forever, args=(stop,), daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        time.sleep(0.05)
+        return self.state / "cli.sock"
+
+    def test_stop_cli_bootouts_only_after_rollback_restored(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        sup = make_supervisor(self.state, table)
+        self.assertEqual(sup.dispatch({"cmd": "takeover.start"}, 0)["result"], "takeover_active")
+        sock = self._serve(sup)
+        table.dns_dirty_window = (1, 1)
+        calls = []
+
+        def helper(argv):
+            calls.append(list(argv))
+            return {"result": "stop"}
+
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(sock)), \
+                patch.object(d, "_run_helper", side_effect=helper), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["stop"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(calls[-1][-1], "stop-root")
+        self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
+
+    def test_stop_cli_does_not_bootout_when_rollback_is_incomplete(self):
+        table = Table(dns_dirty_window=(1, 10 ** 9))
+        sup = make_supervisor(self.state, table)
+        self.assertEqual(sup.dispatch({"cmd": "takeover.start"}, 0)["result"], "takeover_active")
+        sock = self._serve(sup)
+        table.dns_dirty_window = (1, 1)
+        table.prefs_reply = (1, "", "prefs_failed")
+        calls = []
+
+        def helper(argv):
+            calls.append(list(argv))
+            return {"result": "stop"}
+
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(sock)), \
+                patch.object(d, "_run_helper", side_effect=helper), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["stop"])
+        self.assertEqual(code, 1, output.getvalue())
+        body = json.loads(output.getvalue())
+        self.assertEqual(body["error"], "rollback_incomplete")
+        self.assertEqual(body["rollback"]["result"], "rollback_incomplete")
+        self.assertEqual(calls, [])
+        self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(sock)), \
+                patch.object(d, "_run_helper", side_effect=helper), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["stop"])
+        self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["error"], "rollback_incomplete")
+        self.assertEqual(calls, [])
+        self.assertEqual(sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+        table.prefs_reply = None
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(sock)), \
+                patch.object(d, "_run_helper", side_effect=helper), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["stop"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(calls[-1][-1], "stop-root")
+        self.assertEqual(sup.status()["phase"], d.PHASE_ROLLED_BACK)
+
+    def test_takeover_stop_exit_code_follows_the_rollback_result(self):
+        failed = Table(dns_dirty_window=(1, 10 ** 9))
+        (self.state / "failed").mkdir()
+        failed_sup = make_supervisor(self.state / "failed", failed)
+        self.assertEqual(failed_sup.dispatch({"cmd": "takeover.start"}, 0)["result"],
+                         "takeover_active")
+        failed_sock = self._serve(failed_sup)
+        failed.dns_dirty_window = (1, 1)
+        failed.prefs_reply = (1, "", None)
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(failed_sock)), contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["takeover-stop"])
+        self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["result"], "rollback_incomplete")
+        self.assertEqual(failed_sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
+
+        restored = Table(dns_dirty_window=(1, 10 ** 9))
+        (self.state / "restored").mkdir()
+        restored_sup = make_supervisor(self.state / "restored", restored)
+        self.assertEqual(restored_sup.dispatch({"cmd": "takeover.start"}, 0)["result"],
+                         "takeover_active")
+        restored_sock = d.DaemonIPCServer(
+            self.state / "restored.sock", restored_sup.dispatch, group=None).bind()
+        self.addCleanup(restored_sock.close)
+        stop = threading.Event()
+        thread = threading.Thread(target=restored_sock.serve_forever, args=(stop,), daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        time.sleep(0.05)
+        restored.dns_dirty_window = (1, 1)
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(self.state / "restored.sock")), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["takeover-stop"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["result"], "rollback_restored")
+
+    def test_stop_timeout_does_not_bootout(self):
+        sock = self.state / "stall.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def stall():
+            conn, _ = server.accept()
+            time.sleep(1.0)
+            conn.close()
+
+        thread = threading.Thread(target=stall, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        calls = []
+        output = io.StringIO()
+        with patch.object(d, "SOCKET_PATH", str(sock)), \
+                patch.object(d, "_stop_ipc_timeout", return_value=0.2), \
+                patch.object(d, "_run_helper", side_effect=calls.append), \
+                contextlib.redirect_stdout(output):
+            code = d.cli_daemon(["stop"])
+        self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["error"], "stop_timeout")
+        self.assertEqual(calls, [])
 
     def test_boot_policy_takes_over_on_a_true_boot_with_fresh_snapshot(self):
         table = Table(dns_dirty_window=(1, 10 ** 9))
@@ -993,6 +1161,28 @@ class DaemonRestartTests(unittest.TestCase):
         document = json.loads(out)
         self.assertEqual(document["stop"], {"result": "stop"})
         self.assertEqual(document["start"], {"error": "launchctl_start_failed"})
+
+    def test_restart_does_not_start_when_rollback_is_incomplete(self):
+        calls = []
+
+        class Client:
+            def __init__(self, path, timeout=None):
+                pass
+
+            def stop_takeover(self):
+                return {"result": "rollback_incomplete", "reason": "manual_stop"}
+
+        def helper(argv):
+            calls.append(argv[-1])
+            return {"result": "start"}
+
+        code, out, _order = self.run_restart(helper, client=Client)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(calls, [])
+        document = json.loads(out)
+        self.assertEqual(document["stop"]["error"], "rollback_incomplete")
+        self.assertEqual(document["stop"]["rollback"]["result"], "rollback_incomplete")
+        self.assertNotIn("start", document)
 
     def test_restart_rejects_extra_arguments_before_any_helper(self):
         with patch.object(d, "_run_helper", side_effect=AssertionError("helper")), \

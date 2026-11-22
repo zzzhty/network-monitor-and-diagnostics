@@ -439,6 +439,19 @@ def bootstrap(args):
                 monitor_install(root)
 
 
+def _restore_pending(root, previous):
+    """Put pendingApply back when the fast-forward did not change HEAD.
+
+    An unset value stays unset. Writing ``false`` over an absent key would
+    make ``nmd status`` report a pending state the installation did not have.
+    """
+    if previous:
+        setting(root, "pendingApply", previous)
+        return
+    subprocess.run(["git", "config", "--file", str(root / ".git/config"),
+                    "--unset", "nmd.pendingApply"], check=False)
+
+
 def update(root, check_only):
     managed(root)
     with lock(root / ".git" / "nmd.lock"):
@@ -473,8 +486,13 @@ def update(root, check_only):
             clean(root)
             if git(root, "rev-parse", "HEAD") != previous:
                 raise ManagerError("校验期间安装版本被其他程序修改；未更新。")
+            previous_pending = setting(root, "pendingApply")
             setting(root, "pendingApply", "true")
-            git(root, "merge", "--ff-only", target)
+            try:
+                git(root, "merge", "--ff-only", target)
+            except subprocess.CalledProcessError:
+                _restore_pending(root, previous_pending)
+                raise
         print("代码更新完成；没有应用网络配置或重启服务。需要时运行 nmd apply。", flush=True)
         if nmd_platform.name() == "macos":
             # launchd keeps running the old code until the daemon restarts.

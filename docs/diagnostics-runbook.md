@@ -34,7 +34,7 @@
 | `nmd source status [--offline]` | R | 默认 GET 回环 selector；offline 不查控制器，active 不能当实时值 | 管理者 |
 | `nmd source delay <完整节点ID>` | R/N，仅测速 | 经本地控制器触发核心真实联网；固定 URL/超时，不改变 selector | 管理者；失败码不能单独证明节点故障 |
 | `nmd update --check` | C，写管理锁、Git 对象与远端引用 | git fetch；不切换当前代码、不 apply | 管理者；不是零写入预览 |
-| `nmd update` | C，同上并快进代码、记录 pendingApply | 不自动 apply 或重启 monitor | 管理者；无自动代码回滚 |
+| `nmd update` | C，同上并快进代码、成功后记录 pendingApply | 不自动 apply 或重启 monitor。快进失败则版本不变，pendingApply 恢复为更新前的值 | 管理者；无自动代码回滚 |
 | `nmd source add/update/remove`、`nmd channel rename` | C，来源与缓存 | 不即时探测、部署或切换 | 管理者；删除/连接变化可能丢缓存，见第 3 节 |
 | `nmd source refresh <id> --fixture <YAML>` / `--confirm` | C，成功写缓存 | fixture 离线；confirm 用 HTTPS，2 MiB / 20s 预算且不跟随重定向；Linux GUI「更新订阅」按钮走同一 confirm 后端 | 管理者；失败保留旧缓存与选择 |
 | `nmd source select <节点ID> --defer` | C，保存期望，暂停已启用策略 | 不即时 PUT | 管理者；再选可覆盖保存值 |

@@ -91,6 +91,51 @@ def _owner():
     return int(os.environ.get("SUDO_UID", "0")) if os.geteuid() == 0 else os.geteuid()
 
 
+def _mkdir_private(path, mode):
+    """Create only the missing directories, then force ``mode`` on those new ones.
+
+    ``Path.mkdir(parents=True)`` applies ``mode`` only to the leaf and still
+    masks every component with the process umask, so umask 002 leaves a new
+    parent group-writable. Later checks then reject the directory this call
+    just created. Existing directories are left untouched: an untrusted mode
+    is a refusal, not something to chmod. Symlinks are not followed.
+    """
+    path = Path(path)
+    missing = []
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise SourceError("unsafe_source_directory")
+        break
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, mode)
+        except FileExistsError:
+            info = directory.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise SourceError("unsafe_source_directory")
+            continue
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(directory, flags)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
+
 def _directory(path, create=False):
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
@@ -106,7 +151,7 @@ def _directory(path, create=False):
                     or (info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX))):
                 raise SourceError("unsafe_source_directory")
     if create:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _mkdir_private(path, 0o700)
     if path.exists() and (path.stat().st_uid not in {os.geteuid(), _owner()}
                           or path.stat().st_mode & 0o077):
         raise SourceError("source_directory_must_be_private")

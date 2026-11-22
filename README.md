@@ -171,6 +171,7 @@ nmd test-stop        # 临时停 mihomo 验证 Tailscale，结束时恢复原运
 `nmd onboard` 在 Linux 上把 `NMD_VPS_TS_IP` 写到当前用户的端点文件（已记录的 `configDir/nmd-local.env`，否则是 `~/.config/nmd/nmd-local.env`），不写 `/etc/mihomo/nmd-local.env`，也不填文档占位的公网地址。端口只能是现有路径里的 1080，地址只能是 Tailnet 的 IPv4。交互询问里的代理名会核对，但不会写入这个文件。它不执行 `apply`。无参数只在交互终端里询问；管道或脚本里请带 `--server` 和 `--port`，或使用 `--inputs`。macOS 上的同名命令见 [docs/macos.md](docs/macos.md)，不下载 Tailscale。
 
 `nmd update` 不再隐式部署网络，即使显示待应用也不会自动重试 apply。
+快进失败时当前版本不变，`pendingApply` 恢复为更新前的值（原先未设置则仍不设置），不会把未改变的修订标成待应用。
 macOS 的 `nmd apply` / `refresh` 不做上面的 Linux 网络部署。它记录当前版本；已安装常驻守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。若当时有进行中的接管，这次 stop 会按快照回退路由、DNS 或 Tailscale exit node；`on_boot` 为 true 时，新的一次开机可能开始接管。见 [docs/macos.md](docs/macos.md) 与 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。
 `nmd status` 的“待应用”表示当前代码尚未完成显式网络部署，不表示 monitor 安装失败；
 只使用诊断时无需为了清除该状态而运行 apply。网络部署失败后，修复问题并显式重试

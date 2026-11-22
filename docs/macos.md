@@ -71,6 +71,7 @@ macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `de
 `apply` 记录当前版本；已安装常驻守护时，若这次重载会用到接管规则，先运行与 `nmd macos geodata ensure` 相同的补齐，再做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
 它不下载 Linux 的 mihomo 安装包，也不调用 `takeover-start`。下载失败或预检失败时不会 stop，也不会 sudo，待应用状态保留。
 若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。
+回退没有完成时，`nmd macos daemon stop` 和 `takeover-stop` 失败，并且不会 bootout 仍在恢复的管理器。
 `on_boot` 只由 `nmd macos daemon on-boot` 修改。`apply` 不改这个字段。若它已经是 true，且这次启动被管理器当成新的一次开机，它可能开始接管。
 会话若停在 `active`、`starting` 或 `needs_rollback`，启动会先把那次回退做完。
 `start` 在任务未加载时会 bootstrap，所以未加载的 root 管理器会被 `apply` 拉起。

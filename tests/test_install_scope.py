@@ -200,6 +200,45 @@ class ScopeInstallTests(unittest.TestCase):
         self.assertFalse(self.unit.exists())
         self.run.assert_not_called()
 
+    def test_group_umask_creates_private_monitor_directories(self):
+        for mask in (0o002, 0o022):
+            with self.subTest(umask=oct(mask)):
+                home = self.base / f"fresh-{mask:03o}"
+                home.mkdir(mode=0o700)
+                config = home / ".config" / "nmd"
+                state = home / ".local" / "state" / "nmd-monitor"
+                previous = os.umask(mask)
+                try:
+                    unit = install_scope.install_monitor(self.root, "user", config, state)
+                    install_scope.install_monitor(self.root, "user", config, state)
+                finally:
+                    os.umask(previous)
+                created = (
+                    home / ".config", config, home / ".config" / "systemd",
+                    home / ".config" / "systemd" / "user",
+                    home / ".local", home / ".local" / "state", state,
+                )
+                for path in created:
+                    info = path.lstat()
+                    self.assertFalse(stat.S_ISLNK(info.st_mode))
+                    self.assertEqual(stat.S_IMODE(info.st_mode) & 0o022, 0, path)
+                self.assertTrue(unit.is_file())
+
+    def test_existing_group_writable_unit_parent_is_not_repaired(self):
+        home = self.base / "wide-home"
+        home.mkdir(mode=0o700)
+        config_parent = home / ".config"
+        config_parent.mkdir(mode=0o775)
+        os.chmod(config_parent, 0o775)
+        before = stat.S_IMODE(config_parent.lstat().st_mode)
+        config = config_parent / "nmd"
+        state = home / ".local" / "state" / "nmd-monitor"
+        with self.assertRaises(install_scope.ScopeError):
+            install_scope.install_monitor(self.root, "user", config, state)
+        self.assertEqual(stat.S_IMODE(config_parent.lstat().st_mode), before)
+        self.assertFalse(config.exists())
+        self.assertFalse((config_parent / "systemd").exists())
+
     def test_uninstall_removes_only_owned_unit_and_keeps_config_state_code(self):
         self.install()
         self.run.reset_mock()

@@ -69,6 +69,15 @@ and apply do not change this field.
 
 Do not run init or on-boot as root. A missing or invalid daemon.json is
 an error: on-boot does not create one.
+
+stop and takeover-stop succeed only when rollback finished
+(rollback_restored) or no takeover was in progress (not_active, or stopped
+before the exit node was cleared). An incomplete rollback, a resolver that
+still has 198.18, or a wait that times out is a failed command. That
+failure does not bootout a supervisor that is still restoring. A later
+stop while the phase is needs_rollback retries the restore once and
+succeeds only if that retry is rollback_restored. A missing socket is
+not a stop failure: there is no supervisor left to wait for.
 """
 
 
@@ -369,8 +378,11 @@ class DaemonClientBridge:
         return self._cached
 
     def stop_takeover(self):
+        # Status stays on the short client. Stop has to wait out a ready
+        # loop plus DNS cleanup, or a timeout looks like a finished stop.
+        client = DaemonIPCClient(self._client.socket_path, timeout=_stop_ipc_timeout())
         try:
-            return self._client.stop_takeover()
+            return client.stop_takeover()
         except DaemonError as exc:
             return {"error": str(exc)}
 
@@ -405,7 +417,15 @@ class DaemonIPCClient:
         return self._call({"cmd": "status"})
 
     def stop_takeover(self):
-        return self._call({"cmd": "takeover.stop"})
+        try:
+            return self._call({"cmd": "takeover.stop"})
+        except DaemonError as exc:
+            # A connect/read timeout is not "no daemon". The supervisor may
+            # still be rolling the network back.
+            cause = exc.__cause__
+            if isinstance(cause, TimeoutError) or isinstance(cause, socket.timeout):
+                raise DaemonError("stop_timeout") from exc
+            raise
 
     def start_takeover(self):
         return self._call({"cmd": "takeover.start"})
@@ -673,6 +693,10 @@ class RootSupervisor:
             return {"error": "preflight_failed",
                     "has_198_18": summary.get("has_198_18"),
                     "mihomo_running": summary.get("mihomo_running")}
+        if not macos_preflight.observed_exit_snapshot(summary):
+            tail = summary.get("tailscale") if isinstance(summary, dict) else None
+            prefs = tail.get("prefs") if isinstance(tail, dict) else None
+            return {"error": "snapshot_prefs_unavailable", "prefs": prefs}
         self.snapshot_name = Path(snapshot_path).name if snapshot_path is not None else None
         try:
             macos_takeover.write_pin(self.state_dir, self.snapshot_name)
@@ -715,9 +739,9 @@ class RootSupervisor:
                 if self._cancel.is_set():
                     rollback = self._finish_locked("manual_stop", process, mutations)
                     return {"result": rollback.get("result", "stopped"), "reason": "manual_stop"}
-                _, dns_text = macos_takeover.read_state(
+                dns_code, dns_text = macos_takeover.read_state(
                     ["/usr/sbin/scutil", "--dns"], runner=self.runner)
-                parsed = macos_prepare._parse_scutil_dns(0, dns_text, None)
+                parsed = macos_prepare._parse_scutil_dns(dns_code, dns_text, None)
                 if parsed["has_198_18"] is True:
                     break
                 if not process.alive():
@@ -903,6 +927,15 @@ class RootSupervisor:
             if self.phase == PHASE_ACTIVE:
                 rollback = self._finish_locked(reason, self.process, self.mutations)
                 return {"result": rollback.get("result", "rollback_restored"),
+                        "reason": reason}
+            if self.phase == PHASE_NEEDS_ROLLBACK:
+                # Recovery is still unfinished. One more attempt; do not
+                # report not_active, or the caller would bootout the
+                # supervisor that is still restoring.
+                self._cancel.clear()
+                self._retry_rollback_locked()
+                rollback = self.last_rollback or {}
+                return {"result": rollback.get("result") or "rollback_incomplete",
                         "reason": reason}
             if self.phase != PHASE_STARTING:
                 self._cancel.clear()
@@ -1239,10 +1272,38 @@ def uninstall_root_plist():
     return {"uninstalled": str(path)}
 
 
+_STOP_FINISHED = frozenset({"rollback_restored", "not_active", "stopped"})
+_STOP_ABSENT = frozenset({"daemon_unavailable", "socket_missing"})
+
+
+def _stop_ipc_timeout():
+    """Long enough for the ready loop and the DNS cleanup poll."""
+    return (macos_takeover.READY_TIMEOUT_SECONDS
+            + macos_takeover.CLEANUP_TIMEOUT_SECONDS + 5)
+
+
+def stop_result_finished(reply):
+    """True when the supervisor has finished and it is safe to bootout."""
+    return (isinstance(reply, dict) and "error" not in reply
+            and reply.get("result") in _STOP_FINISHED)
+
+
 def _daemon_stop():
-    """IPC stop, then bootout. A missing socket is not a stop failure."""
-    with contextlib.suppress(DaemonError):
-        DaemonIPCClient(SOCKET_PATH, timeout=1.5).stop_takeover()
+    """Ask the supervisor to finish rollback, then bootout.
+
+    A missing socket means there is no supervisor to wait for, so bootout
+    still runs. A timeout or an unfinished rollback must not bootout: the
+    supervisor may still be restoring, and killing it would leave the
+    network half-changed. Those cases are a failed stop.
+    """
+    try:
+        reply = DaemonIPCClient(SOCKET_PATH, timeout=_stop_ipc_timeout()).stop_takeover()
+    except DaemonError as exc:
+        if str(exc) not in _STOP_ABSENT:
+            return {"error": str(exc)}
+    else:
+        if not stop_result_finished(reply):
+            return {"error": "rollback_incomplete", "rollback": reply}
     return _run_helper(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
                         "stop-root"])
 
@@ -1569,11 +1630,11 @@ def cli_daemon(argv):
     if action == "takeover-stop":
         # Same trust as the panel button: any admin-group peer may stop.
         try:
-            reply = DaemonIPCClient(SOCKET_PATH).stop_takeover()
+            reply = DaemonIPCClient(SOCKET_PATH, timeout=_stop_ipc_timeout()).stop_takeover()
         except DaemonError as exc:
             reply = {"error": str(exc)}
         print(json.dumps(reply, ensure_ascii=False, indent=2))
-        return 0 if "error" not in reply else 1
+        return 0 if stop_result_finished(reply) else 1
     if action == "takeover-start":
         blocked = _mutation_gate("takeover-start")
         if blocked is not None:

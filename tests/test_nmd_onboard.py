@@ -320,6 +320,78 @@ class OnboardTests(unittest.TestCase):
         self.assertNotIn("203.0.113", text)
         self.assertEqual(stat.S_IMODE(self.env.stat().st_mode) & 0o777, 0o600)
 
+    def test_linux_same_address_still_requires_a_trusted_endpoint(self):
+        parent = self.env.parent
+        parent.mkdir(mode=0o700)
+        body = f"NMD_VPS_TS_IP={SERVER4}\n"
+        self.env.write_text(body, encoding="utf-8")
+        os.chmod(self.env, 0o600)
+        finders = dict(find_tailscale=lambda platform: "/usr/bin/tailscale",
+                       find_mihomo=lambda platform: "/usr/bin/mihomo")
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux", **finders)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.env.read_text(encoding="utf-8"), body)
+        self.assertNotIn("fetch", self.calls)
+
+        os.chmod(self.env, 0o666)
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux", **finders)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_group_or_world_writable")
+        self.assertEqual(self.env.read_text(encoding="utf-8"), body)
+        self.assertEqual(stat.S_IMODE(self.env.stat().st_mode) & 0o777, 0o666)
+        self.assertNotIn("fetch", self.calls)
+        os.chmod(self.env, 0o600)
+
+        os.chmod(parent, 0o777)
+        code, out, err = self.invoke(
+            ["--server", "100.64.0.9", "--port", "1080"], platform="linux", **finders)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_group_or_world_writable")
+        self.assertEqual(self.env.read_text(encoding="utf-8"), body)
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode) & 0o777, 0o777)
+        self.assertNotIn("fetch", self.calls)
+        os.chmod(parent, 0o700)
+
+        real = self.base / "real-config"
+        real.mkdir(mode=0o700)
+        target = real / "nmd-local.env"
+        target.write_text(body, encoding="utf-8")
+        os.chmod(target, 0o600)
+        linked = self.base / "linked-config"
+        linked.symlink_to(real, target_is_directory=True)
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux",
+            env_path=linked / "nmd-local.env", **finders)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_not_regular")
+        self.assertEqual(target.read_text(encoding="utf-8"), body)
+        self.assertTrue(linked.is_symlink())
+        self.assertNotIn("fetch", self.calls)
+
+        wide = self.base / "wide-new"
+        wide.mkdir(mode=0o777)
+        os.chmod(wide, 0o777)
+        missing = wide / "nmd-local.env"
+        before = list(self.calls)
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux",
+            env_path=missing, find_tailscale=finders["find_tailscale"],
+            find_mihomo=lambda platform: None)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err)["error"], "config_group_or_world_writable")
+        self.assertEqual(self.calls, before)
+        self.assertFalse(missing.exists())
+        self.assertEqual(stat.S_IMODE(wide.stat().st_mode) & 0o777, 0o777)
+
+        self.env.write_text("NMD_VPS_TS_IP=100.64.0.9\n", encoding="utf-8")
+        os.chmod(self.env, 0o600)
+        code, out, err = self.invoke(
+            ["--server", SERVER4, "--port", "1080"], platform="linux", **finders)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.env.read_text(encoding="utf-8"), body)
+
     def test_linux_placeholder_public_address_stops_before_fetch(self):
         self.env.parent.mkdir(parents=True, exist_ok=True)
         self.env.write_text("NMD_VPS_TS_IP=100.64.0.1\nNMD_VPS_PUB=203.0.113.10\n",

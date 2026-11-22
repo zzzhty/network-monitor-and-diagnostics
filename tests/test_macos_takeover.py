@@ -56,6 +56,9 @@ class Table:
         self.fail_mutations = fail_mutations
         self.process_alive = process_alive
         self.clock = 0.0
+        self.prefs_reply = None
+        self.prefs_script = None
+        self.scutil_reply = None
         self.proxy_text = "<dictionary> {\n}\n"
         self.route_text = ("Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
                            "default 192.0.2.1 UGScg en0\n")
@@ -68,6 +71,8 @@ class Table:
         if argv == ("/usr/sbin/netstat", "-rn", "-f", "inet6"):
             return 0, "Routing tables\n\nInternet6:\n", None
         if argv == ("/usr/sbin/scutil", "--dns"):
+            if self.scutil_reply is not None:
+                return self.scutil_reply
             window = self.dns_dirty_window
             dirty = window is not None and window[0] <= self.clock < window[1]
             return 0, DNS_DIRTY if dirty else DNS_CLEAN, None
@@ -112,6 +117,10 @@ class Table:
                         "MagicDNSSuffix": "example.ts.net.", "Peer": peers}
             return 0, json.dumps(body), None
         if argv == (TS, "debug", "prefs"):
+            if self.prefs_script:
+                return self.prefs_script.pop(0)
+            if self.prefs_reply is not None:
+                return self.prefs_reply
             prefs = {"ExitNodeID": None if self.exit_node_cleared else "nodekey:abc",
                      "ExitNodeIP": None, "CorpDNS": self.corp_dns, "RouteAll": False,
                      "ExitNodeAllowLANAccess": self.allow_lan, "WantRunning": True}
@@ -325,6 +334,63 @@ class TakeoverFlowTests(unittest.TestCase):
         self.assertEqual(record["result"], "mihomo_exited_early")
         self.assertEqual(record["rollback"]["result"], "rollback_restored")
 
+    def test_unobserved_prefs_never_clears_the_exit_node(self):
+        empty_looking = json.dumps({
+            "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": False, "RouteAll": False,
+            "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        })
+        for reply in ((1, "", None), (1, empty_looking, None), (1, "", "prefs_failed")):
+            with self.subTest(reply=reply):
+                table = Table()
+                table.prefs_reply = reply
+                for record, state in run_takeover(table):
+                    self.assertEqual(record["result"], "snapshot_prefs_unavailable")
+                    self.assertEqual(record["mutations"], [])
+                    self.assertNotIn("exit_node_cleared", record["steps"])
+                    self.assertFalse((state / mod.PIN_FILE).exists())
+                    break
+
+    def test_observed_empty_exit_still_cuts_over_and_matches(self):
+        table = Table(process_alive=False)
+        table.prefs_reply = (0, json.dumps({
+            "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": False, "RouteAll": False,
+            "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        }), None)
+        record = self.record(table)
+        self.assertEqual(record["result"], "mihomo_exited_early")
+        self.assertIn([TS, "set", "--exit-node="], record["mutations"])
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertIn("exit_node_was_empty", record["rollback"]["steps"])
+        self.assertFalse(any(
+            len(item) > 2 and str(item[2]).startswith("--exit-node=") and item[2] != "--exit-node="
+            for item in table.mutations))
+
+    def test_nonzero_scutil_does_not_confirm_a_clean_resolver(self):
+        for reply in ((1, DNS_CLEAN, None), (1, "", None), (1, DNS_CLEAN, "scutil_failed")):
+            with self.subTest(reply=reply):
+                table = Table(process_alive=False)
+                table.scutil_reply = reply
+                record = self.record(table)
+                self.assertIn([TS, "set", "--exit-node="], record["mutations"])
+                self.assertEqual(record["rollback"]["result"], "rollback_blocked_dirty_dns")
+                self.assertNotIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+                self.assertGreater(table.clock, 0)
+
+    def test_clean_scutil_still_restores_the_selected_exit(self):
+        table = Table(process_alive=False)
+        table.scutil_reply = (0, DNS_CLEAN, None)
+        record = self.record(table)
+        self.assertEqual(record["rollback"]["result"], "rollback_restored")
+        self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+        self.assertEqual(table.clock, 1)  # only the fake process start, no DNS poll
+
+    def test_empty_successful_scutil_is_not_a_clean_resolver(self):
+        table = Table(process_alive=False)
+        table.scutil_reply = (0, "", None)
+        record = self.record(table)
+        self.assertEqual(record["rollback"]["result"], "rollback_blocked_dirty_dns")
+        self.assertNotIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+
     def test_preflight_blocks_when_mihomo_already_runs(self):
         table = Table(ps_mihomo=True)
         record = self.record(table)
@@ -426,7 +492,7 @@ class RollbackTests(unittest.TestCase):
             result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
                                   sleep=table.sleep, now=lambda: table.clock,
                                   tailscale_path=TS)
-            self.assertEqual(result["result"], "rollback_restored")
+            self.assertEqual(result["result"], "rollback_incomplete")
             self.assertIn("prefs_unavailable_in_snapshot", result["steps"])
             # The live exit node stays exactly as it is: no empty-value guess.
             self.assertEqual([m for m in table.mutations if m[0] == TS], [])
@@ -454,6 +520,66 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(len(table.mutations), after)
             self.assertIn("accept_dns_unchanged", again["steps"])
             self.assertIn("allow_lan_unchanged", again["steps"])
+
+    def test_failed_live_prefs_is_not_an_empty_exit(self):
+        empty_looking = json.dumps({
+            "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": True, "RouteAll": False,
+            "ExitNodeAllowLANAccess": False, "WantRunning": True,
+        })
+        cases = (
+            (1, "", None),
+            (1, empty_looking, None),
+            (1, "", "prefs_failed"),
+            (0, "{}", None),
+        )
+        for reply in cases:
+            with self.subTest(reply=reply):
+                with tempfile.TemporaryDirectory() as tmp:
+                    state = Path(tmp)
+                    self.write_snapshot(state)
+                    table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+                    table.exit_node_cleared = True
+                    table.prefs_reply = reply
+                    result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                          sleep=table.sleep, now=lambda: table.clock,
+                                          tailscale_path=TS)
+                    self.assertEqual(result["result"], "rollback_incomplete")
+                    self.assertIn("prefs_unreadable", result["steps"])
+                    self.assertNotIn("exit_node_was_empty", result["steps"])
+                    self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_observed_empty_exit_matches_without_a_write(self):
+        empty = {"status": "observed", "ExitNodeID": "", "ExitNodeIP": "",
+                 "CorpDNS": False, "RouteAll": False,
+                 "ExitNodeAllowLANAccess": False, "WantRunning": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state, prefs=empty)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.prefs_reply = (0, json.dumps({
+                "ExitNodeID": "", "ExitNodeIP": "", "CorpDNS": False, "RouteAll": False,
+                "ExitNodeAllowLANAccess": False, "WantRunning": True,
+            }), None)
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn("exit_node_was_empty", result["steps"])
+            self.assertEqual([item for item in table.mutations if item[0] == TS], [])
+
+    def test_observed_selected_exit_is_still_restored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.write_snapshot(state)
+            table = Table(services=(("Wi-Fi", ["192.0.2.53"]),))
+            table.exit_node_cleared = True
+            table.scutil_reply = (0, DNS_CLEAN, None)
+            result = mod.rollback(state, runner=table.runner, mutator=table.mutator,
+                                  sleep=table.sleep, now=lambda: table.clock,
+                                  tailscale_path=TS)
+            self.assertEqual(result["result"], "rollback_restored")
+            self.assertIn([TS, "set", "--exit-node=" + EXIT_IP], table.mutations)
+            self.assertEqual(table.clock, 0)
 
     def test_pin_beats_a_newer_post_cutover_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

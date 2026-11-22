@@ -88,6 +88,56 @@ class RegistryTests(SourceFixture):
         self.assertEqual(self.store.load()["sources"], {})
         self.assertEqual(e.public_status(self.directory, False)["mode"], "sources")
 
+    def test_group_umask_creates_private_directories_and_a_second_write_works(self):
+        for mask in (0o002, 0o022):
+            with self.subTest(umask=oct(mask)):
+                parent = self.base / f"sources-{mask:03o}"
+                parent.mkdir(mode=0o700)
+                directory = parent / "nmd" / "egress"
+                store = e.Store(directory)
+                previous = os.umask(mask)
+                try:
+                    e.put_source(store, "tail-a", TAIL)
+                    e.put_source(store, "tail-b", dict(
+                        TAIL, server="100.64.0.11", expected_egress_ip="198.51.100.11"))
+                finally:
+                    os.umask(previous)
+                for path in (parent / "nmd", directory):
+                    info = path.lstat()
+                    self.assertFalse(stat.S_ISLNK(info.st_mode))
+                    self.assertEqual(stat.S_IMODE(info.st_mode) & 0o022, 0, path)
+                self.assertTrue(store.path.is_file())
+                self.assertFalse(store.path.is_symlink())
+
+    def test_existing_group_writable_parent_is_not_repaired(self):
+        parent = self.base / "wide-parent"
+        parent.mkdir(mode=0o700)
+        wide = parent / "nmd"
+        wide.mkdir(mode=0o775)
+        os.chmod(wide, 0o775)
+        before = stat.S_IMODE(wide.lstat().st_mode)
+        directory = wide / "egress"
+        store = e.Store(directory)
+        with self.assertRaisesRegex(e.SourceError, "unsafe_source_directory"):
+            e.put_source(store, "tail-a", TAIL)
+        self.assertEqual(stat.S_IMODE(wide.lstat().st_mode), before)
+        self.assertFalse(directory.exists())
+        self.assertFalse((directory / "sources.json").exists())
+
+    def test_symlink_source_directory_is_not_followed(self):
+        parent = self.base / "link-parent"
+        parent.mkdir(mode=0o700)
+        target = parent / "real"
+        target.mkdir(mode=0o755)
+        os.chmod(target, 0o755)
+        link = parent / "egress"
+        link.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(e.SourceError):
+            e.put_source(e.Store(link), "tail-a", TAIL)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o755)
+        self.assertFalse((target / "sources.json").exists())
+
     def test_uninitialized_view_is_read_only(self):
         with patch.object(e.Controller, "request", side_effect=AssertionError("no controller")):
             view = e.public_status(self.directory)
