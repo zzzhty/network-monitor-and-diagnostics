@@ -391,7 +391,7 @@ def serve_dashboard(port, state_dir, sources_dir=None, config_path=None,
     return server
 
 
-def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
+def cli_parser(state_dir=None, config_file=None, sources_dir=None):
     parser = argparse.ArgumentParser(prog="nmd", description="Network Monitor & Diagnostics: independent diagnostics (no network configuration changes)")
     commands = parser.add_subparsers(dest="command", required=True)
     mon = commands.add_parser("monitor", help="continuous diagnostics and recorded history")
@@ -418,22 +418,44 @@ def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
     machine = commands.add_parser("machine", help="versioned machine-readable interface")
     machine.add_argument("action", choices=["capabilities", "status"])
     machine.add_argument("--state-dir", type=Path, default=state_dir or default_state_dir())
+    return parser
+
+
+def run_synthetic(parser, args):
+    if not getattr(args, "dry_run", False):
+        return False
+    if args.command == "monitor" and args.action == "status":
+        with demo_state() as state:
+            print_json(nmd_monitor.read_snapshot(state))
+        return True
+    if args.command == "gui":
+        if not 0 <= args.port <= 65535:
+            parser.error("port must be between 0 and 65535")
+        with demo_state() as state:
+            print("模拟演示：所有样本均为合成数据，不代表本机网络状态。", flush=True)
+            serve_dashboard(args.port, state, sources_dir=None, config_path=None)
+        return True
+    return False
+
+
+def run_synthetic_if_requested(argv):
+    # Only these two forms support synthetic data and have no required
+    # arguments that depend on installed defaults. Parse them normally before
+    # resolving the installation, preserving argparse's flags and validation.
+    if not (argv[:1] == ["gui"] or argv[:2] == ["monitor", "status"]):
+        return False
+    parser = cli_parser()
+    return run_synthetic(parser, parser.parse_args(argv))
+
+
+def main(argv=None, state_dir=None, config_file=None, sources_dir=None):
+    parser = cli_parser(state_dir, config_file, sources_dir)
     args = parser.parse_args(argv)
+    if run_synthetic(parser, args):
+        return
     if (args.command == "monitor" and args.action == "run"
             and args.sources_dir is not None and nmd_platform.name() != "linux"):
         parser.error("automatic egress source control is unsupported on this platform")
-    if getattr(args, "dry_run", False):
-        if args.command == "monitor" and args.action == "status":
-            with demo_state() as state:
-                print_json(nmd_monitor.read_snapshot(state))
-            return
-        if args.command == "gui":
-            if not 0 <= args.port <= 65535:
-                parser.error("port must be between 0 and 65535")
-            with demo_state() as state:
-                print("模拟演示：所有样本均为合成数据，不代表本机网络状态。", flush=True)
-                serve_dashboard(args.port, state, sources_dir=None, config_path=None)
-            return
     if args.command == "machine" and args.action == "capabilities":
         print_json(nmd_platform.capabilities())
     elif args.command == "machine" or (args.command == "monitor" and args.action == "status"):
