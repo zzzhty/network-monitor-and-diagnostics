@@ -444,9 +444,14 @@ class MacosDesktopTests(DesktopFixture):
         kept = new / "Contents/UserNotes.txt"
         self.assertEqual(kept.stat().st_ino, note_inode)
         self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
-        self.assertFalse((self.home / "Applications/nmd.app").exists())
-        self.assertEqual(sorted(path.name for path in (self.home / "Applications").iterdir()),
+        # exists(nmd.app) stays true on a case-insensitive volume: it is this
+        # same directory. The stored directory entry is the name that changed.
+        apps = self.home / "Applications"
+        self.assertEqual(sorted(path.name for path in apps.iterdir()),
                          ["NMD.app", "keep.txt"])
+        folded = apps / "nmd.app"
+        if folded.exists():
+            self.assertEqual(folded.stat().st_ino, dir_inode)
         info = plistlib.loads((new / "Contents/Info.plist").read_bytes())
         self.assertEqual(info["CFBundleName"], "NMD")
         self.assertEqual(info["CFBundleDisplayName"], "NMD")
@@ -474,7 +479,11 @@ class MacosDesktopTests(DesktopFixture):
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text("keep-me")
         foreign = self.home / "Applications/NMD.app"
-        (foreign / "Contents").mkdir(parents=True)
+        try:
+            (foreign / "Contents").mkdir(parents=True)
+        except FileExistsError:
+            self.skipTest("this volume stores nmd.app and NMD.app as one directory; "
+                          "the other-inode refusal is covered in-process")
         marker = foreign / "Contents/foreign.txt"
         marker.write_text("other-app")
         self._product("NMD")
@@ -508,9 +517,35 @@ class MacosDesktopTests(DesktopFixture):
         kept = result / "Contents/UserNotes.txt"
         self.assertEqual(kept.stat().st_ino, note_inode)
         self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
-        self.assertFalse(note.exists())
         self.assertEqual([path.name for path in parent.iterdir()], ["NMD.app"])
         self.assertFalse(any(path.name.startswith(".nmd-bundle-case-") for path in parent.iterdir()))
+        # A case-insensitive volume still resolves the old spelling. That is
+        # the same inode, not a second bundle left behind.
+        if note.exists():
+            self.assertEqual(note.stat().st_ino, note_inode)
+            self.assertEqual((parent / "nmd.app").stat().st_ino, inode)
+
+    def test_other_inode_refusal_deletes_nothing(self):
+        parent = self.base / "case-apps"
+        parent.mkdir()
+        app = parent / "nmd.app"
+        (app / "Contents").mkdir(parents=True)
+        note = app / "Contents/UserNotes.txt"
+        note.write_text("keep-me")
+        inode = app.stat().st_ino
+        desired = parent / "NMD.app"
+
+        def forbid_rmtree(*args, **kwargs):
+            raise AssertionError(f"rmtree {args}")
+
+        with patch.object(manager.shutil, "rmtree", forbid_rmtree), \
+                patch.object(manager, "_desired_occupied", return_value="other"):
+            with self.assertRaises(manager.ManagerError) as caught:
+                manager._align_bundle_directory(app, desired)
+        self.assertIn("desktop_bundle_case_conflict", str(caught.exception))
+        self.assertEqual(note.read_text(encoding="utf-8"), "keep-me")
+        self.assertEqual(app.stat().st_ino, inode)
+        self.assertEqual([path.name for path in parent.iterdir()], ["nmd.app"])
 
     def test_linux_receipt_cannot_claim_files_on_macos(self):
         linux_receipt = {"version": 1, "root": str(self.checkout),
