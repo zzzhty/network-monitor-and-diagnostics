@@ -246,6 +246,8 @@ CLI、持续采集与本机浏览器面板分别运行；关闭面板不停止�
 Tauri 桌面壳（托盘、自动切换系统通知；逻辑仍唯一由 Python 拥有），Linux/macOS 上
 `nmd desktop install` 一条命令用户级安装（需 Rust 工具链；macOS 无需证书、不生成
 DMG，首次先 `./install.sh --manager-only`，见 [docs/desktop.md](docs/desktop.md)）。
+`nmd update` 不会重装已经装好的桌面壳；macOS 上要更新菜单名或 `NMD.app` 时再跑一次
+`nmd desktop install`。
 
 ```bash
 # 先验证本地观测配置；不会发出主动网络探测

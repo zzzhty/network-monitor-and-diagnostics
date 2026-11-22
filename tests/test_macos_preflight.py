@@ -607,6 +607,8 @@ class CommandTests(unittest.TestCase):
         self.assertIn("daemon", output.getvalue())
         self.assertIn("takeover", output.getvalue())
         self.assertIn("unknown", output.getvalue())
+        self.assertIn("--json", output.getvalue())
+        self.assertIn("--summary", output.getvalue())
 
     def test_main_prints_json_and_the_matching_exit_code(self):
         for result, code in (("pass", 0), ("fail", 1), ("unknown", 3), ("not_applicable", 0)):
@@ -615,12 +617,139 @@ class CommandTests(unittest.TestCase):
                       "checks": [], "remediation": ["请在本机安装官方 mihomo。不会自动下载。"],
                       "effects": {"preflight_mutates": False}}
             output = io.StringIO()
+            error = io.StringIO()
             with patch.object(pf, "run", return_value=report), \
-                    contextlib.redirect_stdout(output):
+                    contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(error):
                 self.assertEqual(pf.main(["--tier", "readonly"]), code)
             body = json.loads(output.getvalue())
             self.assertEqual(body["result"], result)
             self.assertIn("不会自动下载", body["remediation"][0])
+            self.assertEqual(error.getvalue(), "")
+
+    def test_conflicting_format_flags_do_not_probe(self):
+        with patch.object(pf, "run", side_effect=AssertionError("probed")), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(pf.main(["--json", "--summary"]), 2)
+        self.assertIn("--json", error.getvalue())
+
+    def test_tty_defaults_to_summary_and_explicit_json_stays_clean(self):
+        report = {"schema_version": 1, "kind": "macos_preflight", "tier": "readonly",
+                  "result": "fail", "blocking": True,
+                  "checks": [
+                      {"id": "collector_directory", "status": "pass", "required": True,
+                       "summary": "当前用户可以使用采集目录。"},
+                      {"id": "dashboard_port", "status": "fail", "required": True,
+                       "summary": "面板端口 8765 已有程序在监听。",
+                       "remediation": "换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。"},
+                  ],
+                  "remediation": ["换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。"],
+                  "effects": {"preflight_mutates": False}}
+        seen = {}
+
+        def fake_run(tier, on_check=None):
+            seen["on_check"] = on_check
+            if on_check is not None:
+                on_check(report["checks"][0])
+                on_check(report["checks"][1])
+            return report
+
+        class Stream(io.StringIO):
+            def __init__(self, tty):
+                super().__init__()
+                self._tty = tty
+
+            def isatty(self):
+                return self._tty
+
+        cases = (
+            ("tty-default", [], True, False, True),
+            ("pipe-default", [], False, False, False),
+            ("tty-json", ["--json"], True, True, False),
+            ("pipe-summary", ["--summary"], False, False, True),
+            ("tty-summary", ["--summary"], True, True, True),
+        )
+        for name, args, out_tty, err_tty, human in cases:
+            with self.subTest(name=name):
+                seen.clear()
+                stdout, stderr = Stream(out_tty), Stream(err_tty)
+                with patch.object(pf, "run", side_effect=fake_run), \
+                        patch.object(sys, "stdout", stdout), \
+                        patch.object(sys, "stderr", stderr):
+                    self.assertEqual(pf.main(["--tier", "readonly", *args]), 1)
+                if human:
+                    self.assertIsNotNone(seen["on_check"])
+                    self.assertIn("预检（readonly）：失败", stdout.getvalue())
+                    self.assertIn("阻塞：", stdout.getvalue())
+                    self.assertEqual(stdout.getvalue().count("不会结束那个进程"), 1)
+                    self.assertNotIn("schema_version", stdout.getvalue())
+                    self.assertNotIn("\x1b", stdout.getvalue() + stderr.getvalue())
+                    self.assertIn("采集目录", stderr.getvalue())
+                    if err_tty:
+                        self.assertIn("\r", stderr.getvalue())
+                    else:
+                        self.assertNotIn("\r", stderr.getvalue())
+                else:
+                    self.assertIsNone(seen["on_check"])
+                    self.assertEqual(stderr.getvalue(), "")
+                    body = json.loads(stdout.getvalue())
+                    self.assertEqual(body, report)
+                    self.assertTrue(stdout.getvalue().startswith("{"))
+
+    def test_summary_exit_codes_match_pass_fail_and_unknown(self):
+        labels = {"pass": "通过", "fail": "失败", "unknown": "未知",
+                  "not_applicable": "不适用"}
+        for result, code in (("pass", 0), ("fail", 1), ("unknown", 3), ("not_applicable", 0)):
+            report = {"schema_version": 1, "kind": "macos_preflight", "tier": "daemon",
+                      "result": result, "blocking": result in ("fail", "unknown"),
+                      "checks": [], "remediation": [],
+                      "effects": {"preflight_mutates": False}}
+            output = io.StringIO()
+            with patch.object(pf, "run", return_value=report), \
+                    contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pf.main(["--summary"]), code)
+            text = output.getvalue()
+            self.assertIn(labels[result], text)
+            self.assertNotIn("schema_version", text)
+            self.assertNotIn("\x1b", text)
+            if result == "not_applicable":
+                self.assertIn("没有执行检查", text)
+
+    def test_duplicate_remediation_is_listed_once(self):
+        report = pf.assess("takeover", takeover_facts(snapshot={
+            "status": "unknown", "reason": "timeout",
+            "has_198_18": None, "mihomo_running": None}))
+        text = pf.render_summary(report)
+        self.assertEqual(text.count("不会当成没有冲突"), 1)
+        self.assertIn("预检（takeover）：未知", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\r", text)
+        self.assertNotIn("{", text)
+
+    def test_library_entry_points_do_not_print_human_text(self):
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(pf, "host_is_darwin", return_value=False), \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(error):
+            self.assertEqual(pf.for_foreground({})["result"], "not_applicable")
+            self.assertEqual(pf.for_daemon_lifecycle()["result"], "not_applicable")
+            self.assertEqual(pf.for_installed_takeover()["result"], "not_applicable")
+            self.assertEqual(pf.run("readonly")["result"], "not_applicable")
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue(), "")
+
+    def test_non_darwin_summary_explains_the_early_exit(self):
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(pf, "host_is_darwin", return_value=False), \
+                patch.object(pf, "collect", side_effect=AssertionError("probed")), \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(error):
+            self.assertEqual(pf.main(["--tier", "takeover", "--summary"]), 0)
+        self.assertIn("不适用", output.getvalue())
+        self.assertIn("没有执行检查", output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        self.assertNotIn("\x1b", output.getvalue())
 
     def test_non_darwin_run_does_not_probe_and_does_not_block(self):
         with patch.object(pf, "host_is_darwin", return_value=False), \
@@ -722,6 +851,88 @@ class CollectTests(_Tree):
         self.assertNotIn("mihomo_executable", [item["id"] for item in report["checks"]])
         self.assertNotIn(TOKEN, json.dumps(report))
         self.assertNotIn(TAILNET, json.dumps(report))
+
+    def test_progress_is_flushed_before_the_next_probe_starts(self):
+        self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
+        err = _Capture()
+        out = io.StringIO()
+        entered = {}
+
+        def blocking_listen(port):
+            text = err.getvalue()
+            self.assertGreater(err.flushes, 0, text)
+            self.assertIn("采集目录", text)
+            self.assertNotIn("面板端口", text)
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("\r", text)
+            entered["ok"] = True
+            return "busy"
+
+        with self.context(), patch.object(pf, "probe_listen", side_effect=blocking_listen), \
+                patch.object(sys, "stdout", out), patch.object(sys, "stderr", err):
+            code = pf.main(["--summary"])
+        self.assertTrue(entered.get("ok"))
+        self.assertEqual(code, 1)
+        summary = out.getvalue()
+        self.assertIn("预检（readonly）：失败", summary)
+        self.assertIn("面板端口", summary)
+        self.assertEqual(summary.count("不会结束那个进程"), 1)
+        self.assertNotIn("schema_version", summary)
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertIn("[失败] 面板端口", err.getvalue())
+
+    def test_explicit_json_matches_the_report_and_has_no_progress(self):
+        err = _Capture()
+        out = io.StringIO()
+        with self.context(), patch.object(sys, "stdout", out), patch.object(sys, "stderr", err):
+            expected = pf.run("readonly")
+            code = pf.main(["--json"])
+        self.assertEqual(code, pf.exit_code(expected))
+        self.assertEqual(out.getvalue(),
+                         json.dumps(expected, ensure_ascii=False, indent=2) + "\n")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(err.flushes, 0)
+
+    def test_missing_daemon_config_summary_names_the_gap(self):
+        err = _Capture()
+        out = io.StringIO()
+        with self.context(), \
+                patch.object(pf, "probe_activity", return_value=dict(INACTIVE)), \
+                patch.object(pf, "probe_snapshot", side_effect=AssertionError("snapshot")), \
+                patch.object(pf, "probe_listen", side_effect=AssertionError("listen")), \
+                patch.object(pf, "probe_version", side_effect=AssertionError("version")), \
+                patch.object(pf, "probe_geodata", side_effect=AssertionError("geodata")), \
+                patch.object(pf, "probe_tailscale_status", side_effect=AssertionError("status")), \
+                patch.object(sys, "stdout", out), patch.object(sys, "stderr", err):
+            code = pf.main(["--tier", "daemon", "--summary"])
+        self.assertEqual(code, 1)
+        text = out.getvalue()
+        self.assertIn("预检（daemon）：失败", text)
+        self.assertIn("没有 daemon.json", text)
+        self.assertIn("nmd macos daemon init", text)
+        self.assertNotIn("schema_version", text)
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertNotIn("\r", err.getvalue())
+        self.assertIn("[失败] 守护配置", err.getvalue())
+
+
+class _Capture(io.TextIOBase):
+    def __init__(self):
+        self.parts = []
+        self.flushes = 0
+
+    def write(self, data):
+        self.parts.append(data)
+        return len(data)
+
+    def flush(self):
+        self.flushes += 1
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        return "".join(self.parts)
 
 
 class LifecycleTests(_Tree):

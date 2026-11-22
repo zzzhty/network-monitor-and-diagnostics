@@ -494,6 +494,10 @@ def update(root, check_only):
                 _restore_pending(root, previous_pending)
                 raise
         print("代码更新完成；没有应用网络配置或重启服务。需要时运行 nmd apply。", flush=True)
+        if nmd_platform.name() == "macos" and setting(root, "desktopInstalled") == "true":
+            print("桌面壳仍是已安装的那一份；这次更新没有重装 ~/Applications 里的应用，"
+                  "菜单名和目录大小写也不会变。需要时运行 nmd desktop install"
+                  "（无 sudo，会构建）。", flush=True)
         if nmd_platform.name() == "macos":
             # launchd keeps running the old code until the daemon restarts.
             try:
@@ -582,6 +586,7 @@ def _macos_info_plist(executable, identifier, version, name):
             f'\t<key>CFBundleIdentifier</key><string>{_xml(identifier)}</string>\n'
             '\t<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n'
             f'\t<key>CFBundleName</key><string>{_xml(name)}</string>\n'
+            f'\t<key>CFBundleDisplayName</key><string>{_xml(name)}</string>\n'
             '\t<key>CFBundlePackageType</key><string>APPL</string>\n'
             '\t<key>CFBundleIconFile</key><string>AppIcon</string>\n'
             f'\t<key>CFBundleShortVersionString</key><string>{_xml(version)}</string>\n'
@@ -743,6 +748,235 @@ def desktop_main(root, args):
         _desktop_status(root, paths)
 
 
+def _dir_identity(path):
+    """Device and inode via lstat, so a symlink is not the directory it names."""
+    info = os.lstat(path)
+    return (info.st_dev, info.st_ino)
+
+
+def _stored_dir_entry(path):
+    """The directory entry as stored, not the case requested by ``path``.
+
+    Returns the entry, ``None`` when nothing matches, or ``"ambiguous"`` when
+    more than one case variant exists. An exact name wins over a folded one.
+    """
+    parent = path.parent
+    try:
+        names = [entry.name for entry in parent.iterdir()]
+    except OSError:
+        return None
+    if path.name in names:
+        return parent / path.name
+    folded = [name for name in names if name.casefold() == path.name.casefold()]
+    if len(folded) == 1:
+        return parent / folded[0]
+    if folded:
+        return "ambiguous"
+    return None
+
+
+def _desired_occupied(stored, desired):
+    """``absent``, ``same`` inode, or ``other``. Existence alone is not enough."""
+    try:
+        exists = desired.exists()
+    except OSError as exc:
+        raise ManagerError(
+            "desktop_bundle_case_failed:无法确认目标目录;未改名、未删除") from exc
+    if not exists:
+        return "absent"
+    try:
+        same = _dir_identity(stored) == _dir_identity(desired)
+    except OSError as exc:
+        raise ManagerError(
+            "desktop_bundle_case_failed:无法确认目标目录;未改名、未删除") from exc
+    return "same" if same else "other"
+
+
+def _two_step_case_rename(stored, desired):
+    """Change only the stored case of one directory. Never unlinks it."""
+    try:
+        stored_id = _dir_identity(stored)
+    except OSError as exc:
+        raise ManagerError(
+            "desktop_bundle_case_failed:无法确认应用包;未改名、未删除") from exc
+    temp = stored.parent / f".nmd-bundle-case-{os.getpid()}-{stored_id[1]}"
+    try:
+        if temp.exists():
+            raise ManagerError(
+                "desktop_bundle_case_busy:临时改名路径已存在;未改名、未删除")
+    except ManagerError:
+        raise
+    except OSError as exc:
+        raise ManagerError(
+            "desktop_bundle_case_failed:无法确认临时路径;未改名、未删除") from exc
+    try:
+        os.rename(stored, temp)
+        try:
+            os.rename(temp, desired)
+        except OSError:
+            try:
+                os.rename(temp, stored)
+            except OSError:
+                pass
+            raise
+    except ManagerError:
+        raise
+    except OSError as exc:
+        raise ManagerError(
+            "desktop_bundle_case_failed:应用包大小写未能改好;未删除原目录") from exc
+    after = _stored_dir_entry(desired)
+    ok = isinstance(after, Path) and after.name == desired.name
+    if ok:
+        try:
+            ok = _dir_identity(after) == stored_id
+        except OSError:
+            ok = False
+    if not ok:
+        try:
+            if (not stored.exists() and desired.exists() and not desired.is_symlink()
+                    and _dir_identity(desired) == stored_id):
+                os.rename(desired, stored)
+        except OSError:
+            pass
+        raise ManagerError(
+            "desktop_bundle_case_failed:应用包大小写未能改好;未删除原目录")
+    return after
+
+
+def _align_bundle_directory(current, desired):
+    """Point a receipt bundle at the product name when only case differs.
+
+    ``exists(NMD.app)`` is true for ``nmd.app`` on a case-insensitive volume,
+    and both names are one inode. This renames that entry. It does not treat
+    the two spellings as different apps and does not delete either.
+    """
+    stored = _stored_dir_entry(current)
+    if stored is None:
+        return current
+    if stored == "ambiguous":
+        raise ManagerError(
+            "desktop_bundle_case_conflict:目标目录大小写不唯一;未改名、未删除")
+    if stored.is_symlink() or not stored.is_dir():
+        raise ManagerError(
+            "desktop_bundle_case_failed:应用包不是普通目录;未改名、未删除")
+    if stored.name == desired.name:
+        return stored
+    if stored.parent != desired.parent or stored.name.casefold() != desired.name.casefold():
+        return current
+    if desired.is_symlink():
+        raise ManagerError(
+            "desktop_bundle_case_failed:目标路径是符号链接;未改名、未删除")
+    if _desired_occupied(stored, desired) == "other":
+        raise ManagerError(
+            "desktop_bundle_case_conflict:目标目录已被另一份应用占用;未改名、未删除")
+    return _two_step_case_rename(stored, desired)
+
+
+def _retarget_paths(paths, old_app, new_app):
+    old, new = str(old_app), str(new_app)
+    updated = {}
+    for key, path in paths.items():
+        text = str(path)
+        if text == old or text.startswith(old + os.sep):
+            updated[key] = Path(new + text[len(old):])
+        else:
+            updated[key] = path
+    return updated
+
+
+def _rewrite_autostart_binary(root, receipt, paths, old_binary, new_binary):
+    path = paths.get("autostart")
+    if path is None or str(old_binary) == str(new_binary):
+        return
+    if "autostart" not in (receipt.get("files") or {}) or not path.is_file():
+        return
+    old, new = str(old_binary), str(new_binary)
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        return
+    _desktop_write_file(root, receipt, "autostart", path, text.replace(old, new))
+
+
+def _macos_refresh_bundle_case(root, receipt, paths):
+    """Rename nmd.app to NMD.app when the product name changed only by case."""
+    _, _, product = _desktop_metadata(root / DESKTOP_CRATE)
+    desired = Path.home() / "Applications" / f"{product}.app"
+    current = _macos_bundle_root(paths)
+    if (current.parent != desired.parent
+            or current.name.casefold() != desired.name.casefold()
+            or not current.exists()):
+        return paths
+    install_scope._plain_path(current)
+    new_app = _align_bundle_directory(current, desired)
+    if new_app.name == current.name and str(new_app) == str(current):
+        return paths
+    new_paths = _retarget_paths(paths, current, new_app)
+    previous = dict(receipt["paths"])
+    receipt["paths"] = {key: str(path) for key, path in new_paths.items()}
+    try:
+        _save_desktop_receipt(root, receipt)
+    except Exception:
+        receipt["paths"] = previous
+        try:
+            if not current.exists() and new_app.exists() and not new_app.is_symlink():
+                os.rename(new_app, current)
+        except OSError:
+            pass
+        raise
+    try:
+        _rewrite_autostart_binary(
+            root, receipt, new_paths, paths["binary"], new_paths["binary"])
+    except Exception:
+        # The directory and the receipt already agree. Leave both; do not delete.
+        raise
+    return new_paths
+
+
+def _plist_visible_name(info_path):
+    try:
+        import plistlib
+        data = plistlib.loads(info_path.read_bytes())
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("CFBundleDisplayName", "CFBundleName"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _macos_name_hint(root, paths):
+    try:
+        _, _, product = _desktop_metadata(root / DESKTOP_CRATE)
+    except ManagerError:
+        return None
+    app = _macos_bundle_root(paths)
+    try:
+        present = app.exists()
+    except OSError:
+        return None
+    if not present:
+        return None
+    stored = _stored_dir_entry(app)
+    stored_name = stored.name if isinstance(stored, Path) else None
+    visible = None
+    info = paths.get("info")
+    if info is not None and info.is_file():
+        visible = _plist_visible_name(info)
+    wanted = f"{product}.app"
+    folder_mismatch = (stored_name is not None and stored_name.casefold() == wanted.casefold()
+                       and stored_name != wanted)
+    name_mismatch = visible is not None and visible != product
+    if not folder_mismatch and not name_mismatch:
+        return None
+    shown = visible or stored_name or product
+    return (f"显示名称: {shown}。源码产品名是 {product}。"
+            "nmd update 不会重装桌面壳；要改菜单名和目录大小写，请运行 "
+            "nmd desktop install（无 sudo，会构建）。")
+
+
 def _macos_install(root, receipt, paths, built, crate):
     """Wrap the cargo binary in a minimal unsigned local .app; no bundler dependency."""
     identifier, version, product = _desktop_metadata(crate)
@@ -783,6 +1017,7 @@ def _desktop_install(root, paths):
                           "paths": {key: str(path) for key, path in paths.items()}, "files": {}}
     _save_desktop_receipt(root, receipt)
     if sys.platform == "darwin":
+        paths = _macos_refresh_bundle_case(root, receipt, paths)
         _macos_install(root, receipt, paths, built, crate)
     else:
         for key, source, mode in (("binary", built, 0o755),
@@ -853,11 +1088,14 @@ def _desktop_status(root, paths):
     installed = paths["binary"].is_file()
     if sys.platform == "darwin":
         app = _macos_bundle_root(paths)
+        hint = _macos_name_hint(root, paths)
         print(f"安装范围: {scope_of(root)}\n"
               f"桌面壳: {'已安装' if installed else '未安装'}\n"
               f"应用包: {app} ({'存在' if app.is_dir() else '不存在'})\n"
               f"开机自启: {'已开启' if paths['autostart'].is_file() else '未开启'}\n"
-              f"提示: 开启自启 nmd desktop autostart on;卸载 nmd desktop uninstall", flush=True)
+              + (f"{hint}\n" if hint else "")
+              + "提示: 开启自启 nmd desktop autostart on;卸载 nmd desktop uninstall",
+              flush=True)
         return
     print(f"安装范围: {scope_of(root)}\n"
           f"桌面壳: {'已安装' if installed else '未安装'}\n"
@@ -946,8 +1184,10 @@ NMD macOS：默认只做监控和诊断，不接管流量
   macos geodata ensure [--geodata-dir DIR] [--inputs FILE]
                                        下载缺少的 geosite.dat / geoip.metadb。不要 sudo。
                                        预检、help、status 和面板不会跑这一步
-  macos preflight [--tier readonly|daemon|takeover]
-                                       只读预检。默认 readonly，不要求 mihomo。不会下载
+  macos preflight [--tier readonly|daemon|takeover] [--json|--summary]
+                                       只读预检。终端逐项显示并在末尾给中文摘要；
+                                       非终端默认仍是完整 JSON。--json 只要 JSON。
+                                       --summary 在非终端也给摘要。默认 readonly。不会下载
   macos daemon init --inputs FILE [--mihomo PATH]
                                        写入 daemon.json。on_boot 固定为 JSON false。
                                        拒绝占位地址 203.0.113.20。不覆盖已有文件。不要 sudo
@@ -970,7 +1210,7 @@ MACOS_SUBCOMMANDS = """\
 nmd macos 子命令。这是实验路径，不是默认监控。总览见 nmd help。
 
   geodata ensure [--geodata-dir DIR] [--inputs FILE]
-  preflight [--tier readonly|daemon|takeover]
+  preflight [--tier readonly|daemon|takeover] [--json|--summary]
   daemon init --inputs FILE [--mihomo PATH]
   daemon on-boot [on|off|status]
   daemon install|uninstall|start|stop|restart|status|takeover-start|takeover-stop

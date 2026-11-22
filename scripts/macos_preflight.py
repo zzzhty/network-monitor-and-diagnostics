@@ -10,10 +10,14 @@ Three tiers, so opening a panel does not depend on takeover-only tools:
 * ``takeover`` — before any network change: mihomo, the official Tailscale
   client, geodata, offline config, and port conflicts.
 
-The command prints one JSON document and does not install, download, sudo,
-stop, start, or edit routes, DNS, proxy, or Tailscale. A ``fail`` or
-``unknown`` result is blocking. ``unknown`` is a probe that did not answer,
-not a guess that the check passed.
+On a terminal the command prints each check as that check finishes, then a
+short Chinese summary. A non-terminal still prints one JSON document so
+scripts keep working. ``--json`` is always that document and nothing else.
+``--summary`` is the short summary even without a terminal; progress goes
+to stderr and does not use terminal control sequences there. The command
+does not install, download, sudo, stop, start, or edit routes, DNS, proxy,
+or Tailscale. A ``fail`` or ``unknown`` result is blocking. ``unknown`` is
+a probe that did not answer, not a guess that the check passed.
 
 ``tun.dns-mode: native`` needs mihomo 1.19.33 or newer. That floor is the
 one recorded in ``docs/macos-mihomo-tailscale.md`` for this mode. It is not
@@ -51,7 +55,7 @@ _CODE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 _VERSION = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b")
 
 HELP = """\
-usage: nmd macos preflight [--tier readonly|daemon|takeover]
+usage: nmd macos preflight [--tier readonly|daemon|takeover] [--json | --summary]
 
 Read-only checks. The default tier is readonly. Nothing is installed,
 downloaded, stopped, started, or changed. Missing geodata is reported
@@ -65,7 +69,14 @@ unknown blocks the same way fail does.
              the running daemon's status cannot be read.
   takeover   before accept, takeover, or daemon takeover-start.
 
-JSON only. A failed check leaves the running service and the network as they are.
+A terminal shows each finished check, then a short Chinese summary.
+Other outputs stay one JSON document, so scripts can keep parsing stdout.
+--json always prints that JSON and no progress.
+--summary prints the summary even when stdout is not a terminal.
+Progress is stderr. A terminal may redraw that line; otherwise each check
+is one plain line with no ANSI control sequences.
+--json and --summary cannot be combined.
+A failed check leaves the running service and the network as they are.
 """
 
 
@@ -563,8 +574,24 @@ def _safe_probe(fn, fallback):
     return value if isinstance(value, dict) else fallback
 
 
-def collect(tier, *, root=None, options=None):
-    """Gather facts. Every probe is read-only; a probe error becomes unknown."""
+def _emit(on_check, factory, *args):
+    """Report checks only after their probes have returned.
+
+    Library and JSON callers pass no callback, so this builds nothing and
+    does not import remediation helpers between probes.
+    """
+    if on_check is None:
+        return
+    for item in factory(*args):
+        on_check(item)
+
+
+def collect(tier, *, root=None, options=None, on_check=None):
+    """Gather facts. Every probe is read-only; a probe error becomes unknown.
+
+    ``on_check`` runs only after the probes for that check have returned,
+    and before the next probe starts. It is omitted by library callers.
+    """
     if not host_is_darwin():
         return {"platform": "other", "tier": tier}
     foreground = tier == "takeover" and options is not None
@@ -584,12 +611,14 @@ def collect(tier, *, root=None, options=None):
             facts["collector"] = _safe_probe(
                 lambda: inspect_collector(state),
                 {"status": "unknown", "reason": "probe_error", "path": None})
+        _emit(on_check, _collector_checks, facts)
         config, problem = _load_installed_config(root)
         if problem is None and isinstance(config, dict):
             port = config.get("dashboard", {}).get("port")
             if isinstance(port, int) and not isinstance(port, bool):
                 facts["dashboard_port"] = port
                 facts["listen"][port] = probe_listen(port)
+        _emit(on_check, _dashboard_checks, facts)
         return facts
 
     config = None
@@ -601,6 +630,7 @@ def collect(tier, *, root=None, options=None):
         facts["config_problem"] = problem
     if isinstance(config, dict):
         facts["on_boot"] = config["takeover"]["on_boot"]
+    _emit(on_check, _daemon_config_checks, facts)
     if tier == "daemon":
         facts["activity"] = _safe_probe(
             probe_activity,
@@ -610,6 +640,7 @@ def collect(tier, *, root=None, options=None):
             facts["on_boot"] = activity["on_boot"]
         facts["expand_takeover"] = bool(
             facts["on_boot"] is True or activity.get("state") == "unknown")
+        _emit(on_check, _activity_checks, tier, facts)
 
     override = options.get("mihomo_path") if foreground else None
     if override is None and isinstance(config, dict):
@@ -617,9 +648,11 @@ def collect(tier, *, root=None, options=None):
     facts["mihomo"] = _safe_probe(
         lambda: _resolve_mihomo(override),
         {"status": "unknown", "path": None, "reason": "probe_error"})
+    _emit(on_check, _mihomo_checks, facts)
     facts["tailscale_cli"] = _safe_probe(
         probe_tailscale_cli,
         {"status": "unknown", "path": None, "reason": "probe_error"})
+    _emit(on_check, _tailscale_cli_checks, facts)
 
     if foreground:
         state = options.get("state_dir") or _recorded_state_dir(root)
@@ -630,6 +663,7 @@ def collect(tier, *, root=None, options=None):
     facts["state_dir"] = _safe_probe(
         lambda: inspect_state_dir(state),
         {"status": "unknown", "reason": "probe_error"})
+    _emit(on_check, _state_checks, facts)
 
     want_takeover = tier == "takeover" or facts["expand_takeover"]
     if not want_takeover:
@@ -646,6 +680,7 @@ def collect(tier, *, root=None, options=None):
         lambda: inspect_document(profile, inputs),
         {"status": "unknown", "reason": "probe_error", "dns_mode": None,
          "needs_site": False, "needs_ip": False, "listen_port": None})
+    _emit(on_check, _document_checks, facts)
     document = facts["document"] or {}
     mihomo = facts["mihomo"] or {}
     if mihomo.get("status") == "pass" and mihomo.get("path"):
@@ -654,6 +689,7 @@ def collect(tier, *, root=None, options=None):
             {"status": "unknown", "parsed": None, "reason": "probe_error"})
     else:
         facts["version"] = {"status": "skip", "parsed": None, "reason": "not_run"}
+    _emit(on_check, _version_checks, facts)
     tailscale = facts["tailscale_cli"] or {}
     if tailscale.get("status") == "pass" and tailscale.get("path"):
         facts["tailscale_status"] = _safe_probe(
@@ -662,6 +698,7 @@ def collect(tier, *, root=None, options=None):
     else:
         facts["tailscale_status"] = {"status": "skip", "availability": None,
                                      "reason": "not_run"}
+    _emit(on_check, _tailscale_status_checks, facts)
     geo_override = options.get("geodata_dir") if foreground else None
     facts["geodata_override"] = geo_override
     try:
@@ -676,13 +713,16 @@ def collect(tier, *, root=None, options=None):
         facts["geodata"] = _safe_probe(
             lambda: probe_geodata(geo_dir, document.get("needs_site"), document.get("needs_ip")),
             {"status": "unknown", "reason": "probe_error", "missing": []})
+    _emit(on_check, _geodata_checks, facts)
     facts["snapshot"] = _safe_probe(
         probe_snapshot,
         {"status": "unknown", "reason": "probe_error",
          "has_198_18": None, "mihomo_running": None})
+    _emit(on_check, _snapshot_checks, tier, facts)
     listen_port = document.get("listen_port")
     if isinstance(listen_port, int):
         facts["listen"][listen_port] = probe_listen(listen_port)
+    _emit(on_check, _dns_listen_checks, tier, facts)
     return facts
 
 
@@ -730,220 +770,228 @@ def _version_text(version, dns_mode):
     return ("无法确认 mihomo 版本。", "结果是 unknown。没有改动服务。")
 
 
-def assess(tier, facts):
-    """Turn collected facts into one report. This function does no I/O."""
-    if not isinstance(facts, dict) or facts.get("platform") != "macos":
-        return _not_applicable(tier)
-    checks = []
-    if tier == "readonly":
-        collector = facts.get("collector") or {"status": "unknown", "reason": "not_run"}
-        status = collector.get("status") or "unknown"
-        if status == "pass":
-            summary, fix = "当前用户可以使用采集目录。", None
-        elif status == "unknown":
-            summary, fix = ("读不到采集目录，无法确认当前用户能不能用。",
-                            "请确认目录是否存在、属主是不是当前用户。预检没有创建目录。")
-        else:
-            summary, fix = ("当前用户用不了采集目录。",
-                            "请使用该用户自己的 0700 目录。接管目录若属 root，采集会改用旁边的"
-                            "同名 -user 目录，父目录也必须可写。打开面板不需要 mihomo。")
-        checks.append(_check("collector_directory", status, required=True,
-                             reason=collector.get("reason"), summary=summary,
-                             remediation=fix, path=collector.get("path")))
-        port = facts.get("dashboard_port")
-        if not isinstance(port, int):
-            checks.append(_check("dashboard_port", "skip", required=False,
-                                 reason="not_configured",
-                                 summary="没有已安装的面板端口。打开面板不检查接管组件。"))
-        else:
-            listened = (facts.get("listen") or {}).get(port)
-            if listened == "busy":
-                checks.append(_check(
-                    "dashboard_port", "fail", required=True, reason="busy",
-                    summary=f"面板端口 {port} 已有程序在监听。",
-                    remediation="换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。"))
-            elif listened == "free":
-                checks.append(_check("dashboard_port", "pass", required=True,
-                                     summary=f"面板端口 {port} 没有监听。"))
-            else:
-                checks.append(_check(
-                    "dashboard_port", "unknown", required=True, reason="probe_unknown",
-                    summary=f"无法确认面板端口 {port} 是否空闲。",
-                    remediation="探测没有得到结果，所以这是 unknown。没有改动端口上的程序。"))
-        return _finish(tier, ["readonly"], checks, facts)
+def _collector_checks(facts):
+    collector = facts.get("collector") or {"status": "unknown", "reason": "not_run"}
+    status = collector.get("status") or "unknown"
+    if status == "pass":
+        summary, fix = "当前用户可以使用采集目录。", None
+    elif status == "unknown":
+        summary, fix = ("读不到采集目录，无法确认当前用户能不能用。",
+                        "请确认目录是否存在、属主是不是当前用户。预检没有创建目录。")
+    else:
+        summary, fix = ("当前用户用不了采集目录。",
+                        "请使用该用户自己的 0700 目录。接管目录若属 root，采集会改用旁边的"
+                        "同名 -user 目录，父目录也必须可写。打开面板不需要 mihomo。")
+    return [_check("collector_directory", status, required=True,
+                   reason=collector.get("reason"), summary=summary,
+                   remediation=fix, path=collector.get("path"))]
 
+
+def _dashboard_checks(facts):
+    port = facts.get("dashboard_port")
+    if not isinstance(port, int):
+        return [_check("dashboard_port", "skip", required=False,
+                       reason="not_configured",
+                       summary="没有已安装的面板端口。打开面板不检查接管组件。")]
+    listened = (facts.get("listen") or {}).get(port)
+    if listened == "busy":
+        return [_check(
+            "dashboard_port", "fail", required=True, reason="busy",
+            summary=f"面板端口 {port} 已有程序在监听。",
+            remediation="换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。")]
+    if listened == "free":
+        return [_check("dashboard_port", "pass", required=True,
+                       summary=f"面板端口 {port} 没有监听。")]
+    return [_check(
+        "dashboard_port", "unknown", required=True, reason="probe_unknown",
+        summary=f"无法确认面板端口 {port} 是否空闲。",
+        remediation="探测没有得到结果，所以这是 unknown。没有改动端口上的程序。")]
+
+
+def _daemon_config_checks(facts):
+    if not facts.get("require_daemon_config"):
+        return []
     config_problem = facts.get("config_problem")
-    if facts.get("require_daemon_config"):
-        if config_problem is None and isinstance(facts.get("config"), dict):
-            checks.append(_check("daemon_config", "pass", required=True,
-                                 summary="daemon.json 可以通过现有校验。"))
-        elif config_problem == "absent":
-            checks.append(_check(
-                "daemon_config", "fail", required=True, reason="absent",
-                summary="没有 daemon.json，常驻守护起不来。",
-                remediation="准备一份自己的 Tailnet 地址 inputs（不要用 203.0.113.20），"
-                            "再运行 nmd macos daemon init --inputs。不会自动填入真实地址，"
-                            "也不会用占位地址生成配置。"))
-        elif config_problem in ("unreadable",):
-            checks.append(_check(
-                "daemon_config", "unknown", required=True, reason=config_problem,
-                summary="daemon.json 读不出来。",
-                remediation="无法确认配置是否有效，所以这是 unknown。没有改这个文件。"))
-        else:
-            checks.append(_check(
-                "daemon_config", "fail", required=True, reason=config_problem or "invalid_config",
-                summary="daemon.json 没有通过校验。",
-                remediation="请修正配置的权限、所有者和字段。预检不会改写它。"))
+    if config_problem is None and isinstance(facts.get("config"), dict):
+        return [_check("daemon_config", "pass", required=True,
+                       summary="daemon.json 可以通过现有校验。")]
+    if config_problem == "absent":
+        return [_check(
+            "daemon_config", "fail", required=True, reason="absent",
+            summary="没有 daemon.json，常驻守护起不来。",
+            remediation="准备一份自己的 Tailnet 地址 inputs（不要用 203.0.113.20），"
+                        "再运行 nmd macos daemon init --inputs。不会自动填入真实地址，"
+                        "也不会用占位地址生成配置。")]
+    if config_problem in ("unreadable",):
+        return [_check(
+            "daemon_config", "unknown", required=True, reason=config_problem,
+            summary="daemon.json 读不出来。",
+            remediation="无法确认配置是否有效，所以这是 unknown。没有改这个文件。")]
+    return [_check(
+        "daemon_config", "fail", required=True, reason=config_problem or "invalid_config",
+        summary="daemon.json 没有通过校验。",
+        remediation="请修正配置的权限、所有者和字段。预检不会改写它。")]
 
+
+def _state_checks(facts):
     state = facts.get("state_dir") or {"status": "unknown", "reason": "not_run"}
     if state.get("status") == "pass":
-        checks.append(_check("state_directory", "pass", required=True,
-                             summary="状态目录通过现有的私有路径检查。"))
-    elif state.get("status") == "unknown":
-        checks.append(_check(
+        return [_check("state_directory", "pass", required=True,
+                       summary="状态目录通过现有的私有路径检查。")]
+    if state.get("status") == "unknown":
+        return [_check(
             "state_directory", "unknown", required=True, reason=state.get("reason"),
             summary="读不到状态目录，无法确认权限。",
-            remediation="没有修改该目录。请先确认路径可读，再重试。"))
-    else:
-        checks.append(_check(
-            "state_directory", "fail", required=True, reason=state.get("reason") or "unsafe",
-            summary="状态目录的权限或路径不安全。",
-            remediation="目录需要是运行该进程的用户可用的私有目录，父路径不能是可被替换的符号链接，"
-                        "组或其他人不能可写。预检不会改权限。"))
+            remediation="没有修改该目录。请先确认路径可读，再重试。")]
+    return [_check(
+        "state_directory", "fail", required=True, reason=state.get("reason") or "unsafe",
+        summary="状态目录的权限或路径不安全。",
+        remediation="目录需要是运行该进程的用户可用的私有目录，父路径不能是可被替换的符号链接，"
+                    "组或其他人不能可写。预检不会改权限。")]
 
+
+def _mihomo_checks(facts):
     mihomo = facts.get("mihomo") or {"status": "unknown", "reason": "not_run"}
     summary, fix = _mihomo_text(mihomo)
-    checks.append(_check("mihomo_executable", mihomo.get("status") or "unknown",
-                         required=True, reason=mihomo.get("reason"),
-                         summary=summary, remediation=fix, path=mihomo.get("path")))
+    return [_check("mihomo_executable", mihomo.get("status") or "unknown",
+                   required=True, reason=mihomo.get("reason"),
+                   summary=summary, remediation=fix, path=mihomo.get("path"))]
 
+
+def _tailscale_cli_checks(facts):
     tailscale = facts.get("tailscale_cli") or {"status": "unknown", "reason": "not_run"}
     if tailscale.get("status") == "pass":
-        checks.append(_check("tailscale_cli", "pass", required=True,
-                             summary="找到官方 Tailscale 命令行。",
-                             path=tailscale.get("path")))
-    elif tailscale.get("status") == "unknown":
-        checks.append(_check(
+        return [_check("tailscale_cli", "pass", required=True,
+                       summary="找到官方 Tailscale 命令行。",
+                       path=tailscale.get("path"))]
+    if tailscale.get("status") == "unknown":
+        return [_check(
             "tailscale_cli", "unknown", required=True, reason=tailscale.get("reason"),
             summary="无法确认官方 Tailscale 命令行是否可执行。",
-            remediation="探测没有得到结果。不会改用其他客户端，也不会安装。"))
+            remediation="探测没有得到结果。不会改用其他客户端，也不会安装。")]
+    return [_check(
+        "tailscale_cli", "fail", required=True, reason="missing",
+        summary="没有找到官方 Tailscale 命令行。",
+        remediation="请安装官方 Tailscale，使命令位于 /usr/bin/tailscale、"
+                    "/usr/local/bin/tailscale、/opt/homebrew/bin/tailscale "
+                    "或 Tailscale.app 内。不会自动安装，也不会改用其他客户端。")]
+
+
+def _activity_checks(tier, facts):
+    if tier != "daemon":
+        return []
+    activity = facts.get("activity") or {"state": "unknown", "reason": "not_run"}
+    if activity.get("state") == "unknown":
+        activity_check = _check(
+            "daemon_activity", "unknown", required=True, reason=activity.get("reason"),
+            summary="看不清常驻守护是否正在接管。",
+            remediation="状态套接字没有给出可用结果。为避免误停正在跑的进程，"
+                        "这次不会 stop，也不会 sudo。")
+    elif activity.get("state") == "active":
+        activity_check = _check("daemon_activity", "pass", required=True,
+                                summary="常驻守护在运行，并且当前有接管。")
     else:
-        checks.append(_check(
-            "tailscale_cli", "fail", required=True, reason="missing",
-            summary="没有找到官方 Tailscale 命令行。",
-            remediation="请安装官方 Tailscale，使命令位于 /usr/bin/tailscale、"
-                        "/usr/local/bin/tailscale、/opt/homebrew/bin/tailscale "
-                        "或 Tailscale.app 内。不会自动安装，也不会改用其他客户端。"))
+        activity_check = _check("daemon_activity", "pass", required=True,
+                                reason=activity.get("reason"),
+                                summary="没有看到正在运行的常驻守护。")
+    return [activity_check,
+            _check("network_effect", "pass", required=False,
+                   summary=_network_summary(activity, facts.get("on_boot")))]
 
-    if tier == "daemon":
-        activity = facts.get("activity") or {"state": "unknown", "reason": "not_run"}
-        if activity.get("state") == "unknown":
-            checks.append(_check(
-                "daemon_activity", "unknown", required=True, reason=activity.get("reason"),
-                summary="看不清常驻守护是否正在接管。",
-                remediation="状态套接字没有给出可用结果。为避免误停正在跑的进程，"
-                            "这次不会 stop，也不会 sudo。"))
-        elif activity.get("state") == "active":
-            checks.append(_check("daemon_activity", "pass", required=True,
-                                 summary="常驻守护在运行，并且当前有接管。"))
-        else:
-            checks.append(_check("daemon_activity", "pass", required=True,
-                                 reason=activity.get("reason"),
-                                 summary="没有看到正在运行的常驻守护。"))
-        checks.append(_check("network_effect", "pass", required=False,
-                             summary=_network_summary(activity, facts.get("on_boot"))))
 
-    want_takeover = tier == "takeover" or facts.get("expand_takeover") is True
-    if not want_takeover:
-        required = ["daemon"]
-        return _finish(tier, required, checks, facts)
-
+def _document_checks(facts):
     document = facts.get("document") or {"status": "unknown", "reason": "not_run",
                                          "dns_mode": None}
     if document.get("status") == "pass":
-        checks.append(_check("mihomo_config", "pass", required=True,
-                             summary="离线配置校验通过。没有运行会联网的 mihomo -t。"))
-    elif document.get("status") == "unknown":
-        checks.append(_check(
+        return [_check("mihomo_config", "pass", required=True,
+                       summary="离线配置校验通过。没有运行会联网的 mihomo -t。")]
+    if document.get("status") == "unknown":
+        return [_check(
             "mihomo_config", "unknown", required=True, reason=document.get("reason"),
             summary="离线配置校验没有完成。",
-            remediation="结果是 unknown。没有写入配置，也没有改网络。"))
+            remediation="结果是 unknown。没有写入配置，也没有改网络。")]
+    reason = document.get("reason") or "invalid_config"
+    if reason == "placeholder_inputs":
+        summary = "配置仍是文档占位地址，不能用来接管。"
+        fix = "换成自己的 Tailnet 地址后再试。预检不会写入这份配置。"
+    elif reason == "inputs_missing":
+        summary = "没有接管输入，无法校验将要加载的配置。"
+        fix = "提供 inputs，或先写好 daemon.json。不会自动生成。"
     else:
-        reason = document.get("reason") or "invalid_config"
-        if reason == "placeholder_inputs":
-            summary = "配置仍是文档占位地址，不能用来接管。"
-            fix = "换成自己的 Tailnet 地址后再试。预检不会写入这份配置。"
-        elif reason == "inputs_missing":
-            summary = "没有接管输入，无法校验将要加载的配置。"
-            fix = "提供 inputs，或先写好 daemon.json。不会自动生成。"
-        else:
-            summary = "mihomo 配置没有通过离线校验。"
-            fix = "请修正 inputs 或 profile。预检不会改写配置，也不会联网下载地理数据。"
-        checks.append(_check("mihomo_config", "fail", required=True, reason=reason,
-                             summary=summary, remediation=fix))
+        summary = "mihomo 配置没有通过离线校验。"
+        fix = "请修正 inputs 或 profile。预检不会改写配置，也不会联网下载地理数据。"
+    return [_check("mihomo_config", "fail", required=True, reason=reason,
+                   summary=summary, remediation=fix)]
 
+
+def _version_checks(facts):
+    document = facts.get("document") or {}
     dns_mode = document.get("dns_mode")
     version = facts.get("version") or {"status": "unknown", "reason": "not_run"}
     if version.get("status") == "skip":
-        checks.append(_check("mihomo_version", "skip", required=False,
-                             reason=version.get("reason") or "not_run",
-                             summary="mihomo 还不可执行，跳过版本探测。"))
-    else:
-        capability = version.get("status") or "unknown"
-        if capability == "pass" and dns_mode == "native":
-            parsed = version.get("parsed")
-            if not isinstance(parsed, tuple) or parsed < NATIVE_DNS_MODE_VERSION:
-                capability = "fail"
-        elif capability == "pass" and dns_mode is None:
-            capability = "unknown"
-        summary, fix = _version_text(dict(version, status=capability), dns_mode)
-        checks.append(_check("mihomo_version", capability, required=True,
-                             reason=version.get("reason"), summary=summary,
-                             remediation=fix, version=_version_label(version.get("parsed"))))
+        return [_check("mihomo_version", "skip", required=False,
+                       reason=version.get("reason") or "not_run",
+                       summary="mihomo 还不可执行，跳过版本探测。")]
+    capability = version.get("status") or "unknown"
+    if capability == "pass" and dns_mode == "native":
+        parsed = version.get("parsed")
+        if not isinstance(parsed, tuple) or parsed < NATIVE_DNS_MODE_VERSION:
+            capability = "fail"
+    elif capability == "pass" and dns_mode is None:
+        capability = "unknown"
+    summary, fix = _version_text(dict(version, status=capability), dns_mode)
+    return [_check("mihomo_version", capability, required=True,
+                   reason=version.get("reason"), summary=summary,
+                   remediation=fix, version=_version_label(version.get("parsed")))]
 
+
+def _geodata_checks(facts):
     geodata = facts.get("geodata") or {"status": "unknown", "reason": "not_run", "missing": []}
     if geodata.get("status") == "pass":
-        checks.append(_check("geodata", "pass", required=True,
-                             summary="接管规则要用的地理数据可以读到。这条预检不会下载。"))
-    elif geodata.get("status") == "unknown":
-        checks.append(_check(
+        return [_check("geodata", "pass", required=True,
+                       summary="接管规则要用的地理数据可以读到。这条预检不会下载。")]
+    if geodata.get("status") == "unknown":
+        return [_check(
             "geodata", "unknown", required=True, reason=geodata.get("reason"),
             summary="地理数据目录读不完整。",
-            remediation="结果是 unknown。没有复制或下载文件。"))
-    else:
-        missing = geodata.get("missing") if isinstance(geodata.get("missing"), list) else []
-        import macos_geodata
-        checks.append(_check(
-            "geodata", "fail", required=True, reason=geodata.get("reason") or "geodata_missing",
-            summary="地理数据不够用或目录不可用。" + (f" 缺：{', '.join(missing)}。" if missing else ""),
-            remediation=macos_geodata.geodata_remediation(facts.get("geodata_override")),
-            missing=missing or None))
+            remediation="结果是 unknown。没有复制或下载文件。")]
+    missing = geodata.get("missing") if isinstance(geodata.get("missing"), list) else []
+    import macos_geodata
+    return [_check(
+        "geodata", "fail", required=True, reason=geodata.get("reason") or "geodata_missing",
+        summary="地理数据不够用或目录不可用。" + (f" 缺：{', '.join(missing)}。" if missing else ""),
+        remediation=macos_geodata.geodata_remediation(facts.get("geodata_override")),
+        missing=missing or None)]
 
+
+def _tailscale_status_checks(facts):
     status_probe = facts.get("tailscale_status") or {"status": "unknown", "reason": "not_run"}
     if status_probe.get("status") == "skip":
-        checks.append(_check("tailscale_status", "skip", required=False,
-                             reason="not_run", summary="没有官方 Tailscale 命令行，跳过状态探测。"))
-    elif status_probe.get("status") == "pass":
-        checks.append(_check("tailscale_status", "pass", required=True,
-                             summary="官方 Tailscale 正在运行。"))
-    elif status_probe.get("status") == "fail":
-        checks.append(_check(
+        return [_check("tailscale_status", "skip", required=False,
+                       reason="not_run", summary="没有官方 Tailscale 命令行，跳过状态探测。")]
+    if status_probe.get("status") == "pass":
+        return [_check("tailscale_status", "pass", required=True,
+                       summary="官方 Tailscale 正在运行。")]
+    if status_probe.get("status") == "fail":
+        return [_check(
             "tailscale_status", "fail", required=True, reason="not_running",
             summary="官方 Tailscale 没有在运行。",
-            remediation="先打开官方客户端并连上，再做接管。预检不会执行 tailscale set。"))
-    else:
-        checks.append(_check(
-            "tailscale_status", "unknown", required=True,
-            reason=status_probe.get("reason") or "unavailable",
-            summary="无法确认官方 Tailscale 是否在运行。",
-            remediation="状态探测超时、失败或无法解析。没有把它当成已连接，也没有修改 Tailscale。"))
+            remediation="先打开官方客户端并连上，再做接管。预检不会执行 tailscale set。")]
+    return [_check(
+        "tailscale_status", "unknown", required=True,
+        reason=status_probe.get("reason") or "unavailable",
+        summary="无法确认官方 Tailscale 是否在运行。",
+        remediation="状态探测超时、失败或无法解析。没有把它当成已连接，也没有修改 Tailscale。")]
 
+
+def _snapshot_checks(tier, facts):
     snapshot = facts.get("snapshot") or {"status": "unknown", "has_198_18": None,
                                          "mihomo_running": None}
     # Restart stops this daemon's takeover before the new process listens.
     # Its own mihomo and 198.18 are not another instance. A boolean probe
     # cannot see a second mihomo beside that takeover; unknown stays unknown.
     owns = _daemon_owns_takeover(tier, facts)
+    checks = []
     for check_id, field, busy_summary, busy_fix, clear_summary in (
             ("tun_dns", "has_198_18",
              "系统 DNS 里已经有 198.18。",
@@ -969,32 +1017,61 @@ def assess(tier, facts):
                                  summary=busy_summary, remediation=busy_fix))
         else:
             checks.append(_check(check_id, "pass", required=True, summary=clear_summary))
+    return checks
 
+
+def _dns_listen_checks(tier, facts):
+    owns = _daemon_owns_takeover(tier, facts)
     listen_port = (facts.get("document") or {}).get("listen_port")
     if not isinstance(listen_port, int):
-        checks.append(_check("dns_listen", "skip", required=False, reason="not_configured",
-                             summary="这份配置没有本机回环 DNS 端口需要检查。"))
-    else:
-        listened = (facts.get("listen") or {}).get(listen_port)
-        if listened == "busy" and owns:
-            checks.append(_check(
-                "dns_listen", "pass", required=True, reason="owned_by_daemon",
-                summary=f"127.0.0.1:{listen_port} 正由当前接管使用，不是另一份程序。"
-                        "重载会先结束它，再由新进程监听。"))
-        elif listened == "busy":
-            checks.append(_check(
-                "dns_listen", "fail", required=True, reason="busy",
-                summary=f"127.0.0.1:{listen_port} 已有程序在监听。",
-                remediation="接管配置会使用这个 DNS 端口。先停掉占用它的程序。预检不会结束那个进程。"))
-        elif listened == "free":
-            checks.append(_check("dns_listen", "pass", required=True,
-                                 summary=f"127.0.0.1:{listen_port} 没有监听。"))
-        else:
-            checks.append(_check(
-                "dns_listen", "unknown", required=True, reason="probe_unknown",
-                summary=f"无法确认 127.0.0.1:{listen_port} 是否空闲。",
-                remediation="探测没有得到结果，所以这是 unknown。没有改动该端口。"))
+        return [_check("dns_listen", "skip", required=False, reason="not_configured",
+                       summary="这份配置没有本机回环 DNS 端口需要检查。")]
+    listened = (facts.get("listen") or {}).get(listen_port)
+    if listened == "busy" and owns:
+        return [_check(
+            "dns_listen", "pass", required=True, reason="owned_by_daemon",
+            summary=f"127.0.0.1:{listen_port} 正由当前接管使用，不是另一份程序。"
+                    "重载会先结束它，再由新进程监听。")]
+    if listened == "busy":
+        return [_check(
+            "dns_listen", "fail", required=True, reason="busy",
+            summary=f"127.0.0.1:{listen_port} 已有程序在监听。",
+            remediation="接管配置会使用这个 DNS 端口。先停掉占用它的程序。预检不会结束那个进程。")]
+    if listened == "free":
+        return [_check("dns_listen", "pass", required=True,
+                       summary=f"127.0.0.1:{listen_port} 没有监听。")]
+    return [_check(
+        "dns_listen", "unknown", required=True, reason="probe_unknown",
+        summary=f"无法确认 127.0.0.1:{listen_port} 是否空闲。",
+        remediation="探测没有得到结果，所以这是 unknown。没有改动该端口。")]
 
+
+def assess(tier, facts):
+    """Turn collected facts into one report. This function does no I/O."""
+    if not isinstance(facts, dict) or facts.get("platform") != "macos":
+        return _not_applicable(tier)
+    checks = []
+    if tier == "readonly":
+        checks.extend(_collector_checks(facts))
+        checks.extend(_dashboard_checks(facts))
+        return _finish(tier, ["readonly"], checks, facts)
+
+    checks.extend(_daemon_config_checks(facts))
+    checks.extend(_state_checks(facts))
+    checks.extend(_mihomo_checks(facts))
+    checks.extend(_tailscale_cli_checks(facts))
+    checks.extend(_activity_checks(tier, facts))
+
+    want_takeover = tier == "takeover" or facts.get("expand_takeover") is True
+    if not want_takeover:
+        return _finish(tier, ["daemon"], checks, facts)
+
+    checks.extend(_document_checks(facts))
+    checks.extend(_version_checks(facts))
+    checks.extend(_geodata_checks(facts))
+    checks.extend(_tailscale_status_checks(facts))
+    checks.extend(_snapshot_checks(tier, facts))
+    checks.extend(_dns_listen_checks(tier, facts))
     required = ["takeover"] if tier == "takeover" else ["daemon", "takeover"]
     return _finish(tier, required, checks, facts)
 
@@ -1056,7 +1133,122 @@ def _finish(tier, required_tiers, checks, facts):
             "remediation": remediation, "effects": effects}
 
 
-def run(tier):
+_CHECK_LABELS = {
+    "collector_directory": "采集目录",
+    "dashboard_port": "面板端口",
+    "daemon_config": "守护配置",
+    "state_directory": "状态目录",
+    "mihomo_executable": "mihomo",
+    "tailscale_cli": "Tailscale 命令",
+    "daemon_activity": "守护状态",
+    "network_effect": "网络影响",
+    "mihomo_config": "离线配置",
+    "mihomo_version": "mihomo 版本",
+    "geodata": "地理数据",
+    "tailscale_status": "Tailscale 状态",
+    "tun_dns": "系统 DNS",
+    "mihomo_process": "mihomo 进程",
+    "dns_listen": "DNS 端口",
+}
+_STATUS_LABELS = {"pass": "通过", "fail": "失败", "unknown": "未知", "skip": "跳过"}
+_RESULT_LABELS = {"pass": "通过", "fail": "失败", "unknown": "未知",
+                  "not_applicable": "不适用"}
+
+
+def _is_tty(stream):
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _display_width(text):
+    width = 0
+    for char in text:
+        width += 2 if ord(char) > 0x2E80 else 1
+    return width
+
+
+def progress_line(check):
+    """One plain progress line. No carriage return and no ANSI controls."""
+    status = _STATUS_LABELS.get(check.get("status"), "未知")
+    label = _CHECK_LABELS.get(check.get("id"), str(check.get("id") or "检查"))
+    summary = " ".join(str(check.get("summary") or "").split())
+    return f"[{status}] {label}：{summary}"
+
+
+def render_summary(report):
+    """Short Chinese summary. Remediation is listed once, not per check."""
+    report = report if isinstance(report, dict) else {}
+    tier = report.get("tier") or ""
+    result = report.get("result")
+    lines = [f"预检（{tier}）：{_RESULT_LABELS.get(result, '失败')}"]
+    if result == "not_applicable":
+        lines.append("当前不是 macOS，没有执行检查。")
+        return "\n".join(lines) + "\n"
+    blocking = []
+    for item in report.get("checks") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("required") and item.get("status") in ("fail", "unknown"):
+            label = _CHECK_LABELS.get(item.get("id"), str(item.get("id") or "检查"))
+            summary = " ".join(str(item.get("summary") or item.get("status") or "").split())
+            blocking.append(f"- {label}：{summary}")
+    suggestions = []
+    for text in report.get("remediation") or []:
+        if text and text not in suggestions:
+            suggestions.append(text)
+    if blocking:
+        lines.append("")
+        lines.append("阻塞：")
+        lines.extend(blocking)
+    if suggestions:
+        lines.append("")
+        lines.append("建议：")
+        lines.extend(f"- {text}" for text in suggestions)
+    elif not blocking:
+        lines.append("没有阻塞项。")
+    return "\n".join(lines) + "\n"
+
+
+class CheckProgress:
+    """Write one check as soon as it is handed over.
+
+    A terminal redraws a single stderr line. Any other stream gets one
+    plain line per check and never a carriage return or ANSI sequence.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.tty = _is_tty(stream)
+        self.width = 0
+
+    def __call__(self, check):
+        line = progress_line(check)
+        try:
+            if self.tty:
+                width = _display_width(line)
+                blank = max(self.width, width)
+                self.stream.write("\r" + line + (" " * (blank - width)))
+                self.width = width
+            else:
+                self.stream.write(line + "\n")
+            self.stream.flush()
+        except OSError:
+            return
+
+    def finish(self):
+        if not self.tty or self.width <= 0:
+            return
+        try:
+            self.stream.write("\r" + (" " * self.width) + "\r")
+            self.stream.flush()
+        except OSError:
+            return
+        self.width = 0
+
+
+def run(tier, on_check=None):
     if tier not in TIERS:
         raise ValueError("invalid_tier")
     if not host_is_darwin():
@@ -1067,7 +1259,7 @@ def run(tier):
         root = manager.ROOT
     except (OSError, ValueError, TypeError):
         root = None
-    return assess(tier, collect(tier, root=root))
+    return assess(tier, collect(tier, root=root, on_check=on_check))
 
 
 def for_daemon_lifecycle(root=None):
@@ -1094,20 +1286,58 @@ def for_installed_takeover(root=None):
     return assess("takeover", collect("takeover", root=root))
 
 
+def _parse_invocation(argv):
+    if any(item in ("-h", "--help") for item in argv) or argv == ["help"]:
+        return {"help": True}
+    tier = None
+    style = None
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in ("--json", "--summary"):
+            if style is not None:
+                return None
+            style = item[2:]
+        elif item == "--tier":
+            if tier is not None or index + 1 >= len(argv) or argv[index + 1] not in TIERS:
+                return None
+            tier = argv[index + 1]
+            index += 1
+        else:
+            return None
+        index += 1
+    return {"help": False, "tier": tier or "readonly", "style": style}
+
+
+def _human_output(style, stdout):
+    if style == "json":
+        return False
+    if style == "summary":
+        return True
+    return _is_tty(stdout)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if any(item in ("-h", "--help") for item in argv) or argv == ["help"]:
-        sys.stdout.write(HELP)
-        return 0 if argv else 2
-    if not argv:
-        tier = "readonly"
-    elif len(argv) == 2 and argv[0] == "--tier" and argv[1] in TIERS:
-        tier = argv[1]
-    else:
+    parsed = _parse_invocation(argv)
+    if parsed is None:
         sys.stderr.write(HELP)
         return 2
-    report = run(tier)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if parsed["help"]:
+        sys.stdout.write(HELP)
+        return 0 if argv else 2
+    if _human_output(parsed["style"], sys.stdout):
+        progress = CheckProgress(sys.stderr)
+        report = run(parsed["tier"], on_check=progress)
+        progress.finish()
+        sys.stdout.write(render_summary(report))
+    else:
+        report = run(parsed["tier"])
+        sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    try:
+        sys.stdout.flush()
+    except OSError:
+        pass
     return exit_code(report)
 
 

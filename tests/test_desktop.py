@@ -319,6 +319,7 @@ class MacosDesktopTests(DesktopFixture):
         self.assertEqual(info["CFBundleExecutable"], "nmd-desktop")
         self.assertEqual(info["CFBundleIdentifier"], "io.github.zzzhty.nmd-desktop")
         self.assertEqual(info["CFBundleName"], "NMD")
+        self.assertEqual(info["CFBundleDisplayName"], "NMD")
         self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
         self.assertEqual(info["CFBundleIconFile"], "AppIcon")
         self.assertTrue(info["NSHighResolutionCapable"])
@@ -409,6 +410,142 @@ class MacosDesktopTests(DesktopFixture):
         after = self.invoke("status")
         self.assertIn("已安装", after.stdout)
         self.assertIn(str(self.home / "Applications/NMD.app"), after.stdout)
+
+    def _product(self, name):
+        (self.checkout / "apps/desktop/src-tauri/tauri.conf.json").write_text(json.dumps({
+            "productName": name, "version": "0.1.0",
+            "identifier": "io.github.zzzhty.nmd-desktop"}), encoding="utf-8")
+
+    def test_case_only_reinstall_renames_the_same_bundle_and_keeps_user_files(self):
+        self._product("nmd")
+        self.assertEqual(self.invoke("install").returncode, 0)
+        old = self.home / "Applications/nmd.app"
+        self.assertTrue(old.is_dir())
+        note = old / "Contents/UserNotes.txt"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("keep-me")
+        dir_inode = old.stat().st_ino
+        note_inode = note.stat().st_ino
+        keep = self.home / "Applications/keep.txt"
+        keep.write_text("outside")
+        self.assertEqual(self.invoke("autostart", "on").returncode, 0)
+        agent = self.destinations()["autostart"]
+        self.assertIn(str(old / "Contents/MacOS/nmd-desktop"), agent.read_text(encoding="utf-8"))
+        self._product("NMD")
+        before = self.invoke("status")
+        self.assertEqual(before.returncode, 0, before.stderr)
+        self.assertIn("nmd.app", before.stdout)
+        self.assertIn("nmd update 不会重装桌面壳", before.stdout)
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new = self.home / "Applications/NMD.app"
+        self.assertTrue(new.is_dir())
+        self.assertEqual(new.stat().st_ino, dir_inode)
+        kept = new / "Contents/UserNotes.txt"
+        self.assertEqual(kept.stat().st_ino, note_inode)
+        self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
+        # exists(nmd.app) stays true on a case-insensitive volume: it is this
+        # same directory. The stored directory entry is the name that changed.
+        apps = self.home / "Applications"
+        self.assertEqual(sorted(path.name for path in apps.iterdir()),
+                         ["NMD.app", "keep.txt"])
+        folded = apps / "nmd.app"
+        if folded.exists():
+            self.assertEqual(folded.stat().st_ino, dir_inode)
+        info = plistlib.loads((new / "Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleName"], "NMD")
+        self.assertEqual(info["CFBundleDisplayName"], "NMD")
+        self.assertEqual(info["CFBundleExecutable"], "nmd-desktop")
+        self.assertEqual(info["CFBundleIdentifier"], "io.github.zzzhty.nmd-desktop")
+        receipt = json.loads(self.receipt("desktopReceipt"))
+        for key in ("binary", "info", "icon"):
+            self.assertIn("/NMD.app/", receipt["paths"][key])
+            self.assertNotIn("/nmd.app/", receipt["paths"][key])
+        agent_text = agent.read_text(encoding="utf-8")
+        self.assertIn(str(new / "Contents/MacOS/nmd-desktop"), agent_text)
+        self.assertNotIn("/nmd.app/", agent_text)
+        self.assertEqual(keep.read_text(encoding="utf-8"), "outside")
+        after = self.invoke("status")
+        self.assertNotIn("不会重装桌面壳", after.stdout)
+        removed = self.invoke("uninstall")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(new.exists())
+        self.assertEqual(keep.read_text(encoding="utf-8"), "outside")
+
+    def test_another_inode_with_the_desired_case_is_not_deleted(self):
+        self._product("nmd")
+        self.assertEqual(self.invoke("install").returncode, 0)
+        note = self.home / "Applications/nmd.app/Contents/UserNotes.txt"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("keep-me")
+        foreign = self.home / "Applications/NMD.app"
+        try:
+            (foreign / "Contents").mkdir(parents=True)
+        except FileExistsError:
+            self.skipTest("this volume stores nmd.app and NMD.app as one directory; "
+                          "the other-inode refusal is covered in-process")
+        marker = foreign / "Contents/foreign.txt"
+        marker.write_text("other-app")
+        self._product("NMD")
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("desktop_bundle_case_conflict", result.stderr)
+        self.assertEqual(note.read_text(encoding="utf-8"), "keep-me")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "other-app")
+        self.assertTrue((self.home / "Applications/nmd.app").is_dir())
+        self.assertTrue(foreign.is_dir())
+
+    def test_same_inode_case_rename_never_unlinks_the_bundle(self):
+        parent = self.base / "case-apps"
+        parent.mkdir()
+        app = parent / "nmd.app"
+        (app / "Contents").mkdir(parents=True)
+        note = app / "Contents/UserNotes.txt"
+        note.write_text("keep-me")
+        inode = app.stat().st_ino
+        note_inode = note.stat().st_ino
+        desired = parent / "NMD.app"
+
+        def forbid_rmtree(*args, **kwargs):
+            raise AssertionError(f"rmtree {args}")
+
+        with patch.object(manager.shutil, "rmtree", forbid_rmtree), \
+                patch.object(manager, "_desired_occupied", return_value="same"):
+            result = manager._align_bundle_directory(app, desired)
+        self.assertEqual(result.name, "NMD.app")
+        self.assertEqual(result.stat().st_ino, inode)
+        kept = result / "Contents/UserNotes.txt"
+        self.assertEqual(kept.stat().st_ino, note_inode)
+        self.assertEqual(kept.read_text(encoding="utf-8"), "keep-me")
+        self.assertEqual([path.name for path in parent.iterdir()], ["NMD.app"])
+        self.assertFalse(any(path.name.startswith(".nmd-bundle-case-") for path in parent.iterdir()))
+        # A case-insensitive volume still resolves the old spelling. That is
+        # the same inode, not a second bundle left behind.
+        if note.exists():
+            self.assertEqual(note.stat().st_ino, note_inode)
+            self.assertEqual((parent / "nmd.app").stat().st_ino, inode)
+
+    def test_other_inode_refusal_deletes_nothing(self):
+        parent = self.base / "case-apps"
+        parent.mkdir()
+        app = parent / "nmd.app"
+        (app / "Contents").mkdir(parents=True)
+        note = app / "Contents/UserNotes.txt"
+        note.write_text("keep-me")
+        inode = app.stat().st_ino
+        desired = parent / "NMD.app"
+
+        def forbid_rmtree(*args, **kwargs):
+            raise AssertionError(f"rmtree {args}")
+
+        with patch.object(manager.shutil, "rmtree", forbid_rmtree), \
+                patch.object(manager, "_desired_occupied", return_value="other"):
+            with self.assertRaises(manager.ManagerError) as caught:
+                manager._align_bundle_directory(app, desired)
+        self.assertIn("desktop_bundle_case_conflict", str(caught.exception))
+        self.assertEqual(note.read_text(encoding="utf-8"), "keep-me")
+        self.assertEqual(app.stat().st_ino, inode)
+        self.assertEqual([path.name for path in parent.iterdir()], ["nmd.app"])
 
     def test_linux_receipt_cannot_claim_files_on_macos(self):
         linux_receipt = {"version": 1, "root": str(self.checkout),
