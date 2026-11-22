@@ -400,6 +400,31 @@ def _parse_launchctl_job(text):
     return {"state": state, "pid": int(pid), "arguments": args}
 
 
+def _lsof_binary():
+    """Absolute lsof. macOS has ``/usr/sbin/lsof``; some hosts use ``/usr/bin``."""
+    for path in ("/usr/sbin/lsof", "/usr/bin/lsof"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _lsof_argv(pid, port):
+    """``lsof -F n`` for this pid's ``127.0.0.1`` listener, or None.
+
+    The address grammar is ``[46][protocol][@host][:port]``. ``TCP:port`` is
+    any address on that port. ``TCP:127.0.0.1:port`` is a service name, and
+    lsof exits 1 with ``unacceptable port specification`` and empty stdout.
+    That rejected query is not an absent listener. ``TCP@127.0.0.1:port`` is
+    the loopback socket; a wildcard bind does not satisfy it.
+    """
+    binary = _lsof_binary()
+    if binary is None:
+        return None
+    return [
+        binary, "-nP", "-a", "-p", str(pid),
+        f"-iTCP@127.0.0.1:{port}", "-sTCP:LISTEN", "-F", "n"]
+
+
 def _lsof_loopback(text, port):
     """True when the only ``lsof -F n`` name is this loopback listener."""
     if not isinstance(text, str):
@@ -417,9 +442,10 @@ def inspect_dashboard_owner(port, config_path):
     """Whether the busy dashboard port is this user's running collector.
 
     Evidence is the user LaunchAgent, ``launchctl print`` of that job, and
-    ``lsof`` showing that pid listening on ``127.0.0.1``. This does not connect
-    to the port and does not read an HTTP response. ``match`` still needs a
-    usable collector directory before the check passes.
+    ``lsof -F n`` for that pid on ``TCP@127.0.0.1``. This does not connect to
+    the port and does not read an HTTP response. ``match`` still needs a
+    usable collector directory before the check passes. A rejected lsof query
+    is unknown, not another listener.
     """
     import nmd_daemon
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -459,17 +485,21 @@ def inspect_dashboard_owner(port, config_path):
         return {"status": "unknown", "reason": "job_unhealthy"}
     if job["arguments"] != data["ProgramArguments"]:
         return {"status": "unknown", "reason": "job_mismatch"}
-    listed = _bounded_text([
-        "/usr/sbin/lsof", "-nP", "-a", "-p", str(job["pid"]),
-        f"-iTCP:127.0.0.1:{port}", "-sTCP:LISTEN", "-F", "n"])
+    argv = _lsof_argv(job["pid"], port)
+    if argv is None:
+        return {"status": "unknown", "reason": "listener_unreadable"}
+    listed = _bounded_text(argv)
     if listed["error"]:
         return {"status": "unknown", "reason": "listener_unreadable"}
     heard = _lsof_loopback(listed["stdout"], port)
-    if heard is None or (listed["code"] != 0 and listed["code"] != 1):
+    if heard is True and listed["code"] == 0:
+        return {"status": "match", "reason": "running"}
+    # A clean miss is exit 1 with empty stdout and empty stderr. Anything
+    # else (a usage error, an extra address, a non-zero success) was not read.
+    if (heard is not False or listed["code"] not in (0, 1)
+            or listed["stderr"].strip()):
         return {"status": "unknown", "reason": "listener_unreadable"}
-    if heard is not True:
-        return {"status": "other", "reason": "busy"}
-    return {"status": "match", "reason": "running"}
+    return {"status": "other", "reason": "busy"}
 
 
 def probe_snapshot():

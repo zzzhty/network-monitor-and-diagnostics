@@ -1,0 +1,2 @@
+  PID STARTED                      COMMAND
+25353 Sun Nov 22 15:28:38 2026     /Users/max/.local/bin/python3 /Users/max/.nmd/scripts/nmd_daemon.py run-user --config /Users/max/.config/nmd/daemon.json
