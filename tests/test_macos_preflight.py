@@ -133,6 +133,80 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(pf.exit_code(unknown), 3)
         self.assertTrue(unknown["blocking"])
 
+    def test_matching_collector_is_expected_and_other_owners_are_not(self):
+        collector = {"status": "pass", "reason": "ok", "path": "/tmp/collector"}
+        match = pf.assess("readonly", {
+            "platform": "macos", "collector": collector,
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "match", "reason": "running"},
+        })
+        check = one(match, "dashboard_port")
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["reason"], "collector_running")
+        self.assertIn("采集器已运行", check["summary"])
+        self.assertNotIn("remediation", check)
+        self.assertEqual(match["result"], "pass")
+        self.assertNotIn("停掉", json.dumps(match, ensure_ascii=False))
+
+        foreign = pf.assess("readonly", {
+            "platform": "macos", "collector": collector,
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "other", "reason": "busy"},
+        })
+        self.assertEqual(one(foreign, "dashboard_port")["status"], "fail")
+        self.assertIn("停掉占用它的程序", one(foreign, "dashboard_port")["remediation"])
+        self.assertNotIn("采集器已运行", one(foreign, "dashboard_port")["summary"])
+
+        wrong = pf.assess("readonly", {
+            "platform": "macos", "collector": collector,
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "other", "reason": "wrong_config"},
+        })
+        self.assertEqual(one(wrong, "dashboard_port")["reason"], "wrong_config")
+        self.assertEqual(wrong["result"], "fail")
+        self.assertNotIn("采集器已运行", one(wrong, "dashboard_port")["summary"])
+
+        forged = pf.assess("readonly", {
+            "platform": "macos", "collector": collector,
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "other", "reason": "wrong_instance"},
+        })
+        self.assertEqual(forged["result"], "fail")
+        self.assertNotIn("采集器已运行", one(forged, "dashboard_port")["summary"])
+
+        unclear = pf.assess("readonly", {
+            "platform": "macos", "collector": collector,
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "unknown", "reason": "job_unreadable"},
+        })
+        self.assertEqual(unclear["result"], "unknown")
+        self.assertEqual(pf.exit_code(unclear), 3)
+        self.assertNotIn("采集器已运行", json.dumps(unclear, ensure_ascii=False))
+        self.assertNotIn("停掉", one(unclear, "dashboard_port")["remediation"])
+
+        unhealthy = pf.assess("readonly", {
+            "platform": "macos",
+            "collector": {"status": "fail", "reason": "not_private", "path": "/tmp/collector"},
+            "dashboard_port": 8765, "listen": {8765: "busy"},
+            "dashboard_owner": {"status": "match", "reason": "running"},
+        })
+        self.assertEqual(one(unhealthy, "dashboard_port")["reason"], "collector_unhealthy")
+        self.assertEqual(unhealthy["result"], "fail")
+        self.assertNotIn("采集器已运行", one(unhealthy, "dashboard_port")["summary"])
+        self.assertNotIn("停掉", one(unhealthy, "dashboard_port")["remediation"])
+
+    def test_takeover_stays_strict_when_a_collector_matches(self):
+        report = pf.assess("takeover", takeover_facts(
+            listen={1053: "busy"},
+            dashboard_port=8765,
+            dashboard_owner={"status": "match", "reason": "running"},
+            collector={"status": "pass", "reason": "ok", "path": "/tmp/collector"},
+        ))
+        self.assertEqual(one(report, "dns_listen")["status"], "fail")
+        self.assertEqual(one(report, "dns_listen")["reason"], "busy")
+        self.assertNotIn("dashboard_port", [item["id"] for item in report["checks"]])
+        self.assertNotIn("采集器已运行", json.dumps(report, ensure_ascii=False))
+
     def test_daemon_tier_does_not_require_takeover_checks(self):
         report = pf.assess("daemon", daemon_facts(
             geodata={"status": "fail", "reason": "geodata_missing", "missing": ["geosite.dat"]},
@@ -851,6 +925,155 @@ class CollectTests(_Tree):
         self.assertNotIn("mihomo_executable", [item["id"] for item in report["checks"]])
         self.assertNotIn(TOKEN, json.dumps(report))
         self.assertNotIn(TAILNET, json.dumps(report))
+
+    def _agent_plist(self, script, config_path, arguments=None):
+        import plistlib
+        directory = Path.home() / "Library" / "LaunchAgents"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "io.github.zzzhty.nmd-daemon.plist"
+        path.write_bytes(plistlib.dumps({
+            "Label": "io.github.zzzhty.nmd-daemon",
+            "Note": "HTTP/1.1 200 nmd",
+            "ProgramArguments": arguments or [
+                "/usr/bin/python3", str(script), "run-user", "--config", str(config_path)],
+            "RunAtLoad": True,
+        }))
+        path.chmod(0o644)
+        return path
+
+    def _job_text(self, script, config_path, *, state="running", pid="25353"):
+        args = "\n".join([
+            "\t\t/usr/bin/python3", f"\t\t{script}", "\t\trun-user",
+            "\t\t--config", f"\t\t{config_path}"])
+        return (
+            "gui/501/io.github.zzzhty.nmd-daemon = {\n"
+            "\tstate = " + state + "\n"
+            "\tpath = /tmp/nmd HTTP/1.1 200\n"
+            "\targuments = {\n" + args + "\n\t}\n"
+            "\tpid = " + pid + "\n"
+            "}\n")
+
+    def test_running_collector_matches_only_with_the_job_and_the_socket(self):
+        self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
+        script = self.base / "scripts" / "nmd_daemon.py"
+        script.parent.mkdir()
+        script.write_text("print('nmd')\n", encoding="utf-8")
+        config_path = self.config_dir / "daemon.json"
+        self._agent_plist(script, config_path)
+        calls = []
+
+        def runner(argv):
+            calls.append(argv)
+            if argv[:2] == ["/bin/launchctl", "print"]:
+                self.assertEqual(argv[2], f"gui/{os.geteuid()}/io.github.zzzhty.nmd-daemon")
+                return {"code": 0, "error": None, "stderr": "",
+                        "stdout": self._job_text(script, config_path)}
+            self.assertEqual(argv[0], "/usr/sbin/lsof")
+            self.assertIn("-p", argv)
+            self.assertEqual(argv[argv.index("-p") + 1], "25353")
+            self.assertIn("-iTCP:127.0.0.1:8765", argv)
+            return {"code": 0, "error": None, "stderr": "", "stdout": "n127.0.0.1:8765\n"}
+
+        def refuse_connect(self, *_args, **_kwargs):
+            raise AssertionError("connect")
+
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=runner), \
+                patch.object(socket.socket, "connect", refuse_connect):
+            report = pf.run("readonly")
+        check = one(report, "dashboard_port")
+        self.assertEqual(report["result"], "pass")
+        self.assertEqual(check["reason"], "collector_running")
+        self.assertIn("采集器已运行", check["summary"])
+        self.assertNotIn("停掉", json.dumps(report, ensure_ascii=False))
+        self.assertEqual([item[0] for item in calls], ["/bin/launchctl", "/usr/sbin/lsof"])
+
+    def test_other_listener_forged_argv_and_unknown_job_do_not_pass(self):
+        self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
+        script = self.base / "scripts" / "nmd_daemon.py"
+        script.parent.mkdir()
+        script.write_text("# nmd\n", encoding="utf-8")
+        config_path = self.config_dir / "daemon.json"
+        self._agent_plist(script, config_path)
+
+        def other_socket(argv):
+            if argv[0] == "/bin/launchctl":
+                return {"code": 0, "error": None, "stderr": "",
+                        "stdout": self._job_text(script, config_path)}
+            return {"code": 1, "error": None, "stderr": "", "stdout": ""}
+
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=other_socket):
+            other = pf.run("readonly")
+        self.assertEqual(one(other, "dashboard_port")["status"], "fail")
+        self.assertEqual(one(other, "dashboard_port")["reason"], "busy")
+        self.assertIn("停掉占用它的程序", one(other, "dashboard_port")["remediation"])
+        self.assertNotIn("采集器已运行", one(other, "dashboard_port")["summary"])
+
+        self._agent_plist(script, config_path, arguments=[
+            "/usr/bin/python3", "/tmp/nmd", "run-user", "--config", str(config_path)])
+
+        def forbidden(argv):
+            raise AssertionError(argv)
+
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=forbidden):
+            forged = pf.run("readonly")
+        self.assertEqual(one(forged, "dashboard_port")["reason"], "wrong_instance")
+        self.assertNotIn("采集器已运行", one(forged, "dashboard_port")["summary"])
+
+        other_config = self.base / "other-daemon.json"
+        other_config.write_text("{}\n", encoding="utf-8")
+        self._agent_plist(script, other_config)
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=forbidden):
+            wrong = pf.run("readonly")
+        self.assertEqual(one(wrong, "dashboard_port")["reason"], "wrong_config")
+
+        self._agent_plist(script, config_path)
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text",
+                             return_value={"code": None, "stdout": "", "stderr": "",
+                                           "error": "tool_missing"}):
+            unclear = pf.run("readonly")
+        self.assertEqual(unclear["result"], "unknown")
+        self.assertEqual(pf.exit_code(unclear), 3)
+        self.assertEqual(one(unclear, "dashboard_port")["reason"], "job_unreadable")
+        self.assertNotIn("采集器已运行", json.dumps(unclear, ensure_ascii=False))
+
+        plist = self._agent_plist(script, config_path)
+        plist.chmod(0o666)
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=forbidden):
+            alien = pf.run("readonly")
+        self.assertEqual(one(alien, "dashboard_port")["reason"], "plist_untrusted")
+        self.assertEqual(alien["result"], "unknown")
+
+        self._agent_plist(script, config_path)
+        plist = Path.home() / "Library" / "LaunchAgents" / "io.github.zzzhty.nmd-daemon.plist"
+        plist.chmod(0o644)
+
+        def waiting(argv):
+            if argv[0] == "/bin/launchctl":
+                return {"code": 0, "error": None, "stderr": "",
+                        "stdout": self._job_text(script, config_path, state="waiting")}
+            raise AssertionError(argv)
+
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=waiting):
+            sick = pf.run("readonly")
+        self.assertEqual(one(sick, "dashboard_port")["reason"], "job_unhealthy")
+        self.assertEqual(sick["result"], "unknown")
+        self.assertNotIn("采集器已运行", json.dumps(sick, ensure_ascii=False))
+
+    def test_daemon_start_does_not_ask_who_owns_the_dashboard(self):
+        self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
+        with self.context(), \
+                patch.object(pf, "inspect_dashboard_owner", side_effect=AssertionError("owner")), \
+                patch.object(pf, "probe_listen", return_value="busy"):
+            report = pf.run("daemon")
+        self.assertNotIn("dashboard_port", [item["id"] for item in report["checks"]])
+        self.assertNotIn("采集器已运行", json.dumps(report, ensure_ascii=False))
 
     def test_progress_is_flushed_before_the_next_probe_starts(self):
         self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
