@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import ipaddress
 import json
 import os
@@ -24,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zlib
 
 import macos_preflight
 import macos_prepare
@@ -49,6 +51,11 @@ _MACHO = (
 _DOC_PREFIXES = ("192.0.2.", "198.51.100.", "203.0.113.")
 _ENV_LINE = re.compile(r"^(NMD_VPS_PUB|NMD_VPS_TS_IP)=([0-9.]+)$")
 DARWIN_MIHOMO_VERSION = (1, 19, 34)
+# GitHub release asset digests cover the .gz bytes, before decompression.
+DARWIN_ASSET_SHA256 = {
+    "mihomo-darwin-arm64-v1.19.34.gz": "1a7a20eca63fbbaec90137717465bfde488d0db2a3a79b8fadebf9b2545b6e4c",
+    "mihomo-darwin-amd64-v1.19.34.gz": "089b033be801ff365b6558851115238b443b237433aa0841bc3fa41ad75a3927",
+}
 _RELEASE = "https://github.com/MetaCubeX/mihomo/releases/download/"
 _CANDIDATE_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/local/sbin")
 _DEFAULT = object()
@@ -136,6 +143,8 @@ def _remediation(token):
         "mihomo_download_failed": (
             "官方 mihomo 发布包没有下载成功。没有写入配置，也没有开始接管。"),
         "mihomo_download_invalid": "下载内容不是可用的 mihomo 可执行文件。没有写入配置。",
+        "mihomo_checksum_missing": "当前版本和架构缺少固定的 SHA-256 摘要，已停止下载。",
+        "mihomo_checksum_mismatch": "下载包与该版本和架构的固定 SHA-256 摘要不符，已停止安装。",
         "mihomo_install_unavailable": (
             "没有当前用户可写、且不需要 sudo 的目录来放置 mihomo。"
             "fetch-assets.sh 只下载 Linux deb，不能代替这一步。没有写入配置。"),
@@ -265,7 +274,7 @@ def curl_bytes(url):
 def unpack_darwin_gzip(blob):
     try:
         binary = gzip.decompress(blob)
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+    except (OSError, EOFError, zlib.error) as exc:
         raise OnboardError("mihomo_download_invalid") from exc
     if len(binary) < 64 or len(binary) > 80 * 1024 * 1024 or not binary.startswith(_MACHO):
         raise OnboardError("mihomo_download_invalid")
@@ -765,7 +774,12 @@ def _ensure_mihomo(platform, *, find_mihomo, fetch_linux_assets, download,
         raise OnboardError("mihomo_install_unavailable")
     version = darwin_release_version()
     url = darwin_asset_url(version, machine or os.uname().machine)
+    expected = DARWIN_ASSET_SHA256.get(url.rsplit("/", 1)[-1])
+    if expected is None:
+        raise OnboardError("mihomo_checksum_missing")
     blob = (download or curl_bytes)(url)
+    if hashlib.sha256(blob).hexdigest() != expected:
+        raise OnboardError("mihomo_checksum_mismatch")
     binary = unpack_darwin_gzip(blob)
     placed = place_user_binary(directory, binary)
     return str(placed), True

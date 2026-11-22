@@ -1,6 +1,7 @@
 """nmd onboard: fail closed, and do not install Tailscale on macOS."""
 import contextlib
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -24,8 +25,10 @@ SERVER = "fd7a:115c:a1e0::abcd"
 SERVER4 = "100.64.0.8"
 
 
-def macho_gzip():
-    return gzip.compress(b"\xcf\xfa\xed\xfe" + b"\x00" * 60)
+def macho_gzip(arch="arm64", *, mtime=0):
+    cpu = {"arm64": 0x0100000C, "amd64": 0x01000007}[arch]
+    header = b"\xcf\xfa\xed\xfe" + cpu.to_bytes(4, "little") + bytes(56)
+    return gzip.compress(header, mtime=mtime)
 
 
 class OnboardTests(unittest.TestCase):
@@ -38,6 +41,10 @@ class OnboardTests(unittest.TestCase):
         self.bindir = self.base / "bin"
         self.bindir.mkdir(mode=0o700)
         self.calls = []
+        self.pins = {
+            f"mihomo-darwin-{arch}-v1.19.34.gz": hashlib.sha256(macho_gzip(arch)).hexdigest()
+            for arch in ("arm64", "amd64")
+        }
 
     def download(self, url):
         self.calls.append(("download", url))
@@ -48,6 +55,7 @@ class OnboardTests(unittest.TestCase):
 
     def invoke(self, argv, **kwargs):
         bombs = (
+            patch.dict(nmd_onboard.DARWIN_ASSET_SHA256, self.pins, clear=True),
             patch.object(subprocess, "run", side_effect=AssertionError("subprocess")),
             patch("manager.ensure_assets", side_effect=AssertionError("ensure")),
             patch("manager.apply", side_effect=AssertionError("apply")),
@@ -83,6 +91,8 @@ class OnboardTests(unittest.TestCase):
                 self.assertEqual(nmd_onboard.darwin_asset_url(version, host),
                                  "https://github.com/MetaCubeX/mihomo/releases/download/"
                                  f"v1.19.34/mihomo-darwin-{arch}-v1.19.34.gz")
+                self.assertRegex(nmd_onboard.DARWIN_ASSET_SHA256[f"mihomo-darwin-{arch}-{version}.gz"],
+                                 r"^[0-9a-f]{64}$")
         text = (ROOT / "fetch-assets.sh").read_text(encoding="utf-8")
         self.assertIn("mihomo-linux-$ARCH-$VER.deb", text)
         self.assertIn("VPS_PORT=1080", (ROOT / "local-setup.sh").read_text(encoding="utf-8"))
@@ -180,6 +190,7 @@ class OnboardTests(unittest.TestCase):
         self.assertTrue(self.calls[0][1].endswith("/v1.19.34/mihomo-darwin-arm64-v1.19.34.gz"))
         self.assertNotIn("fetch", self.calls)
         binary = self.bindir / "mihomo"
+        self.assertEqual(binary.read_bytes(), gzip.decompress(macho_gzip()))
         self.assertEqual(stat.S_IMODE(binary.stat().st_mode) & 0o777, 0o755)
         self.assertEqual(binary.stat().st_uid, os.geteuid())
         self.assertFalse(binary.is_symlink())
@@ -190,6 +201,52 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(stored["takeover"]["mihomo_path"], str(binary))
         self.assertIn('"on_boot": false', self.daemon.read_text(encoding="utf-8"))
         self.assertNotIn("203.0.113.20", self.daemon.read_text(encoding="utf-8"))
+
+    def test_macos_installs_the_amd64_asset_on_intel(self):
+        def download(url):
+            self.assertTrue(url.endswith("/v1.19.34/mihomo-darwin-amd64-v1.19.34.gz"))
+            return macho_gzip("amd64")
+
+        code, _, err = self.invoke(
+            ["--server", SERVER4, "--port", "1081"], platform="macos", machine="x86_64",
+            find_tailscale=lambda platform: "/usr/bin/tailscale",
+            find_mihomo=lambda platform: None, download=download)
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.bindir / "mihomo").read_bytes(), gzip.decompress(macho_gzip("amd64")))
+
+    def test_macos_rejects_altered_and_swapped_archives_before_unpack(self):
+        dest = self.bindir / "mihomo"
+        dest.write_bytes(b"original executable")
+        self.daemon.parent.mkdir()
+        self.daemon.write_bytes(b"original configuration")
+        altered = gzip.compress(gzip.decompress(macho_gzip())[:-1] + b"X", mtime=0)
+        for case, machine, blob in (("altered executable", "arm64", altered),
+                                    ("altered gzip timestamp", "arm64", macho_gzip(mtime=1)),
+                                    ("Intel archive on Apple Silicon", "arm64", macho_gzip("amd64")),
+                                    ("Apple Silicon archive on Intel", "x86_64", macho_gzip())):
+            with self.subTest(case=case), patch.object(
+                    gzip, "decompress", side_effect=AssertionError("unverified archive")):
+                code, out, err = self.invoke(
+                    ["--server", SERVER4, "--port", "1081"], platform="macos", machine=machine,
+                    find_tailscale=lambda platform: "/usr/bin/tailscale",
+                    find_mihomo=lambda platform: None, download=lambda url: blob)
+                self.assertEqual(code, 1, err)
+                self.assertEqual(out, "")
+                self.assertEqual(json.loads(err)["error"], "mihomo_checksum_mismatch")
+                self.assertEqual(dest.read_bytes(), b"original executable")
+                self.assertEqual(self.daemon.read_bytes(), b"original configuration")
+                self.assertEqual(list(self.bindir.iterdir()), [dest])
+
+    def test_macos_missing_pin_refuses_download(self):
+        self.pins.clear()
+        code, _, err = self.invoke(
+            ["--server", SERVER4, "--port", "1081"], platform="macos",
+            find_tailscale=lambda platform: "/usr/bin/tailscale",
+            find_mihomo=lambda platform: None, download=lambda url: self.fail("missing pin"))
+        self.assertEqual(code, 1, err)
+        self.assertEqual(json.loads(err)["error"], "mihomo_checksum_missing")
+        self.assertFalse(self.daemon.exists())
+        self.assertFalse(any(self.bindir.iterdir()))
 
     def test_macos_does_not_download_when_mihomo_is_already_present(self):
         present = "/opt/homebrew/bin/mihomo"
@@ -237,15 +294,20 @@ class OnboardTests(unittest.TestCase):
         self.assertIs(json.loads(out)["takeover_started"], False)
 
     def test_macos_bad_download_or_no_directory_writes_nothing(self):
-        code, out, err = self.invoke(
-            ["--server", SERVER, "--port", "1081"], platform="macos",
-            find_tailscale=lambda platform: "/usr/bin/tailscale",
-            find_mihomo=lambda platform: None,
-            download=lambda url: b"not-gzip")
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(err)["error"], "mihomo_download_invalid")
-        self.assertFalse(self.daemon.exists())
-        self.assertFalse((self.bindir / "mihomo").exists())
+        # Pin malformed fixtures to exercise decompression after digest verification.
+        archive = macho_gzip()
+        for case, blob in (("truncated trailer", archive[:-4]),
+                           ("reserved DEFLATE block type", archive[:10] + b"\x07" + archive[-8:])):
+            with self.subTest(case=case):
+                self.pins["mihomo-darwin-arm64-v1.19.34.gz"] = hashlib.sha256(blob).hexdigest()
+                code, _, err = self.invoke(
+                    ["--server", SERVER, "--port", "1081"], platform="macos",
+                    find_tailscale=lambda platform: "/usr/bin/tailscale",
+                    find_mihomo=lambda platform: None, download=lambda url: blob)
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(err)["error"], "mihomo_download_invalid")
+                self.assertFalse(self.daemon.exists())
+                self.assertFalse(any(self.bindir.iterdir()))
 
         code, out, err = self.invoke(
             ["--server", SERVER, "--port", "1081"], platform="macos",
