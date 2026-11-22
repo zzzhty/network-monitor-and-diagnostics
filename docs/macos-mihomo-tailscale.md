@@ -321,7 +321,8 @@ starting 或 needs_rollback，启动会先把那次回退做完。未安装守�
 加载的 root 管理器会被 `apply` 拉起。用户 LaunchAgent 不在这次重载里。
 显式只读入口是 `nmd macos preflight --tier readonly|daemon|takeover`：面板档
 不要求 mihomo；守护档在 start/restart 之前；接管档在改网络之前。`fail` 和
-`unknown` 都不继续。daemon 代码没有在实机运行。另一终端的
+`unknown` 都不继续。终端里这条命令逐项显示进度并在末尾给中文摘要；管道和
+`--json` 仍是原来的一份 JSON。守护进程内部的预检门禁不读这段终端文字。daemon 代码没有在实机运行。另一终端的
 `sudo nmd macos rollback` 不拿管理器的锁：它读 pin，只在 `owned-mihomo.json`
 里的 pid、`ps` 的启动时间、完整 argv（含精确的 `-d` 工作目录）和会话组
 长身份同时对得上时才发信号，再按这份原始快照恢复。pid 被同名进程复用、

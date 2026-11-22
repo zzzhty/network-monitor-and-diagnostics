@@ -55,7 +55,7 @@ systemd 安装管理，面板不提供编辑。
 | systemd 服务 | 不支持；`services` 为空，`service_observation_error` 为 `unsupported_platform` |
 | DNS/TCP/TLS/HTTP 探测 | 复用显式配置的既有探测逻辑；默认 `probes: []`；本次未访问真实外部目标 |
 | 浏览器面板 | 诊断只读、仅回环、相同账户读取私有状态；静态首页允许顶层导航，数据 API 拒绝跨站请求、写方法与陌生 Host；macOS 额外仅开放 `/api/config` 编辑自己的 monitor 配置（不启动采集） |
-| 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身 |
+| 用户级桌面壳 | 可选；`nmd desktop install` 本机构建 `~/Applications/NMD.app`（无需证书），登录自启为可选 LaunchAgent，仅启动 GUI 壳本身。`nmd update` 不重装这个应用 |
 | 后台采集/网络服务安装、来源控制、网络管理 | 常驻守护可选（`nmd macos daemon install`，默认关，含采集监督与面板服务）。`nmd apply` / `refresh` 在已安装守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。进行中的接管会被这次 stop 回退；`on_boot` 为 true 时，新的一次开机可能开始接管。来源控制、Linux 网络部署与 systemd 仍在执行动作前拒绝 |
 | 实验性自管接管（单次） | `sudo nmd macos takeover`：sudo 前台运行 mihomo 接管出口，绝对截止（默认 10 分钟、上限 8 小时，按墙钟），STOP/到期/连续 3 个故障周期幂等回退；唤醒后复查或回退。仅显式运行，无常驻组件。accept 的 sentinel 有一次实机恢复记录；睡眠唤醒尚未验收。见 [macos-mihomo-tailscale.md](macos-mihomo-tailscale.md) |
 | 实验性自管接管（常驻 daemon） | `nmd macos daemon install`：root 管理器（launchd KeepAlive）常驻监督接管——无绝对截止，健康故障（默认连续 3 周期）或 mihomo 退出即自动回退，唤醒后复查托管状态且不因此启动接管，手动停止走 CLI 或面板。开机策略用 `nmd macos daemon on-boot` 读写 `daemon.json` 的 `on_boot`（JSON 布尔，默认关）；这条命令不加载守护，也不开始接管。`install`、`start`、`apply` 不改这个字段。面板归属 daemon，桌面壳自动复用。未实机验证。策略见 `DAEMON_POLICY`。 |
@@ -88,6 +88,8 @@ macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `de
 ./nmd macos preflight --tier readonly
 ./nmd macos preflight --tier daemon
 ./nmd macos preflight --tier takeover
+./nmd macos preflight --summary
+./nmd macos preflight --json
 ```
 
 | 档 | 什么时候用 | 查什么 |
@@ -98,7 +100,21 @@ macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `de
 
 `tun.dns-mode: native` 需要 mihomo 1.19.33 或更新。这是文档里 native 模式的要求，不是把曾经观测到的 1.19.34 当成最低版本。`dns-mode: disabled` 没有这道下限。
 
-输出是一份 JSON：`result` 为 `pass`、`fail` 或 `unknown`。`unknown` 是探测没有得到结果，不会当成通过。退出码分别是 0、1、3。`fail` 和 `unknown` 都不会 sudo、stop、start 或改网络。失败项带一句中文的下一步，例如把官方 mihomo 或官方 Tailscale 装到哪。缺地理数据时，下一步是下面的 `nmd macos geodata ensure`。预检本身不会安装或下载，也不会打印配置正文、地址或密钥。
+交互终端里，每项检查在真正完成时就写到标准错误并立刻 flush，结束时清掉这行进度，标准输出只留一份短中文摘要：总体是通过、失败、未知或不适用，加上阻塞项和去重后的建议。非终端默认仍打印原来的一整份 JSON，脚本可以继续解析标准输出。`--json` 在任何情况下都只打印这份 JSON，不混入进度。`--summary` 在管道里也给摘要；此时进度是标准错误上的普通文本行，不用 ANSI 控制符。`--json` 和 `--summary` 不能一起用。`result` 仍是 `pass`、`fail` 或 `unknown`。`unknown` 是探测没有得到结果，不会当成通过。退出码分别是 0、1、3。`fail` 和 `unknown` 都不会 sudo、stop、start 或改网络。失败项带一句中文的下一步，例如把官方 mihomo 或官方 Tailscale 装到哪。缺地理数据时，下一步是下面的 `nmd macos geodata ensure`。预检本身不会安装或下载，也不会打印配置正文、地址或密钥。守护、安装和 apply 的预检门禁仍读内存里的报告，不走这套终端文字。
+
+示例（格式示意，不是某台机器的实测；非终端 `--summary` 时进度在标准错误，摘要在标准输出）：
+
+```text
+[失败] 面板端口：面板端口 8765 已有程序在监听。
+
+预检（readonly）：失败
+
+阻塞：
+- 面板端口：面板端口 8765 已有程序在监听。
+
+建议：
+- 换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。
+```
 
 这些检查在本仓库里用替身和离线用例验证。它们不是实机验收，也不表示睡眠唤醒或 watchdog 恢复已经在真机上通过。
 
@@ -200,7 +216,7 @@ nmd macos preflight --tier daemon
 nmd macos preflight --tier takeover
 ```
 
-`geodata ensure` 不带 `--inputs` 时读刚才的 `daemon.json`，把缺少的 `geosite.dat` / `geoip.metadb` 下载到当前账户的 `~/.config/mihomo`。不要 sudo。`preflight` 默认是 `readonly`，不要求 mihomo。`daemon` 档检查 mihomo 能否执行、官方 Tailscale 命令行、`daemon.json` 和状态目录；`on_boot` 仍是 false 且看得到守护没在接管时，这一档不要求 Tailscale 已连接，也不要求地理数据。`takeover` 档才要求地理数据、Tailscale 正在运行，以及 198.18 / 端口没有被别人占用。`fail` 和 `unknown` 都不会 sudo，也不会改网络。
+`geodata ensure` 不带 `--inputs` 时读刚才的 `daemon.json`，把缺少的 `geosite.dat` / `geoip.metadb` 下载到当前账户的 `~/.config/mihomo`。不要 sudo。`preflight` 默认是 `readonly`，不要求 mihomo。在终端里它逐项显示并给出中文摘要；要给脚本解析时加 `--json`，在管道里只要摘要时加 `--summary`。`daemon` 档检查 mihomo 能否执行、官方 Tailscale 命令行、`daemon.json` 和状态目录；`on_boot` 仍是 false 且看得到守护没在接管时，这一档不要求 Tailscale 已连接，也不要求地理数据。`takeover` 档才要求地理数据、Tailscale 正在运行，以及 198.18 / 端口没有被别人占用。`fail` 和 `unknown` 都不会 sudo，也不会改网络。
 
 ### 4. 安装并加载
 

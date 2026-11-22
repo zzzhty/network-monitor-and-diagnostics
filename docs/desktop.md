@@ -65,7 +65,7 @@ nmd desktop uninstall          # 移除二进制、图标、桌面入口与自�
 - 旧版本只有 `desktopInstalled=true` 的布尔记录，不能证明文件归属：不会自动认领或删除。
   遇到 `desktop_file_not_owned` 时，先自行确认并备份/移走旧文件或外来文件，再显式重装。
   未安装且目标不存在时，卸载与关闭自启可重复执行，不触碰其他数据。
-- 升级桌面壳：`nmd update` 拉取新代码后重跑 `nmd desktop install`
+- 升级桌面壳要再跑一次 `nmd desktop install`。`nmd update` 只快进检出的代码，不运行 cargo，也不替换已经装好的桌面文件；采集器重载同样不重装桌面壳
 - 与 `cargo run` 的关系：同一份源码，install 只是构建后复制；日常调试用
   `cargo run`，日常使用走安装入口
 
@@ -94,6 +94,18 @@ nmd desktop uninstall          # 预检通过后移除整个 NMD.app 与自启 p
   （共四个产物：应用内二进制、`Info.plist`、图标、自启 plist），规则与 Linux 一致；
   无归属记录的 `NMD.app` 目录、被修改的产物、符号链接及链接父目录均拒绝
   覆盖/删除。平台不匹配的凭据（如 Linux 凭据）直接判无效，不会认领对方文件
+- 用户能看见的名称来自 `tauri.conf.json` 的 `productName`（现为 `NMD`）：安装器把它写入
+  `CFBundleName` 和 `CFBundleDisplayName`，应用目录是 `~/Applications/NMD.app`。窗口标题在壳程序里
+  已经是 `NMD`。命令行仍是 `nmd`，包内可执行文件仍是 `nmd-desktop`，bundle id 仍是
+  `io.github.zzzhty.nmd-desktop`，这些内部标识不随显示名改动
+- `productName` 在 2026-11-09 改为 `NMD` 之后，更早装上的 `~/Applications/nmd.app` 不会自己变。
+  `nmd update` 和采集器重载都不重装桌面壳，所以菜单名会一直是当时 plist 里的 `nmd`，直到再次执行
+  `nmd desktop install`（无 sudo，会 `cargo build --release --locked`）。装好后要自己退出再打开，
+  正在运行的进程不会被这条命令结束
+- 再次安装时，若凭据里的应用包和当前产品名只差大小写，安装器只改这一个目录的存储大小写，并改写凭据路径
+  和已归属的登录项里的程序路径。默认大小写不敏感的 APFS 上，`nmd.app` 和 `NMD.app` 是同一个 inode，
+  不能用「`NMD.app` 已存在」判断已经改好，也不会把旧路径当成另一个应用删除。目录里凭据没有跟踪的文件留在原地。
+  若目标名字已经是另一个 inode，安装停止，两份目录都不删
 - 图标：`icons/` 下的整套图标（`icon-1024.png` 源、`icon.icns` 32–1024px、
   `icon.png` 32px、`icon.ico`）由 `scripts/build_icons.py` 从 1024px 源图
   确定性生成（需要 Pillow，仅开发用）；重设计时用新源图重跑并整套提交
