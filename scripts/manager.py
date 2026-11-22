@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shlex
 import shutil
 import subprocess
@@ -885,16 +886,38 @@ def _retarget_paths(paths, old_app, new_app):
 
 
 def _rewrite_autostart_binary(root, receipt, paths, old_binary, new_binary):
+    """Point an existing login item at the renamed bundle.
+
+    The plist stores the path as XML, so a home directory containing ``&``,
+    ``<``, ``>`` or quotes is not the raw string on disk. Parse the values and
+    replace only an argument equal to the old path. Other keys stay. This does
+    not create a login item and does not turn RunAtLoad on.
+    """
     path = paths.get("autostart")
     if path is None or str(old_binary) == str(new_binary):
         return
     if "autostart" not in (receipt.get("files") or {}) or not path.is_file():
         return
     old, new = str(old_binary), str(new_binary)
-    text = path.read_text(encoding="utf-8")
-    if old not in text:
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException) as exc:
+        raise ManagerError(
+            "desktop_autostart_unreadable:登录项不是可解析的 plist;未改写、未删除") from exc
+    if not isinstance(data, dict):
+        raise ManagerError(
+            "desktop_autostart_unreadable:登录项不是可解析的 plist;未改写、未删除")
+    arguments = data.get("ProgramArguments")
+    if (not isinstance(arguments, list)
+            or any(not isinstance(item, str) for item in arguments)):
+        raise ManagerError(
+            "desktop_autostart_unreadable:登录项没有程序参数;未改写、未删除")
+    if old not in arguments:
         return
-    _desktop_write_file(root, receipt, "autostart", path, text.replace(old, new))
+    updated = dict(data)
+    updated["ProgramArguments"] = [new if item == old else item for item in arguments]
+    text = plistlib.dumps(updated, sort_keys=False).decode("utf-8")
+    _desktop_write_file(root, receipt, "autostart", path, text)
 
 
 def _macos_refresh_bundle_case(root, receipt, paths):

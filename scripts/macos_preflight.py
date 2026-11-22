@@ -2,7 +2,10 @@
 
 Three tiers, so opening a panel does not depend on takeover-only tools:
 
-* ``readonly`` — dashboard and diagnostics for the current user.
+* ``readonly`` — dashboard and diagnostics for the current user. A dashboard
+  port held by this user's healthy ``run-user`` collector is expected. Any
+  other listener is still a conflict. Daemon and takeover gates do not use
+  that exception.
 * ``daemon`` — what the root supervisor needs before ``start`` or ``restart``.
   ``apply`` uses that restart. When ``on_boot`` is true, or the daemon's
   status cannot be read, the takeover checks are required as well, because
@@ -35,6 +38,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import subprocess
 import sys
 
 import macos_coexist
@@ -280,6 +284,222 @@ def probe_listen(port, host="127.0.0.1", timeout=1.0):
         return "busy"
     finally:
         sock.close()
+
+
+def _bounded_text(argv, timeout=2.0, limit=65536):
+    """Run one absolute argv. No shell, no network, and a capped read."""
+    if not argv or not isinstance(argv[0], str) or not argv[0].startswith("/"):
+        return {"code": None, "stdout": "", "stderr": "", "error": "launch_error"}
+    try:
+        proc = subprocess.Popen(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"},
+            start_new_session=True)
+    except FileNotFoundError:
+        return {"code": None, "stdout": "", "stderr": "", "error": "tool_missing"}
+    except OSError:
+        return {"code": None, "stdout": "", "stderr": "", "error": "launch_error"}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return {"code": None, "stdout": "", "stderr": "", "error": "timeout"}
+    if len(stdout) > limit or len(stderr) > limit:
+        return {"code": None, "stdout": "", "stderr": "", "error": "too_large"}
+    try:
+        out = stdout.decode("utf-8")
+        err = stderr.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"code": None, "stdout": "", "stderr": "", "error": "invalid_text"}
+    return {"code": proc.returncode, "stdout": out, "stderr": err, "error": None}
+
+
+def _same_regular_file(left, right):
+    """True, False, or None when the comparison itself cannot be made."""
+    try:
+        a = os.lstat(left)
+        b = os.lstat(right)
+    except OSError:
+        return None
+    if (stat.S_ISLNK(a.st_mode) or stat.S_ISLNK(b.st_mode)
+            or not stat.S_ISREG(a.st_mode) or not stat.S_ISREG(b.st_mode)):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _trusted_file(path, uid):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1 or info.st_uid != uid
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        return "untrusted"
+    return "ok"
+
+
+def _program_target(arguments, config_path):
+    """How a parsed argv relates to this install's run-user collector.
+
+    The shape has to be the five arguments the installer writes. A path that
+    merely contains the letters ``nmd`` is not this collector.
+    """
+    if (not isinstance(arguments, list) or len(arguments) != 5
+            or any(not isinstance(item, str) or not item for item in arguments)):
+        return "wrong_instance"
+    python, script, verb, flag, configured = arguments
+    if (not Path(python).is_absolute() or not Path(script).is_absolute()
+            or Path(script).name != "nmd_daemon.py"
+            or verb != "run-user" or flag != "--config"
+            or not Path(configured).is_absolute()):
+        return "wrong_instance"
+    same = _same_regular_file(configured, config_path)
+    if same is None:
+        return "unreadable"
+    if not same:
+        return "wrong_config"
+    return "match"
+
+
+def _parse_launchctl_job(text):
+    """State, pid, and arguments from ``launchctl print``. None if unreadable."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    depth = 0
+    collecting = False
+    args = None
+    state = None
+    pid = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if collecting:
+            if line == "}":
+                collecting = False
+                continue
+            args.append(line)
+            continue
+        if line == "arguments = {":
+            if depth != 1 or args is not None:
+                return None
+            collecting = True
+            args = []
+            continue
+        depth += line.count("{")
+        if depth == 1 and line.startswith("state = "):
+            state = line.split("=", 1)[1].strip()
+        elif depth == 1 and line.startswith("pid = "):
+            pid = line.split("=", 1)[1].strip()
+        depth -= line.count("}")
+    if not state or args is None or not pid or not pid.isdigit() or int(pid) <= 0:
+        return None
+    return {"state": state, "pid": int(pid), "arguments": args}
+
+
+def _lsof_binary():
+    """Absolute lsof. macOS has ``/usr/sbin/lsof``; some hosts use ``/usr/bin``."""
+    for path in ("/usr/sbin/lsof", "/usr/bin/lsof"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _lsof_argv(pid, port):
+    """``lsof -F n`` for this pid's ``127.0.0.1`` listener, or None.
+
+    The address grammar is ``[46][protocol][@host][:port]``. ``TCP:port`` is
+    any address on that port. ``TCP:127.0.0.1:port`` is a service name, and
+    lsof exits 1 with ``unacceptable port specification`` and empty stdout.
+    That rejected query is not an absent listener. ``TCP@127.0.0.1:port`` is
+    the loopback socket; a wildcard bind does not satisfy it.
+    """
+    binary = _lsof_binary()
+    if binary is None:
+        return None
+    return [
+        binary, "-nP", "-a", "-p", str(pid),
+        f"-iTCP@127.0.0.1:{port}", "-sTCP:LISTEN", "-F", "n"]
+
+
+def _lsof_loopback(text, port):
+    """True when the only ``lsof -F n`` name is this loopback listener."""
+    if not isinstance(text, str):
+        return None
+    names = [line[1:] for line in text.splitlines() if line.startswith("n")]
+    wanted = f"127.0.0.1:{port}"
+    if names == [wanted]:
+        return True
+    if not names:
+        return False
+    return None
+
+
+def inspect_dashboard_owner(port, config_path):
+    """Whether the busy dashboard port is this user's running collector.
+
+    Evidence is the user LaunchAgent, ``launchctl print`` of that job, and
+    ``lsof -F n`` for that pid on ``TCP@127.0.0.1``. This does not connect to
+    the port and does not read an HTTP response. ``match`` still needs a
+    usable collector directory before the check passes. A rejected lsof query
+    is unknown, not another listener.
+    """
+    import nmd_daemon
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return {"status": "unknown", "reason": "probe_unknown"}
+    config_path = Path(config_path)
+    uid = os.geteuid()
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{nmd_daemon.LABEL}.plist"
+    trust = _trusted_file(plist_path, uid)
+    if trust == "missing":
+        return {"status": "other", "reason": "busy"}
+    if trust == "untrusted":
+        return {"status": "unknown", "reason": "plist_untrusted"}
+    if trust != "ok":
+        return {"status": "unknown", "reason": "plist_unreadable"}
+    try:
+        import plistlib
+        data = plistlib.loads(plist_path.read_bytes())
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return {"status": "unknown", "reason": "plist_unreadable"}
+    if not isinstance(data, dict) or data.get("Label") != nmd_daemon.LABEL:
+        return {"status": "other", "reason": "wrong_instance"}
+    target = _program_target(data.get("ProgramArguments"), config_path)
+    if target == "unreadable":
+        return {"status": "unknown", "reason": "config_unreadable"}
+    if target != "match":
+        return {"status": "other", "reason": target}
+    printed = _bounded_text(
+        ["/bin/launchctl", "print", f"gui/{uid}/{nmd_daemon.LABEL}"])
+    if printed["error"]:
+        return {"status": "unknown", "reason": "job_unreadable"}
+    if printed["code"] != 0:
+        if "Could not find service" in printed["stderr"]:
+            return {"status": "other", "reason": "busy"}
+        return {"status": "unknown", "reason": "job_unreadable"}
+    job = _parse_launchctl_job(printed["stdout"])
+    if job is None or job["state"] != "running":
+        return {"status": "unknown", "reason": "job_unhealthy"}
+    if job["arguments"] != data["ProgramArguments"]:
+        return {"status": "unknown", "reason": "job_mismatch"}
+    argv = _lsof_argv(job["pid"], port)
+    if argv is None:
+        return {"status": "unknown", "reason": "listener_unreadable"}
+    listed = _bounded_text(argv)
+    if listed["error"]:
+        return {"status": "unknown", "reason": "listener_unreadable"}
+    heard = _lsof_loopback(listed["stdout"], port)
+    if heard is True and listed["code"] == 0:
+        return {"status": "match", "reason": "running"}
+    # A clean miss is exit 1 with empty stdout and empty stderr. Anything
+    # else (a usage error, an extra address, a non-zero success) was not read.
+    if (heard is not False or listed["code"] not in (0, 1)
+            or listed["stderr"].strip()):
+        return {"status": "unknown", "reason": "listener_unreadable"}
+    return {"status": "other", "reason": "busy"}
 
 
 def probe_snapshot():
@@ -618,6 +838,12 @@ def collect(tier, *, root=None, options=None, on_check=None):
             if isinstance(port, int) and not isinstance(port, bool):
                 facts["dashboard_port"] = port
                 facts["listen"][port] = probe_listen(port)
+                if facts["listen"][port] == "busy":
+                    import nmd_daemon
+                    config_path = nmd_daemon.default_daemon_config_path(root)
+                    facts["dashboard_owner"] = _safe_probe(
+                        lambda: inspect_dashboard_owner(port, config_path),
+                        {"status": "unknown", "reason": "probe_error"})
         _emit(on_check, _dashboard_checks, facts)
         return facts
 
@@ -795,6 +1021,41 @@ def _dashboard_checks(facts):
                        summary="没有已安装的面板端口。打开面板不检查接管组件。")]
     listened = (facts.get("listen") or {}).get(port)
     if listened == "busy":
+        owner = facts.get("dashboard_owner") or {}
+        status = owner.get("status")
+        reason = owner.get("reason") or "busy"
+        collector = (facts.get("collector") or {}).get("status")
+        if status == "match" and collector == "pass":
+            return [_check(
+                "dashboard_port", "pass", required=True, reason="collector_running",
+                summary=f"采集器已运行。面板端口 {port} 由当前用户的这份配置监听。")]
+        if status == "match":
+            if collector == "unknown":
+                return [_check(
+                    "dashboard_port", "unknown", required=True,
+                    reason="collector_unhealthy",
+                    summary=f"认得出面板端口 {port} 上的进程，但采集目录读不准，不能当成已正常运行。",
+                    remediation="无法确认采集目录，所以这是 unknown。没有停进程，也没有改端口。")]
+            return [_check(
+                "dashboard_port", "fail", required=True, reason="collector_unhealthy",
+                summary=f"面板端口 {port} 上的进程对得上当前配置，但采集目录不可用，不能当成已正常运行。",
+                remediation="先让当前用户能用自己的采集目录。预检不会结束那个进程，也不会改端口。")]
+        if status == "unknown":
+            return [_check(
+                "dashboard_port", "unknown", required=True,
+                reason=reason if reason != "busy" else "probe_unknown",
+                summary=f"无法确认面板端口 {port} 的监听者是不是当前这份采集器。",
+                remediation="探测没有得到可信任的归属，所以这是 unknown。没有停进程，也没有改端口。")]
+        if reason == "wrong_config":
+            return [_check(
+                "dashboard_port", "fail", required=True, reason="wrong_config",
+                summary=f"面板端口 {port} 被另一份配置占用，不是当前 daemon.json。",
+                remediation="这不是当前配置的采集器。预检不会结束那个进程，也不会改端口。")]
+        if reason == "wrong_instance":
+            return [_check(
+                "dashboard_port", "fail", required=True, reason="wrong_instance",
+                summary=f"面板端口 {port} 上的进程不是当前这份 run-user 采集器。",
+                remediation="换一个端口，或停掉占用它的程序后再开面板。预检不会结束那个进程。")]
         return [_check(
             "dashboard_port", "fail", required=True, reason="busy",
             summary=f"面板端口 {port} 已有程序在监听。",

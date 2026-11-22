@@ -472,6 +472,54 @@ class MacosDesktopTests(DesktopFixture):
         self.assertFalse(new.exists())
         self.assertEqual(keep.read_text(encoding="utf-8"), "outside")
 
+    def test_case_rename_updates_an_escaped_autostart_path_and_keeps_other_keys(self):
+        self.home = self.base / "h&<>\"'"
+        self.home.mkdir()
+        self._product("nmd")
+        self.assertEqual(self.invoke("install").returncode, 0)
+        self.assertEqual(self.invoke("autostart", "on").returncode, 0)
+        agent = self.home / "Library/LaunchAgents/io.github.zzzhty.nmd-desktop.plist"
+        old_binary = str(self.home / "Applications/nmd.app/Contents/MacOS/nmd-desktop")
+        data = plistlib.loads(agent.read_bytes())
+        self.assertEqual(data["ProgramArguments"], [old_binary])
+        data["ProgramArguments"].append(old_binary + "-note")
+        data["RunAtLoad"] = False
+        data["LimitLoadToSessionType"] = "Aqua"
+        agent.write_bytes(plistlib.dumps(data))
+        agent.chmod(0o644)
+        receipt = json.loads(self.receipt("desktopReceipt"))
+        receipt["files"]["autostart"] = manager._desktop_fingerprint(agent)
+        manager.setting(self.checkout, "desktopReceipt", json.dumps(receipt, sort_keys=True))
+        self._product("NMD")
+        result = self.invoke("install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = plistlib.loads(agent.read_bytes())
+        new_binary = str(self.home / "Applications/NMD.app/Contents/MacOS/nmd-desktop")
+        self.assertEqual(parsed["ProgramArguments"], [new_binary, old_binary + "-note"])
+        self.assertEqual(parsed["Label"], "io.github.zzzhty.nmd-desktop")
+        self.assertFalse(parsed["RunAtLoad"])
+        self.assertEqual(parsed["LimitLoadToSessionType"], "Aqua")
+        self.assertEqual(set(parsed), {
+            "Label", "ProgramArguments", "RunAtLoad", "LimitLoadToSessionType"})
+        raw = agent.read_text(encoding="utf-8")
+        self.assertIn('&amp;&lt;&gt;"\'/Applications/NMD.app/', raw)
+        self.assertEqual(self.receipt("desktopAutostart"), "true")
+        self.assertEqual(sorted(path.name for path in (self.home / "Library/LaunchAgents").iterdir()),
+                         ["io.github.zzzhty.nmd-desktop.plist"])
+
+    def test_rewrite_does_not_create_or_enable_autostart(self):
+        self.assertEqual(self.invoke("install").returncode, 0)
+        paths = self.destinations()
+        receipt = json.loads(self.receipt("desktopReceipt"))
+        receipt["files"]["autostart"] = {"size": 1, "sha256": "0" * 64}
+        missing = paths["autostart"]
+        self.assertFalse(missing.exists())
+        manager._rewrite_autostart_binary(
+            self.checkout, receipt, paths,
+            paths["binary"], paths["binary"].with_name("other"))
+        self.assertFalse(missing.exists())
+        self.assertEqual(self.receipt("desktopAutostart"), "false")
+
     def test_another_inode_with_the_desired_case_is_not_deleted(self):
         self._product("nmd")
         self.assertEqual(self.invoke("install").returncode, 0)
