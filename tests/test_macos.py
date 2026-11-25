@@ -202,6 +202,9 @@ class SafeMacOSCLITests(unittest.TestCase):
         self.assertIn('daemon on-boot', text)
         self.assertIn('203.0.113.20', text)
         self.assertIn('不改 on_boot', text)
+        self.assertIn('loaded_daemon: false', text)
+        self.assertIn('用户 LaunchAgent 不在这次 restart 里', text)
+        self.assertLess(text.index('与 Linux 共享的动词留在顶层'), text.index('\n监控和诊断\n'))
         self.assertLess(text.index('监控和诊断'), text.index('安装、更新、应用'))
         self.assertLess(text.index('安装、更新、应用'), text.index('实验性常驻守护'))
         self.assertLess(text.index('onboard'), text.index('macos geodata ensure'))
@@ -448,6 +451,47 @@ class SafeMacOSCLITests(unittest.TestCase):
         kwargs = observe.call_args.kwargs
         self.assertIsNone(kwargs['sources_dir'])
         self.assertNotIn('config_file', kwargs)
+
+    def test_top_level_daemon_is_rejected_on_every_platform_without_loading_launchd(self):
+        import nmd_daemon
+        for platform in ('linux', 'macos', 'windows'):
+            with self.subTest(platform=platform), \
+                    patch.object(nmd_platform, 'name', return_value=platform), \
+                    patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('loaded')):
+                with self.assertRaisesRegex(manager.ManagerError, '没有顶层 daemon 命令'):
+                    manager.main(['daemon'])
+
+    def test_wrong_prefix_names_the_top_level_command_and_stops(self):
+        import nmd_daemon
+        for name, message in manager.MACOS_WRONG_PREFIX.items():
+            error = io.StringIO()
+            with self.subTest(name=name), \
+                    patch('macos_takeover.main', side_effect=AssertionError('takeover')), \
+                    patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('daemon')), \
+                    patch('sys.stderr', error):
+                with self.assertRaises(SystemExit) as caught:
+                    manager.main(['macos', name])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(error.getvalue(), message + '\n')
+            self.assertNotIn('geodata ensure', error.getvalue())
+
+    def test_top_level_start_stop_restart_name_the_experimental_command(self):
+        import nmd_daemon
+        for name in ('start', 'stop', 'restart'):
+            with self.subTest(name=name), \
+                    patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('daemon')), \
+                    patch.object(manager, 'run', side_effect=AssertionError('run')):
+                with self.assertRaises(manager.ManagerError) as caught:
+                    manager.main([name])
+            self.assertEqual(str(caught.exception), manager.MACOS_LIFECYCLE_REJECTION[name])
+            self.assertIn('Linux', str(caught.exception))
+
+    def test_macos_typo_stays_the_generic_platform_rejection(self):
+        with self.assertRaises(manager.ManagerError) as caught:
+            manager.main(['typo'])
+        text = str(caught.exception)
+        self.assertIn('仅支持 Linux', text)
+        self.assertNotIn('未知命令', text)
 
 
 class ConfigEditAPITests(unittest.TestCase):

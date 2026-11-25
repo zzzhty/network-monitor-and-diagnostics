@@ -68,6 +68,7 @@ systemd 安装管理，面板不提供编辑。
 不启动后台常驻，不自动测速、修复或切换网络。唯一例外是显式 `nmd desktop autostart on`
 写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
 macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `desktop` 生命周期。
+与 Linux 共享的动词留在顶层，包括 apply / refresh。macOS 的 apply 仍可能 bootstrap 未加载的 root job，并回退正在进行的接管。
 `apply` 记录当前版本；已安装常驻守护时，若这次重载会用到接管规则，先运行与 `nmd macos geodata ensure` 相同的补齐，再做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
 它不下载 Linux 的 mihomo 安装包，也不调用 `takeover-start`。下载失败或预检失败时不会 stop，也不会 sudo，待应用状态保留。
 若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。
@@ -139,7 +140,7 @@ nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
 
 这是显式选择的实验路径，不是与 Clash Verge Rev 共同使用时的默认监控。默认路径不部署 mihomo，不改 DNS、路由或系统代理。下面的顺序没有在本仓库的实机上跑过。入口是 `nmd onboard`。它不能从零装完一台 Mac：官方 Tailscale 仍要自己安装，Tailnet SOCKS 地址也要自己提供。mihomo 只有在已经存在当前用户可写的目录时才会被放进去；放不进去就停，不写 `daemon.json`，也不开始接管。
 
-`install`、`start`、`restart` 和 `apply` 都不改 `takeover.on_boot`。`DAEMON_POLICY` 里 `takeover_on_boot_default` 仍是 false。同一次开机里的 KeepAlive 重启，以及睡眠唤醒，都不会因为这个标志再开一轮接管。
+`install`、`start`、`restart` 和 `apply` 都不改 `takeover.on_boot`。`DAEMON_POLICY` 里 `takeover_on_boot_default` 仍是 false。同一次开机里的 KeepAlive 重启，以及睡眠唤醒，都不会因为这个标志再开一轮接管。on-boot、init、onboard 成功 JSON 里的 `loaded_daemon: false` 表示这条命令没有去加载守护，不表示守护处于未加载。
 
 ### nmd 装不了的前提
 

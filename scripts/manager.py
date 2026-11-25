@@ -1169,6 +1169,8 @@ def installation_status(root):
 MACOS_HELP = """\
 NMD macOS：默认只做监控和诊断，不接管流量
 
+与 Linux 共享的动词留在顶层，包括 apply / refresh。macOS 的 apply 仍可能 bootstrap 未加载的 root job，并回退正在进行的接管。nmd macos 是 Darwin 实验面，不是只有这里会改网络。
+
 监控和诊断
   monitor config-check --config FILE
   monitor run --config FILE --state-dir DIR [--once]
@@ -1193,6 +1195,7 @@ NMD macOS：默认只做监控和诊断，不接管流量
                                        on_boot 为 true 时，新的一次开机可能开始接管
 
 实验性常驻守护（按下面的顺序；不是与外部客户端一起用时的默认路径）
+  这一节才是 nmd macos。顶层的 apply 不在这里，但 macOS 上它仍可能 bootstrap 并回退接管。
   onboard                              交互终端逐项填写。确认前不下载、不写配置
   onboard --server ADDR --port PORT
   onboard --inputs FILE                非交互。不安装 Tailscale。mihomo 不在时才放到
@@ -1211,10 +1214,14 @@ NMD macOS：默认只做监控和诊断，不接管流量
   macos daemon on-boot [on|off|status]
                                        只读写 takeover.on_boot。不加载守护，也不开始接管。
                                        不要 sudo。之后的 start 或 apply 只有在被当成新的一次开机时
-                                       才可能马上接管
+                                       才可能马上接管。
+                                       on-boot、init、onboard 成功 JSON 里的 loaded_daemon: false
+                                       表示这条命令没有去加载守护，不表示守护处于未加载
   macos daemon install|uninstall|start|stop|restart|status|takeover-start|takeover-stop
                                        root supervisor 与用户 daemon。这些动作不改 on_boot。
-                                       restart 等于先 stop 再 start。预检失败则不 stop。
+                                       restart 等于先 stop 再 start。stop 失败不 start。
+                                       未加载的 root job 会在 start 里 bootstrap 已安装的 plist。
+                                       用户 LaunchAgent 不在这次 restart 里。预检失败则不 stop。
                                        进行中的接管会被这次 stop 回退
   macos accept                         2 分钟验收：独立 root 回退进程就绪后才改网络
   macos takeover|rollback              实验性 sudo 前台接管。见 docs/macos-mihomo-tailscale.md
@@ -1225,6 +1232,7 @@ Linux 的网络部署与 systemd 生命周期在 macOS 不支持。
 
 MACOS_SUBCOMMANDS = """\
 nmd macos 子命令。这是实验路径，不是默认监控。总览见 nmd help。
+这些才是 nmd macos 的子命令；nmd apply、nmd update、nmd onboard 不在这里。
 
   geodata ensure [--geodata-dir DIR] [--inputs FILE]
   preflight [--tier readonly|daemon|takeover] [--json|--summary]
@@ -1239,6 +1247,26 @@ restart 等于先 stop 再 start。install、start、restart 和 apply 不改 on
 init 拒绝占位地址 203.0.113.20。某一条的参数：nmd macos <子命令> --help
 """
 
+# Top-level verbs typed under `nmd macos`. Exit 2 before any daemon or takeover work.
+MACOS_WRONG_PREFIX = {
+    "apply": "没有 nmd macos apply。用 nmd apply。",
+    "refresh": "没有 nmd macos refresh。用 nmd refresh。",
+    "update": "没有 nmd macos update。用 nmd update。",
+    "onboard": "没有 nmd macos onboard。用 nmd onboard。",
+    "monitor": "没有 nmd macos monitor。用 nmd monitor status、nmd monitor run 或 nmd monitor config-check。",
+    "gui": "没有 nmd macos gui。用 nmd gui。",
+    "machine": "没有 nmd macos machine。用 nmd machine status 或 nmd machine capabilities。",
+    "desktop": "没有 nmd macos desktop。用 nmd desktop。",
+    "bootstrap": "没有 nmd macos bootstrap。用 nmd bootstrap --manager-only。",
+    "version": "没有 nmd macos version。用 nmd version。",
+}
+
+MACOS_LIFECYCLE_REJECTION = {
+    "start": "顶层 nmd start 是 Linux 的 mihomo 命令，macOS 不运行它。对应的实验命令是 nmd macos daemon start。警告：那个 start 会 bootstrap 未加载的 root job。本命令没有执行 sudo，也没有加载 launchd。",
+    "stop": "顶层 nmd stop 是 Linux 的 mihomo 命令，macOS 不运行它。对应的实验命令是 nmd macos daemon stop。警告：那个 stop 会回退正在进行的接管；回退未完成则不会 bootout 仍在恢复的管理器。本命令没有执行 sudo，也没有加载 launchd。",
+    "restart": "顶层 nmd restart 是 Linux 的 mihomo 命令，macOS 不运行它。对应的实验命令是 nmd macos daemon restart。警告：那是先 stop 再 start；stop 失败不 start；start 会 bootstrap 未加载的 root job；用户 LaunchAgent 不在内。本命令没有执行 sudo，也没有加载 launchd。",
+}
+
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
@@ -1246,6 +1274,10 @@ def main(argv=None):
     platform = nmd_platform.name()
     if command == "demo":
         raise ManagerError("没有 demo 命令。合成数据用 nmd gui --dry-run，或 nmd monitor status --dry-run。")
+    if command == "daemon":
+        raise ManagerError(
+            "没有顶层 daemon 命令。macOS 的 root 管理器是 nmd macos daemon。"
+            "Linux 的 mihomo 仍用顶层 start、stop、restart。本命令没有加载 launchd。")
     if command == "onboard":
         from nmd_onboard import main as onboard_main
         raise SystemExit(onboard_main(argv[1:]))
@@ -1282,6 +1314,8 @@ def main(argv=None):
             # back an active takeover. Linux network deploy and systemd stay
             # unsupported. `macos` is the experimental takeover controller.
             allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos", "onboard"}
+        if platform == "macos" and command in MACOS_LIFECYCLE_REJECTION:
+            raise ManagerError(MACOS_LIFECYCLE_REJECTION[command])
         if (command not in allowed
                 or (command == "monitor" and len(argv) > 1 and argv[1] in service_actions)):
             raise ManagerError("此命令仅支持 Linux；macOS 仅支持源码诊断 CLI、只读诊断 GUI"
@@ -1362,6 +1396,9 @@ def main(argv=None):
         # so never let another platform fall through into that re-exec.
         if platform != "macos":
             print(f"未知命令: {command}", file=sys.stderr)
+            raise SystemExit(2)
+        if len(argv) > 1 and argv[1] in MACOS_WRONG_PREFIX:
+            print(MACOS_WRONG_PREFIX[argv[1]], file=sys.stderr)
             raise SystemExit(2)
         if argv[1:2] == ["preflight"]:
             from macos_preflight import main as preflight_main
