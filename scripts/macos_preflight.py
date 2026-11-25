@@ -522,10 +522,13 @@ def probe_snapshot():
 
 
 def probe_activity(socket_path=None):
-    """One status read. Missing socket means the daemon is not running.
+    """One status read.
 
-    A timeout or a garbled reply is ``unknown``: the process might still be
-    in a takeover, so the caller must not stop it.
+    ``inactive`` with ``reason`` None means the socket answered and there is
+    no takeover. A missing socket is ``inactive`` with ``socket_absent``;
+    that does not prove the daemon is uninstalled, and this probe does not
+    load it. A timeout or a garbled reply is ``unknown``: the process might
+    still be in a takeover, so the caller must not stop it.
     """
     import nmd_daemon
     path = Path(socket_path or nmd_daemon.SOCKET_PATH)
@@ -1138,6 +1141,14 @@ def _tailscale_cli_checks(facts):
                     "或 Tailscale.app 内。不会自动安装，也不会改用其他客户端。")]
 
 
+def _inactive_activity_summary(reason):
+    if reason in ("socket_absent", "not_listening"):
+        return "没有看到 root 管理器的套接字。不能据此说它未安装，这次也不会去加载。"
+    if reason is None:
+        return "root 管理器有应答，当前没有接管。"
+    return "没有看到正在进行的接管。这不是「守护已停止」。"
+
+
 def _activity_checks(tier, facts):
     if tier != "daemon":
         return []
@@ -1154,7 +1165,7 @@ def _activity_checks(tier, facts):
     else:
         activity_check = _check("daemon_activity", "pass", required=True,
                                 reason=activity.get("reason"),
-                                summary="没有看到正在运行的常驻守护。")
+                                summary=_inactive_activity_summary(activity.get("reason")))
     return [activity_check,
             _check("network_effect", "pass", required=False,
                    summary=_network_summary(activity, facts.get("on_boot")))]
