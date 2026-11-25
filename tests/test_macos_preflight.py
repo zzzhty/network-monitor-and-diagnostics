@@ -423,6 +423,33 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(pf.exit_code(report), 0)
         self.assertFalse(report["effects"]["preflight_mutates"])
 
+    def test_inactive_summaries_do_not_call_a_silent_socket_stopped(self):
+        cases = (
+            ("socket_absent", "没有看到 root 管理器的套接字。不能据此说它未安装，这次也不会去加载。"),
+            ("not_listening", "没有看到 root 管理器的套接字。不能据此说它未安装，这次也不会去加载。"),
+            (None, "root 管理器有应答，当前没有接管。"),
+            ("socket_unreadable", "没有看到正在进行的接管。这不是「守护已停止」。"),
+        )
+        for reason, summary in cases:
+            report = pf.assess("daemon", daemon_facts(
+                activity={"state": "inactive", "reason": reason, "on_boot": None}))
+            item = one(report, "daemon_activity")
+            self.assertEqual(item["status"], "pass", reason)
+            self.assertEqual(item["summary"], summary, reason)
+        unknown = pf.assess("daemon", daemon_facts(
+            activity={"state": "unknown", "reason": "timeout", "on_boot": None},
+            expand_takeover=True))
+        self.assertEqual(one(unknown, "daemon_activity")["status"], "unknown")
+        self.assertEqual(one(unknown, "daemon_activity")["summary"], "看不清常驻守护是否正在接管。")
+        self.assertIn("不会 stop", one(unknown, "daemon_activity")["remediation"])
+        self.assertIn("也不会 sudo", one(unknown, "daemon_activity")["remediation"])
+        active = pf.assess("daemon", daemon_facts(
+            activity={"state": "active", "reason": None, "on_boot": False}))
+        self.assertEqual(one(active, "daemon_activity")["status"], "pass")
+        self.assertEqual(one(active, "daemon_activity")["summary"], "常驻守护在运行，并且当前有接管。")
+        self.assertNotIn("not running", pf.probe_activity.__doc__)
+        self.assertIn("no takeover", pf.probe_activity.__doc__)
+
 
 class SnapshotConflictTests(unittest.TestCase):
     def test_strict_accept_refuses_anything_that_is_not_an_explicit_clear(self):
@@ -1320,6 +1347,60 @@ class CollectTests(_Tree):
         self.assertNotIn("\x1b", err.getvalue())
         self.assertNotIn("\r", err.getvalue())
         self.assertIn("[失败] 守护配置", err.getvalue())
+
+    def test_collect_expand_takeover_follows_on_boot_and_unknown(self):
+        missing = {"status": "fail", "path": None, "reason": "missing"}
+        document = {"status": "fail", "reason": "inputs_missing", "dns_mode": None,
+                    "needs_site": False, "needs_ip": False, "listen_port": None}
+        geodata_fact = {"status": "fail", "reason": "geodata_missing", "missing": []}
+        snapshot = {"status": "unknown", "reason": "not_observed",
+                    "has_198_18": None, "mihomo_running": None}
+
+        def gather(on_boot, activity, expand):
+            config = self.config_dir / "daemon.json"
+            if on_boot is None:
+                if config.exists():
+                    config.unlink()
+            else:
+                self.write_config(on_boot=on_boot,
+                                  mihomo_path=str(self.base / "missing-mihomo"))
+            patches = [
+                patch.object(pf, "probe_activity", return_value=activity),
+                patch.object(pf, "_resolve_mihomo", return_value=missing),
+                patch.object(pf, "probe_tailscale_cli", return_value=missing),
+                patch.object(pf, "inspect_state_dir",
+                             return_value={"status": "pass", "reason": "ok"}),
+                patch.object(pf, "_recorded_state_dir", return_value=str(self.state_dir)),
+            ]
+            if expand:
+                patches.extend([
+                    patch.object(pf, "inspect_document", return_value=document),
+                    patch.object(pf, "probe_geodata", return_value=geodata_fact),
+                    patch.object(pf, "probe_snapshot", return_value=snapshot),
+                    patch.object(pf.macos_takeover, "resolve_geodata_dir",
+                                 return_value=str(self.state_dir)),
+                    patch.object(pf, "probe_listen", return_value="free"),
+                ])
+            else:
+                for name in ("inspect_document", "probe_geodata", "probe_snapshot",
+                             "probe_listen", "probe_version", "probe_tailscale_status"):
+                    patches.append(patch.object(pf, name, side_effect=AssertionError(name)))
+                patches.append(patch.object(
+                    pf.macos_takeover, "resolve_geodata_dir", side_effect=AssertionError("geo")))
+            with self.context():
+                with contextlib.ExitStack() as stack:
+                    for item in patches:
+                        stack.enter_context(item)
+                    facts = pf.collect("daemon", root=self.checkout)
+            self.assertIs(facts["expand_takeover"], expand, (on_boot, activity))
+            self.assertEqual(
+                one(pf.assess("daemon", facts), "daemon_activity")["status"],
+                "unknown" if activity["state"] == "unknown" else "pass")
+
+        gather(False, {"state": "inactive", "reason": "socket_absent", "on_boot": None}, False)
+        gather(None, {"state": "inactive", "reason": None, "on_boot": None}, False)
+        gather(True, {"state": "inactive", "reason": None, "on_boot": False}, True)
+        gather(False, {"state": "unknown", "reason": "timeout", "on_boot": None}, True)
 
 
 class _Capture(io.TextIOBase):
