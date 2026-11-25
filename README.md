@@ -172,8 +172,8 @@ nmd test-stop        # 临时停 mihomo 验证 Tailscale，结束时恢复原运
 
 `nmd update` 不再隐式部署网络，即使显示待应用也不会自动重试 apply。
 快进失败时当前版本不变，`pendingApply` 恢复为更新前的值（原先未设置则仍不设置），不会把未改变的修订标成待应用。
-macOS 的 `nmd apply` / `refresh` 不做上面的 Linux 网络部署。它记录当前版本；已安装常驻守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。若当时有进行中的接管，这次 stop 会按快照回退路由、DNS 或 Tailscale exit node；`on_boot` 为 true 时，新的一次开机可能开始接管。与 Linux 共享的动词留在顶层，包括 apply / refresh。macOS 的 apply 仍可能 bootstrap 未加载的 root job，并回退正在进行的接管。见 [docs/macos.md](docs/macos.md) 与 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。
-`nmd status` 的“待应用”表示当前代码尚未完成显式网络部署，不表示 monitor 安装失败；
+macOS 的 `nmd apply` / `refresh` 不做上面的 Linux 网络部署。它记录当前版本；已安装常驻守护时，若这次重载需要地理数据，先补齐缺少的文件，再做只读预检，通过后才执行 `nmd macos daemon restart`（先 stop 再 start）。下载或预检失败不 stop、不 sudo。若当时有进行中的接管，这次 stop 会按快照回退路由、DNS 或 Tailscale exit node；`on_boot` 为 true 时，新的一次开机可能开始接管。与 Linux 共享的动词留在顶层，包括 apply / refresh。macOS 的 apply 仍可能 bootstrap 未加载的 root job，并回退正在进行的接管。macOS 的 `nmd status` 是只读目录：修订是否已记录、root 套接字是否应答、是否正在接管。它不读服务、Tailscale、DNS 或路由。见 [docs/macos.md](docs/macos.md) 与 [docs/macos-mihomo-tailscale.md](docs/macos-mihomo-tailscale.md)。
+Linux 上 `nmd status` 的“待应用”表示当前代码尚未完成显式网络部署，不表示 monitor 安装失败；
 只使用诊断时无需为了清除该状态而运行 apply。网络部署失败后，修复问题并显式重试
 `nmd apply`。个人安装的显式网络操作仍可能通过 sudo 执行该 checkout 中的辅助脚本，
 必须信任整个 checkout；scope 不改变网络操作的系统权限。系统安装与更新检查整个

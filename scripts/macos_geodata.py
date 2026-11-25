@@ -88,7 +88,8 @@ daemon.json when --inputs is omitted. --geodata-dir is the destination
 either way; otherwise the destination is ~/.config/mihomo for this account.
 
 Does not sudo, stop, start, or change routes, DNS, proxy, or Tailscale.
-nmd macos preflight, help, status, and the read-only panel do not download.
+nmd macos preflight, help, daemon status, and the read-only panel do not download.
+nmd status does not download.
 Run this, or accept / takeover / daemon start, as the account that owns the
 files. Do not use sudo for this command.
 

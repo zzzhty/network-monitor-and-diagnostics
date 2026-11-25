@@ -69,6 +69,7 @@ systemd 安装管理，面板不提供编辑。
 写入的用户级登录 LaunchAgent：它只在登录时启动 GUI 壳本身，不是后台采集或网络服务。
 macOS 支持 `bootstrap --manager-only`、`update`、`apply` / `refresh` 与 `desktop` 生命周期。
 与 Linux 共享的动词留在顶层，包括 apply / refresh。macOS 的 apply 仍可能 bootstrap 未加载的 root job，并回退正在进行的接管。
+`nmd status` 在 macOS 上是只读目录：修订是否已记录、root 套接字是否应答、是否正在接管。它不是采集快照，不读 Tailscale、DNS 或路由。
 `apply` 记录当前版本；已安装常驻守护时，若这次重载会用到接管规则，先运行与 `nmd macos geodata ensure` 相同的补齐，再做只读预检，通过后才重载 root 管理器（`daemon restart` 等于先 stop 再 start）。
 它不下载 Linux 的 mihomo 安装包，也不调用 `takeover-start`。下载失败或预检失败时不会 stop，也不会 sudo，待应用状态保留。
 若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。
@@ -132,7 +133,7 @@ nmd macos geodata ensure --geodata-dir /path/to/dir --inputs inputs.json
 
 不带 `--geodata-dir` 时写到当前账户的 `~/.config/mihomo`。这个目录也是 sudo 前台（`SUDO_USER` 的家目录）和 launchd（daemon 配置所有者的家目录）复制地理数据的地方。不要用 sudo 跑这条命令：它不会把文件写进 `/var/root`，也不会改 root 拥有的权限。显式 `--geodata-dir` 只写该目录，规则来自 `--inputs` 或已安装的 `daemon.json` 时都一样。规则里没有 `GEOSITE` 就不下 `geosite.dat`，没有 `GEOIP` 就不下 `geoip.metadb`。文件已经是合法的 MMDB 或 geosite 时不访问网络。下载或格式校验失败时，原来的字节留在原地；目录里剩下一个非空但无效的文件也不会 sudo、stop，或把这次 apply 记成已应用。复制进 mihomo 工作目录时包含 `geoip.db`，因为这个名字和 `geoip.metadb`、`Country.mmdb` 一样被 mihomo 1.19 认作 MMDB。
 
-`accept`、`takeover`，以及需要接管检查的 `daemon start` / `restart` / `takeover-start`（含已安装守护上的 `apply`），会在 sudo、stop、start 之前做同一步。下载或校验失败则不继续，不改路由、DNS、代理或 Tailscale，也不把版本记成已应用。`preflight`、`help`、`status` 和只读面板不会下载。
+`accept`、`takeover`，以及需要接管检查的 `daemon start` / `restart` / `takeover-start`（含已安装守护上的 `apply`），会在 sudo、stop、start 之前做同一步。下载或校验失败则不继续，不改路由、DNS、代理或 Tailscale，也不把版本记成已应用。`preflight`、`help`、`daemon status` 和只读面板不会下载。顶层 `nmd status` 同样不会下载。
 
 这一步在仓库里用替身验证，不是实机下载验收。
 

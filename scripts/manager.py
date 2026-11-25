@@ -5,7 +5,7 @@ Git owns source revisions; .git/config's nmd section owns installation state.
 The privileged local-setup.sh remains the owner of systemd and /etc/mihomo.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import errno
 try:
     import fcntl
@@ -18,6 +18,7 @@ from pathlib import Path
 import plistlib
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import sqlite3
@@ -1182,6 +1183,8 @@ NMD macOS：默认只做监控和诊断，不接管流量
   machine capabilities | machine status --state-dir DIR
   desktop install|uninstall|status|autostart on|off
                                        用户级桌面壳，见 docs/desktop.md
+  nmd status                           只读目录：修订是否已记录、root 套接字是否应答、
+                                       是否正在接管。不是采集快照
 
 安装、更新、应用
   bootstrap --manager-only             建立管理安装。macOS 必须带 --manager-only
@@ -1232,7 +1235,7 @@ Linux 的网络部署与 systemd 生命周期在 macOS 不支持。
 
 MACOS_SUBCOMMANDS = """\
 nmd macos 子命令。这是实验路径，不是默认监控。总览见 nmd help。
-这些才是 nmd macos 的子命令；nmd apply、nmd update、nmd onboard 不在这里。
+这些才是 nmd macos 的子命令；nmd apply、nmd update、nmd onboard、nmd status 不在这里。
 
   geodata ensure [--geodata-dir DIR] [--inputs FILE]
   preflight [--tier readonly|daemon|takeover] [--json|--summary]
@@ -1259,6 +1262,7 @@ MACOS_WRONG_PREFIX = {
     "desktop": "没有 nmd macos desktop。用 nmd desktop。",
     "bootstrap": "没有 nmd macos bootstrap。用 nmd bootstrap --manager-only。",
     "version": "没有 nmd macos version。用 nmd version。",
+    "status": "没有 nmd macos status。目录用 nmd status。root 管理器 JSON 用 nmd macos daemon status。开机布尔用 nmd macos daemon on-boot status。",
 }
 
 MACOS_LIFECYCLE_REJECTION = {
@@ -1266,6 +1270,144 @@ MACOS_LIFECYCLE_REJECTION = {
     "stop": "顶层 nmd stop 是 Linux 的 mihomo 命令，macOS 不运行它。对应的实验命令是 nmd macos daemon stop。警告：那个 stop 会回退正在进行的接管；回退未完成则不会 bootout 仍在恢复的管理器。本命令没有执行 sudo，也没有加载 launchd。",
     "restart": "顶层 nmd restart 是 Linux 的 mihomo 命令，macOS 不运行它。对应的实验命令是 nmd macos daemon restart。警告：那是先 stop 再 start；stop 失败不 start；start 会 bootstrap 未加载的 root job；用户 LaunchAgent 不在内。本命令没有执行 sudo，也没有加载 launchd。",
 }
+
+_STATUS_PHASES = {"direct", "starting", "active", "needs_rollback", "rolled_back"}
+_WHERE_TO_LOOK = (
+    "采集快照：nmd monitor status",
+    "合成快照：nmd monitor status --dry-run",
+    "桌面壳：nmd desktop status",
+    "本机样本：nmd machine status",
+    "只读预检：nmd macos preflight",
+    "管理器 JSON：nmd macos daemon status",
+    "开机策略只读：nmd macos daemon on-boot status（只读，不会把策略打开）",
+)
+
+
+def _read_supervisor_status(socket_path=None):
+    """Copy probe_activity's socket loop without folding takeover_active.
+
+    Returns ``("absent", None)``, ``("unreadable", None)``, or ``("ok", reply)``.
+    Does not call DaemonIPCClient or cli_daemon. Each connect and recv waits
+    1.5 seconds. A payload longer than IPC_MAX_BYTES is not parsed.
+    """
+    import nmd_daemon
+    path = Path(socket_path or nmd_daemon.SOCKET_PATH)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unreadable", None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISSOCK(info.st_mode):
+        return "unreadable", None
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(1.5)
+    try:
+        sock.connect(os.fspath(path))
+        sock.sendall(b'{"cmd":"status"}\n')
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_WR)
+        data = sock.recv(nmd_daemon.IPC_MAX_BYTES + 1)
+    except socket.timeout:
+        return "unreadable", None
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ECONNREFUSED):
+            return "absent", None
+        return "unreadable", None
+    finally:
+        sock.close()
+    if len(data) > nmd_daemon.IPC_MAX_BYTES:
+        return "unreadable", None
+    try:
+        reply = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return "unreadable", None
+    if not isinstance(reply, dict) or "error" in reply:
+        return "unreadable", None
+    if not isinstance(reply.get("takeover_active"), bool):
+        return "unreadable", None
+    return "ok", reply
+
+
+def _on_boot_line(reply):
+    value = reply.get("on_boot")
+    if isinstance(value, bool):
+        shown = "true" if value else "false"
+        return f"运行中的 on_boot: {shown}。改它仍只用 nmd macos daemon on-boot。"
+    return "运行中的 on_boot: 回复里没有布尔，不读 daemon.json。"
+
+
+def _supervisor_lines(kind, reply):
+    if kind == "absent":
+        return [
+            "套接字: 没有应答",
+            "接管: 套接字没有应答，所以不知道",
+            "运行中的 on_boot: 套接字没有应答，不读 daemon.json。",
+        ]
+    if kind != "ok":
+        return [
+            "套接字: 读不清",
+            "接管: 读不清。不把这当成已停止",
+            "运行中的 on_boot: 套接字读不清，不读 daemon.json。",
+        ]
+    active = reply["takeover_active"]
+    lines = [
+        "套接字: 有应答",
+        "接管: 正在接管" if active else "接管: 没有在接管。管理器仍在应答，这不是守护已停止",
+        _on_boot_line(reply),
+    ]
+    phase = reply.get("phase")
+    if phase in _STATUS_PHASES:
+        lines.append(f"阶段: {phase}")
+    if active is False and phase == "active":
+        lines.append("字段不一致，本命令不采取动作")
+    return lines
+
+
+def _revision_lines(root):
+    """Home predicate only. Never calls managed() or writes pendingApply."""
+    try:
+        installed = (root / ".git").is_dir() and setting(root, "home") == str(root)
+    except ManagerError:
+        return ["修订读不出"]
+    if not installed:
+        return ["不是管理安装，没有 appliedRevision。"]
+    try:
+        applied = setting(root, "appliedRevision")
+        pending = setting(root, "pendingApply")
+    except ManagerError:
+        return ["修订读不出"]
+    return [
+        f"已应用修订: {applied or '尚未记录'}",
+        f"待应用: {pending or '尚未记录'}",
+    ]
+
+
+def _receipt_line(root):
+    from nmd_daemon import DaemonError, daemon_receipt
+    try:
+        receipt = daemon_receipt(root)
+    except (ManagerError, DaemonError):
+        return "收据读不出"
+    if receipt is None:
+        return "收据: 未安装"
+    return "收据: 已安装"
+
+
+def macos_status_index(root):
+    """Read-only directory. Catches ManagerError. Does not call launchctl.
+
+    Returns normally so main exits 0. Socket absent is not stopped.
+    takeover_active false is not stopped either. Never opens daemon.json.
+    """
+    for line in _revision_lines(root):
+        print(line, flush=True)
+    print(_receipt_line(root), flush=True)
+    kind, reply = _read_supervisor_status()
+    for line in _supervisor_lines(kind, reply):
+        print(line, flush=True)
+    for line in _WHERE_TO_LOOK:
+        print(line, flush=True)
 
 
 def main(argv=None):
@@ -1313,7 +1455,7 @@ def main(argv=None):
             # reloads an installed daemon after preflight. That reload can roll
             # back an active takeover. Linux network deploy and systemd stay
             # unsupported. `macos` is the experimental takeover controller.
-            allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos", "onboard"}
+            allowed |= {"desktop", "bootstrap", "update", "apply", "refresh", "macos", "onboard", "status"}
         if platform == "macos" and command in MACOS_LIFECYCLE_REJECTION:
             raise ManagerError(MACOS_LIFECYCLE_REJECTION[command])
         if (command not in allowed
@@ -1331,6 +1473,11 @@ def main(argv=None):
             if argv[1:]:
                 raise ManagerError("version 不接受额外参数。")
             print(git(ROOT, "rev-parse", "HEAD"))
+            return
+        if platform == "macos" and command == "status":
+            if argv[1:]:
+                raise ManagerError("status 不接受额外参数。")
+            macos_status_index(ROOT)
             return
     if command in {"source", "channel"}:
         import json
