@@ -286,7 +286,7 @@ class SafeMacOSCLITests(unittest.TestCase):
         }
         return checkout, head, settings
 
-    def test_macos_apply_restarts_an_installed_daemon_and_names_the_network_effects(self):
+    def test_macos_apply_restarts_an_installed_daemon_and_prints_a_short_result(self):
         import nmd_daemon
         checkout, head, settings = self._managed_checkout()
         writes = []
@@ -326,11 +326,7 @@ class SafeMacOSCLITests(unittest.TestCase):
                 ('pendingApply', 'false'),
             ])
             text = output.getvalue()
-            self.assertIn('nmd macos daemon restart', text)
-            self.assertIn('用户 LaunchAgent 不在这次重载里', text)
-            self.assertIn('若当时有进行中的接管', text)
-            self.assertIn('on_boot', text)
-            self.assertNotIn('也没有启动接管', text)
+            self.assertEqual(text, '常驻守护已重载（先 stop 再 start）。用户 LaunchAgent 未重载。\n')
 
     def test_macos_apply_keeps_pending_when_restart_fails(self):
         import nmd_daemon

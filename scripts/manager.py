@@ -362,13 +362,7 @@ def _activate_macos_daemon(root):
         raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。") from exc
     if code != 0:
         raise ManagerError("常驻守护重载失败；待应用状态保留。再次运行 nmd apply 重试。")
-    return ("已通过 nmd macos daemon restart 重载常驻守护（先 stop 再 start）。"
-            "用户 LaunchAgent 不在这次重载里。",
-            "这次不调用 takeover-start，也不部署 Linux 网络。"
-            "若当时有进行中的接管，stop 会先按快照回退，路由、DNS 或 Tailscale exit node 会变。"
-            "若 daemon.json 的 on_boot 为 true，且这次启动被管理器当成新的一次开机，它可能开始接管。"
-            "会话若停在 active、starting 或 needs_rollback，启动会先把那次回退做完。"
-            "缺少的地理数据会在预检前补齐；下载或预检未通过时不会 stop，也不会 sudo。")
+    return ("常驻守护已重载（先 stop 再 start）。用户 LaunchAgent 未重载。",)
 
 
 def bootstrap(args):
