@@ -2,9 +2,11 @@
 import os
 import json
 import io
+import socket
 import stat
 import http.client
 import threading
+import contextlib
 from contextlib import nullcontext, redirect_stdout
 import subprocess
 from unittest.mock import Mock, patch
@@ -207,6 +209,7 @@ class SafeMacOSCLITests(unittest.TestCase):
         self.assertLess(text.index('与 Linux 共享的动词留在顶层'), text.index('\n监控和诊断\n'))
         self.assertLess(text.index('监控和诊断'), text.index('安装、更新、应用'))
         self.assertLess(text.index('安装、更新、应用'), text.index('实验性常驻守护'))
+        self.assertLess(text.index('nmd status'), text.index('实验性常驻守护'))
         self.assertLess(text.index('onboard'), text.index('macos geodata ensure'))
         self.assertLess(text.index('macos geodata ensure'), text.index('macos preflight'))
         self.assertLess(text.index('macos daemon init'), text.index('macos daemon on-boot'))
@@ -468,6 +471,8 @@ class SafeMacOSCLITests(unittest.TestCase):
             with self.subTest(name=name), \
                     patch('macos_takeover.main', side_effect=AssertionError('takeover')), \
                     patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('daemon')), \
+                    patch.object(manager, '_read_supervisor_status',
+                                 side_effect=AssertionError('socket')), \
                     patch('sys.stderr', error):
                 with self.assertRaises(SystemExit) as caught:
                     manager.main(['macos', name])
@@ -492,6 +497,246 @@ class SafeMacOSCLITests(unittest.TestCase):
         text = str(caught.exception)
         self.assertIn('仅支持 Linux', text)
         self.assertNotIn('未知命令', text)
+
+    def test_linux_status_still_reads_installation_then_local_setup(self):
+        order = []
+        with patch.object(nmd_platform, 'name', return_value='linux'), \
+                patch.object(manager, 'managed', side_effect=lambda root: order.append('managed')), \
+                patch.object(manager, 'installation_status',
+                             side_effect=lambda root: order.append('installation')), \
+                patch.object(manager, 'network_command',
+                             side_effect=lambda root, command: order.append(command)), \
+                patch.object(manager, 'macos_status_index', side_effect=AssertionError('index')):
+            manager.main(['status'])
+        self.assertEqual(order, ['managed', 'installation', 'status'])
+
+    def test_windows_status_is_rejected_before_any_read(self):
+        with patch.object(nmd_platform, 'name', return_value='windows'), \
+                patch.object(manager, 'installation_status', side_effect=AssertionError('read')), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'macos_status_index', side_effect=AssertionError('index')), \
+                patch.object(manager, '_read_supervisor_status', side_effect=AssertionError('socket')):
+            with self.assertRaisesRegex(manager.ManagerError, '仅支持 Linux'):
+                manager.main(['status'])
+
+    def test_status_rejects_extra_arguments_before_any_read(self):
+        with patch.object(manager, '_read_supervisor_status', side_effect=AssertionError('read')), \
+                patch.object(manager, 'setting', side_effect=AssertionError('setting')), \
+                patch.object(manager, 'installation_status', side_effect=AssertionError('installation')):
+            with self.assertRaisesRegex(manager.ManagerError, 'status 不接受额外参数'):
+                manager.main(['status', '--json'])
+
+    def _quiet_status(self, kind, reply, setting):
+        import nmd_daemon
+        output = io.StringIO()
+        with patch.object(manager, 'setting', side_effect=setting), \
+                patch.object(nmd_daemon, 'daemon_receipt', return_value=None), \
+                patch.object(manager, '_read_supervisor_status', return_value=(kind, reply)), \
+                patch.object(manager, 'installation_status', side_effect=AssertionError('installation')), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'managed', side_effect=AssertionError('managed')), \
+                patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('cli')), \
+                patch.object(nmd_daemon.DaemonIPCClient, 'status', side_effect=AssertionError('ipc')), \
+                patch.object(manager, 'run', side_effect=AssertionError('launchctl')), \
+                redirect_stdout(output):
+            manager.main(['status'])
+        return output.getvalue()
+
+    def test_status_answered_without_takeover_is_not_a_stopped_daemon(self):
+        checkout, _head, _settings = self._managed_checkout()
+        reply = {
+            'takeover_active': False,
+            'phase': 'rolled_back',
+            'on_boot': False,
+            'mihomo_pid': 424242,
+            'tailnet': '100.99.1.2',
+            'root_plist': '/Library/LaunchDaemons/io.github.zzzhty.nmd-daemon.plist',
+            'result': 'takeover_error:mutation_failed',
+            'boot_id': 1794756792,
+            'started_at': '2026-01-01T00:00:00Z',
+            'failures': 7,
+        }
+
+        def setting(root, key, value=None):
+            self.assertIsNone(value)
+            if key == 'home':
+                return str(checkout)
+            if key == 'appliedRevision':
+                return ''
+            if key == 'pendingApply':
+                return 'false'
+            raise AssertionError(key)
+
+        with patch.object(manager, 'ROOT', checkout):
+            text = self._quiet_status('ok', reply, setting)
+        self.assertIn('有应答', text)
+        self.assertIn('没有在接管', text)
+        self.assertIn('阶段: rolled_back', text)
+        self.assertIn('运行中的 on_boot: false', text)
+        self.assertIn('已应用修订: 尚未记录', text)
+        self.assertIn('待应用: false', text)
+        self.assertNotIn('没有看到正在运行的常驻守护', text)
+        self.assertNotIn('100.99.1.2', text)
+        self.assertNotIn('424242', text)
+        self.assertNotIn('LaunchDaemons', text)
+        self.assertNotIn('mutation_failed', text)
+        self.assertNotIn('1794756792', text)
+        self.assertNotIn('2026-01-01', text)
+        self.assertNotIn('\n7\n', text)
+        self.assertNotIn('takeover', text)
+        self.assertNotIn('accept', text)
+        self.assertNotIn('on-boot on', text)
+        self.assertLess(len(text.encode()), 2048)
+
+    def test_status_socket_rows_do_not_treat_silence_as_stopped(self):
+        def setting(root, key, value=None):
+            self.assertIsNone(value)
+            if key == 'home':
+                return '/not/this/checkout'
+            raise AssertionError(key)
+
+        absent = self._quiet_status('absent', None, setting)
+        self.assertIn('套接字没有应答', absent)
+        self.assertIn('运行中的 on_boot: 套接字没有应答，不读 daemon.json。', absent)
+        self.assertNotIn('读不清', absent)
+        self.assertNotIn('已停止', absent)
+        self.assertNotIn('未加载', absent)
+        self.assertNotIn('没有看到正在运行的常驻守护', absent)
+
+        unreadable = self._quiet_status('unreadable', None, setting)
+        self.assertIn('读不清。不把这当成已停止', unreadable)
+        self.assertIn('运行中的 on_boot: 套接字读不清，不读 daemon.json。', unreadable)
+        self.assertNotIn('没有应答', unreadable)
+        self.assertNotIn('active', unreadable)
+
+    def test_status_phase_token_follows_a_boolean_takeover_flag(self):
+        inconsistent = manager._supervisor_lines('ok', {
+            'takeover_active': False, 'phase': 'active', 'on_boot': True})
+        self.assertIn('阶段: active', inconsistent)
+        self.assertIn('字段不一致，本命令不采取动作', inconsistent)
+        steady = manager._supervisor_lines('ok', {
+            'takeover_active': True, 'phase': 'active', 'on_boot': False})
+        self.assertIn('阶段: active', steady)
+        self.assertNotIn('字段不一致，本命令不采取动作', steady)
+        for phase in ('direct', 'starting', 'needs_rollback', 'rolled_back'):
+            lines = manager._supervisor_lines('ok', {
+                'takeover_active': True, 'phase': phase, 'on_boot': False})
+            self.assertIn(f'阶段: {phase}', lines)
+        hidden = manager._supervisor_lines('ok', {
+            'takeover_active': True, 'phase': 'nope', 'on_boot': 'false'})
+        self.assertFalse(any(line.startswith('阶段:') for line in hidden))
+        self.assertIn('回复里没有布尔', '\n'.join(hidden))
+        for kind in ('absent', 'unreadable'):
+            lines = '\n'.join(manager._supervisor_lines(kind, {'phase': 'active'}))
+            self.assertNotIn('active', lines)
+
+    def test_status_read_errors_stay_exit_zero_and_do_not_write_pending(self):
+        import nmd_daemon
+        writes = []
+
+        def setting(root, key, value=None):
+            if value is not None:
+                writes.append((key, value))
+            raise manager.ManagerError('git')
+
+        output = io.StringIO()
+        with patch.object(manager, 'setting', side_effect=setting), \
+                patch.object(nmd_daemon, 'daemon_receipt',
+                             side_effect=manager.ManagerError('receipt')), \
+                patch.object(manager, '_read_supervisor_status', return_value=('absent', None)), \
+                patch.object(manager, 'installation_status', side_effect=AssertionError('installation')), \
+                patch.object(manager, 'network_command', side_effect=AssertionError('network')), \
+                patch.object(manager, 'managed', side_effect=AssertionError('managed')), \
+                patch.object(nmd_daemon, 'cli_daemon', side_effect=AssertionError('cli')), \
+                patch.object(nmd_daemon.DaemonIPCClient, 'status', side_effect=AssertionError('ipc')), \
+                patch.object(manager, 'run', side_effect=AssertionError('launchctl')), \
+                redirect_stdout(output):
+            manager.main(['status'])
+        self.assertEqual(writes, [])
+        text = output.getvalue()
+        self.assertIn('修订读不出', text)
+        self.assertIn('收据读不出', text)
+        self.assertNotIn('pendingApply', text)
+
+    def test_status_without_a_checkout_does_not_read_revisions(self):
+        import nmd_daemon
+        root = Path(self.temp.name) / 'not-a-checkout'
+        root.mkdir()
+        keys = []
+
+        def setting(root, key, value=None):
+            self.assertIsNone(value)
+            keys.append(key)
+            return 'true'
+
+        output = io.StringIO()
+        with patch.object(manager, 'ROOT', root), \
+                patch.object(manager, 'setting', side_effect=setting), \
+                patch.object(nmd_daemon, 'daemon_receipt', return_value=None), \
+                patch.object(manager, '_read_supervisor_status', return_value=('absent', None)), \
+                redirect_stdout(output):
+            manager.main(['status'])
+        self.assertEqual(keys, [])
+        text = output.getvalue()
+        self.assertIn('不是管理安装，没有 appliedRevision。', text)
+        self.assertIn('收据: 未安装', text)
+        self.assertNotIn('true', text)
+
+    def test_supervisor_reader_splits_absent_garbled_timeout_and_oversized(self):
+        import nmd_daemon
+        base = Path(self.temp.name)
+        missing = base / 'missing.sock'
+        self.assertEqual(manager._read_supervisor_status(missing), ('absent', None))
+        plain = base / 'not-a-socket'
+        plain.write_text('x', encoding='utf-8')
+        self.assertEqual(manager._read_supervisor_status(plain), ('unreadable', None))
+
+        sequence = {'n': 0}
+
+        def serve(payload):
+            sequence['n'] += 1
+            path = base / f's{sequence["n"]}'
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(os.fspath(path))
+            server.listen(1)
+
+            def run():
+                try:
+                    conn, _addr = server.accept()
+                except OSError:
+                    return
+                with contextlib.closing(conn):
+                    conn.recv(64)
+                    if payload is not None:
+                        conn.sendall(payload)
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(server.close)
+            return path
+
+        kind, reply = manager._read_supervisor_status(serve(
+            b'{"error":"invalid_command","phase":"active"}\n'))
+        self.assertEqual(kind, 'unreadable')
+        self.assertIsNone(reply)
+        kind, reply = manager._read_supervisor_status(serve(b'{"phase":"active"}\n'))
+        self.assertEqual(kind, 'unreadable')
+        self.assertIsNone(reply)
+        kind, reply = manager._read_supervisor_status(serve(
+            b'{"takeover_active": false, "phase": "rolled_back", "on_boot": false}\n'))
+        self.assertEqual(kind, 'ok')
+        self.assertIs(reply['takeover_active'], False)
+        oversized = b'{' + b'x' * nmd_daemon.IPC_MAX_BYTES
+        self.assertGreater(len(oversized), nmd_daemon.IPC_MAX_BYTES)
+        self.assertEqual(manager._read_supervisor_status(serve(oversized))[0], 'unreadable')
+
+        hung = base / 'hung'
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(os.fspath(hung))
+        server.listen(1)
+        self.addCleanup(server.close)
+        self.assertEqual(manager._read_supervisor_status(hung), ('unreadable', None))
 
 
 class ConfigEditAPITests(unittest.TestCase):

@@ -26,7 +26,9 @@
 | `nmd help`、`source --help`、`monitor --help` | R，帮助 | 不部署、不探测 | 源码帮助不需管理员；已安装 source/channel 帮助仍先校验管理者身份 |
 | `nmd monitor status`、`nmd machine status --state-dir DIR` | R，只读已有 SQLite；不存在返回 no_data，不建目录 | 无探测 | 数据所属 UID；无需恢复 |
 | `nmd monitor config-check --config FILE` | R，只校验配置 | 不探测 | 能读取配置的 UID |
-| `nmd status`、`nmd version` | R；状态读取，要求有效安装记录 | status 读本机服务/Tailscale/DNS/路由；不做外网验证 | 管理者 |
+| `nmd version` | R；读管理安装的 HEAD | 不部署 | 管理者 |
+| `nmd status`（Linux） | R；要求有效安装记录 | `installation_status` 加 `local-setup.sh status`：服务、Tailscale、DNS、路由；不做外网验证 | 管理者 |
+| `nmd status`（macOS） | R；只读目录，不先要求 `managed()` | 修订、root 套接字是否应答、是否正在接管。不读 Tailscale、DNS、路由或 `daemon.json` | 当前用户；无应答仍退出 0 |
 | `nmd monitor service-status` / `logs` | R，但会创建/打开管理锁 | 查询 systemd / journal，不启停服务 | 管理者；不是诊断 SQLite 快照 |
 | `nmd check` | R，但创建临时配置/provider/日志，可能含私有来源；正常退出清理 | 调用本地 mihomo 校验，不覆盖运行配置；需现有资产 | 管理者；不要传播临时原始内容 |
 | `nmd verify`、可选 `nmd diagnostics` | R/N，仅探测 | 真实 DNS/HTTPS/出口或配置的设备探测；不部署、不 PUT selector | 管理者；仅在允许外网探测时使用 |
@@ -156,7 +158,7 @@ Store 打开旧库时幂等创建；行数与时间窗口取交集，仍保留�
 
 ### 3.5 user / system 范围混淆
 
-`nmd status` 显示 scope、管理目录、版本与待应用状态，不保证输出 configDir/stateDir。
+Linux 的 `nmd status` 显示 scope、管理目录、版本与待应用状态，不保证输出 configDir/stateDir。macOS 的 `nmd status` 是只读目录，不读 Tailscale、DNS 或路由，也不使用下面的 user/system 表。
 下表是默认值；user 路径可能受安装时 XDG 设置影响，实际以安装记录为准。
 
 | 项 | user | system |
