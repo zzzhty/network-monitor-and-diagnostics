@@ -1,6 +1,19 @@
 /* Local viewer with explicit egress controls and save-only private Channel configuration. */
 'use strict';
 (() => {
+  const themeKey = 'nmd-theme';
+  const applyTheme = choice => {
+    const root = document.documentElement;
+    if (choice === 'light' || choice === 'dark') root.dataset.theme = choice;
+    else delete root.dataset.theme;
+    const active = choice === 'light' || choice === 'dark' ? choice : 'system';
+    document.querySelectorAll('[data-theme-choice]').forEach(button => {
+      button.setAttribute('aria-pressed', button.dataset.themeChoice === active ? 'true' : 'false');
+    });
+  };
+  let storedTheme = null;
+  try { storedTheme = localStorage.getItem(themeKey); } catch { storedTheme = null; }
+  applyTheme(storedTheme === 'light' || storedTheme === 'dark' || storedTheme === 'system' ? storedTheme : null);
   let busy = false, snapshot = null, failure = null, sources = null, pendingSelect = false, capabilities = null;
   const delayResults = new Map(), pendingDelay = new Set(), renameDrafts = new Map(), pendingRefresh = new Set();
   let pendingChannel = false, pendingPolicy = false, candidateDrafts = null, diagnoseReport = null, pendingDiagnose = false;
@@ -23,6 +36,53 @@
   const pathName = value => ({ system: '系统默认路径', proxy: '显式代理路径', local: '本地被动观测' }[value] || '未知路径');
   const statusName = value => ({ success: '成功', failure: '失败', observed: '已观测', unknown: '未知', skipped: '已跳过' }[value] || '未知');
   const badge = (status, label) => make('span', label || statusName(status), `badge ${status === 'success' ? 'ok' : status === 'failure' ? 'fail' : 'unknown'}`);
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svgNode = (name, attrs) => {
+    const node = document.createElementNS(svgNS, name);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    return node;
+  };
+  const statusIcon = kind => {
+    const svg = svgNode('svg', { viewBox: '0 0 14 14', width: '14', height: '14', 'aria-hidden': 'true' });
+    svg.classList.add('status-icon');
+    const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+    if (kind === 'success') svg.append(svgNode('path', { ...stroke, d: 'M3.2 7.3 5.7 9.8 10.8 4.2' }));
+    else if (kind === 'failure') svg.append(svgNode('path', { ...stroke, d: 'M4 4 10 10M10 4 4 10' }));
+    else if (kind === 'stale') {
+      svg.append(svgNode('circle', { ...stroke, cx: '7', cy: '7', r: '4.4' }));
+      svg.append(svgNode('path', { ...stroke, d: 'M7 4.3V7.1L9.1 8.3' }));
+    } else if (kind === 'dot-filled') svg.append(svgNode('circle', { cx: '7', cy: '7', r: '3.5', fill: 'currentColor' }));
+    else if (kind === 'dot-hollow') svg.append(svgNode('circle', { ...stroke, cx: '7', cy: '7', r: '3.2' }));
+    else {
+      svg.append(svgNode('path', { ...stroke, d: 'M5.2 5.5a1.9 1.9 0 1 1 3.1 1.5c-.6.4-1.1.8-1.1 1.6' }));
+      svg.append(svgNode('circle', { cx: '7.2', cy: '11', r: '.75', fill: 'currentColor' }));
+    }
+    return svg;
+  };
+  const markedBadge = (status, label, kind) => {
+    const el = badge(status, label);
+    el.prepend(statusIcon(kind));
+    return el;
+  };
+  function placeCollectorMark(kind) {
+    const stateEl = $('collector-state');
+    let row = stateEl.parentElement;
+    if (!row.classList.contains('metric-line')) {
+      row = document.createElement('div');
+      row.className = 'metric-line';
+      stateEl.replaceWith(row);
+      row.append(stateEl);
+    }
+    const mark = statusIcon(kind);
+    mark.classList.add('sample-mark');
+    if (kind === 'success') mark.classList.add('ok');
+    const previous = row.querySelector(':scope > .sample-mark');
+    if (previous) previous.replaceWith(mark); else row.prepend(mark);
+    const card = row.closest('article');
+    card.classList.toggle('status-ok', kind === 'success');
+    card.classList.toggle('status-fail', false);
+    card.classList.toggle('status-unknown', kind !== 'success');
+  }
   const empty = value => make('div', value, 'empty');
   function details(pairs) {
     const dl = make('dl', undefined, 'details');
@@ -441,11 +501,19 @@
         const row = make('div', undefined, 'node-row' + (active ? ' active' : ''));
         const select = make('button', undefined, 'node-select');
         select.type = 'button'; select.dataset.node = node.id; select.disabled = pendingSelect || !canControl;
-        select.append(make('span', active ? '●' : '○', 'node-dot'), make('span', node.display || node.id, 'node-name'), make('span', node.id, 'node-id'));
+        const dot = make('span', undefined, 'node-dot');
+        dot.append(statusIcon(active ? 'dot-filled' : 'dot-hollow'));
+        select.append(dot, make('span', node.display || node.id, 'node-name'), make('span', node.id, 'node-id'));
         const delay = make('button', '测速', 'delay-btn');
         delay.type = 'button'; delay.dataset.node = node.id; delay.disabled = pendingDelay.has(node.id) || !canControl;
+        const failedDelay = delayResults.has(node.id) && delayResults.get(node.id) === false;
         const result = make('span', pendingDelay.has(node.id) ? '测速中…' : delayResults.has(node.id)
-          ? (delayResults.get(node.id) === false ? '失败' : `${delayResults.get(node.id)} ms`) : '', 'delay-result');
+          ? (failedDelay ? '失败' : `${delayResults.get(node.id)} ms`) : '', 'delay-result');
+        if (failedDelay) {
+          const mark = statusIcon('failure');
+          mark.classList.add('delay-fail-mark');
+          result.prepend(mark);
+        }
         row.append(select, delay, result);
         group.append(row);
       }
@@ -482,6 +550,12 @@
     else if (c && c.state !== 'no_data') message = `监控数据已过期或时间无效，当前网络状态未知。超过 ${threshold} 秒无新采样即视为过期。`;
     text('connection', message); $('connection').classList.toggle('fresh', fresh);
     text('collector-state', demoMode ? '模拟样本' : fresh ? '最近有采样' : '未知');
+    // The question mark covers demo, a missing sample, and a failed read.
+    // The clock is only a real snapshot past the freshness threshold.
+    const collectorIcon = !demoMode && fresh ? 'success'
+      : (!demoMode && !failure && c && c.state !== 'no_data' && age !== null && age > threshold) ? 'stale'
+      : 'unknown';
+    placeCollectorMark(collectorIcon);
     text('collector-detail', demoMode ? '临时合成记录；未运行真实采集器' : fresh ? '进程是否仍运行：未验证' : failure ? '无法确认当前监控状态' : c?.state === 'no_data' ? '尚无采集记录' : '数据不新鲜或未提供');
     text('sample-time', date(c?.last_sample_at));
     text('sample-age', age === null ? '暂无采样时间' : `${elapsed(age)}前 · 本地时区`);
@@ -494,8 +568,10 @@
     for (const path of ['system', 'proxy']) {
       const group = samples.filter(item => item.path === path);
       const state = !fresh || !group.length || !group.every(recent) ? 'unknown' : group.some(item => item.status === 'failure') ? 'failure' : group.every(item => item.status === 'success') ? 'success' : 'unknown';
-      const card = make('article', undefined, 'card'), head = make('div', undefined, 'path-head');
-      head.append(make('h2', pathName(path)), badge(state));
+      const pathIcon = state === 'success' ? 'success' : state === 'failure' ? 'failure' : (!fresh && group.length) ? 'stale' : 'unknown';
+      const pathRail = state === 'success' ? 'status-ok' : state === 'failure' ? 'status-fail' : 'status-unknown';
+      const card = make('article', undefined, `card ${pathRail}`), head = make('div', undefined, 'path-head');
+      head.append(make('h2', pathName(path)), markedBadge(state, undefined, pathIcon));
       card.append(head, make('p', path === 'system' ? 'SYSTEM DEFAULT / OS ROUTING' : 'EXPLICIT PROXY / CONFIGURED ENDPOINT', 'path-code'));
       card.append(make('p', group.length ? `${group.length} 项最近探测 · ${state === 'unknown' ? '当前结果不足以判断' : state === 'failure' ? '存在失败探测，请检查证据' : '所列最近探测成功'}` : '暂无对应路径的探测数据', 'muted'));
       card.append(make('p', path === 'system' ? '可能经过 TUN 或出口节点，不表示绕过代理。' : '仅表示指定代理端点路径，不代表全部系统流量。', 'muted'));
@@ -511,8 +587,12 @@
     $('probe-list').replaceChildren();
     if (!samples.length) $('probe-list').append(empty('暂无探测结果。缺少数据不代表成功。'));
     for (const sample of samples) {
-      const card = make('article', undefined, 'card'), head = make('div', undefined, 'row-head');
-      head.append(make('h2', sample.id), badge(recent(sample) ? sample.status : 'unknown', recent(sample) ? statusName(sample.status) : `当前未知 · 历史${statusName(sample.status)}`));
+      const sampleRecent = recent(sample);
+      const sampleStatus = sampleRecent ? sample.status : 'unknown';
+      const sampleIcon = !sampleRecent ? 'stale' : sample.status === 'success' ? 'success' : sample.status === 'failure' ? 'failure' : 'unknown';
+      const sampleRail = sampleIcon === 'success' ? 'status-ok' : sampleIcon === 'failure' ? 'status-fail' : 'status-unknown';
+      const card = make('article', undefined, `card ${sampleRail}`), head = make('div', undefined, 'row-head');
+      head.append(make('h2', sample.id), markedBadge(sampleStatus, sampleRecent ? statusName(sample.status) : `当前未知 · 历史${statusName(sample.status)}`, sampleIcon));
       const total = sample.timings?.total;
       card.append(head, details([['路径 / 类型', `${pathName(sample.path)} / ${sample.type || '未知'}`], ['观测时间', date(sample.observed_at)], ['总耗时', finite(total) && total >= 0 ? `${(total * 1000).toFixed(1)} ms` : '未提供']]));
       card.append(make('pre', JSON.stringify({ error: sample.error ?? null, http_status: sample.http_status ?? null, timings_seconds: sample.timings || {}, ...(sample.type === 'passive' ? { synthetic: sample.synthetic ?? false, platform: sample.platform, interfaces: sample.interfaces, interface_states: sample.interface_states, interface_observation_error: sample.interface_observation_error, route_observation_error: sample.route_observation_error, services: sample.services, service_observation_error: sample.service_observation_error, ipv4_default_routes: sample.ipv4_default_routes, route_fingerprint: sample.route_fingerprint, macos_readonly: sample.macos_readonly ?? null } : {}) }, null, 2), 'evidence'));
@@ -748,6 +828,12 @@
       await refresh();
     }
   });
+  document.querySelectorAll('[data-theme-choice]').forEach(button => button.addEventListener('click', () => {
+    const choice = button.dataset.themeChoice;
+    if (choice !== 'light' && choice !== 'dark' && choice !== 'system') return;
+    try { localStorage.setItem(themeKey, choice); } catch { /* the visible choice still applies for this visit */ }
+    applyTheme(choice);
+  }));
   $('refresh').addEventListener('click', refresh);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   text('timezone', `浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
