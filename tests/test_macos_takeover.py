@@ -968,11 +968,13 @@ class WorkdirTests(unittest.TestCase):
             secret = base / "secret"
             secret.write_bytes(b"secret")
             source = base / "src"
-            source.mkdir()
+            source.mkdir(mode=0o700)
+            os.chmod(source, 0o700)
             (source / "geoip.metadb").symlink_to(secret)
             (source / "geosite.dat").write_bytes(b"geosite")
             target = base / "work"
-            target.mkdir()
+            target.mkdir(mode=0o700)
+            os.chmod(target, 0o700)
             planted = target / "Country.mmdb"
             planted.symlink_to(secret)
             staged, missing = mod.stage_geodata(target, source)
@@ -1152,23 +1154,30 @@ class CLITests(unittest.TestCase):
         return RollbackTests._ps_runner(self, text, table)
 
     def test_parse_requires_inputs_and_valid_minutes(self):
-        example = str(ROOT / "examples/macos-mihomo-takeover.inputs.example.json")
-        with self.assertRaisesRegex(mod.TakeoverError, "inputs_required"):
-            mod._parse_takeover_args([])
-        with self.assertRaisesRegex(mod.TakeoverError, "invalid_minutes"):
-            mod._parse_takeover_args(["--inputs", example, "--minutes", "abc"])
-        with self.assertRaisesRegex(mod.TakeoverError, "invalid_arguments"):
-            mod._parse_takeover_args(["--inputs", example, "--bogus", "1"])
-        values, rest = mod._parse_takeover_args(
-            ["--inputs", example, "--minutes", "10"])
-        self.assertEqual(rest, [])
-        self.assertEqual(values["minutes"], 10)
-        self.assertIsNone(values["geodata_dir"])
-        self.assertEqual(values["inputs"], macos_prepare.PLACEHOLDER_INPUTS)
-        values, rest = mod._parse_takeover_args(
-            ["--inputs", example, "--geodata-dir", "/tmp/nmd-geodata"])
-        self.assertEqual(values["geodata_dir"], "/tmp/nmd-geodata")
-        self.assertEqual(rest, [])
+        # The checkout may sit under a group-writable directory. Parsing must
+        # not depend on that ancestor being a trusted path.
+        with tempfile.TemporaryDirectory() as tmp:
+            example_path = Path(tmp) / "inputs.json"
+            example_path.write_bytes(
+                (ROOT / "examples/macos-mihomo-takeover.inputs.example.json").read_bytes())
+            os.chmod(example_path, 0o600)
+            example = str(example_path)
+            with self.assertRaisesRegex(mod.TakeoverError, "inputs_required"):
+                mod._parse_takeover_args([])
+            with self.assertRaisesRegex(mod.TakeoverError, "invalid_minutes"):
+                mod._parse_takeover_args(["--inputs", example, "--minutes", "abc"])
+            with self.assertRaisesRegex(mod.TakeoverError, "invalid_arguments"):
+                mod._parse_takeover_args(["--inputs", example, "--bogus", "1"])
+            values, rest = mod._parse_takeover_args(
+                ["--inputs", example, "--minutes", "10"])
+            self.assertEqual(rest, [])
+            self.assertEqual(values["minutes"], 10)
+            self.assertIsNone(values["geodata_dir"])
+            self.assertEqual(values["inputs"], macos_prepare.PLACEHOLDER_INPUTS)
+            values, rest = mod._parse_takeover_args(
+                ["--inputs", example, "--geodata-dir", "/tmp/nmd-geodata"])
+            self.assertEqual(values["geodata_dir"], "/tmp/nmd-geodata")
+            self.assertEqual(rest, [])
 
     def test_process_identity_ps_is_allowlisted_only_for_a_numeric_pid(self):
         with patch.object(macos_readonly, "bounded_run", return_value=(0, b"ok\n", None)) as run:

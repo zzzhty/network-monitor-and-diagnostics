@@ -26,6 +26,24 @@ import macos_coexist
 import nmd_daemon as d
 from test_macos_takeover import EXIT_IP, FakeProcess, MIHOMO, PINNED_IP, Table, TS
 
+def _mkdir_private(path, root):
+    """Create ``path`` under ``root`` and clear group/world write on that chain.
+
+    ``mkdir`` applies the process umask, so a developer umask of 002 would
+    leave a directory the private-ancestor check refuses.
+    """
+    path = Path(path)
+    root = Path(root)
+    path.mkdir(parents=True, exist_ok=True)
+    current = path
+    while True:
+        os.chmod(current, 0o700)
+        if current == root or root not in current.parents:
+            break
+        current = current.parent
+    return path
+
+
 CONFIG = {"schema_version": 1, "dashboard": {"port": 8765},
           "takeover": {"inputs": {"proxy_name": "VPS", "server": "fd7a:115c:a1e0::abcd",
                                   "port": 1081},
@@ -517,8 +535,10 @@ class SupervisorTests(unittest.TestCase):
 
     def test_takeover_stop_exit_code_follows_the_rollback_result(self):
         failed = Table(dns_dirty_window=(1, 10 ** 9))
-        (self.state / "failed").mkdir()
-        failed_sup = make_supervisor(self.state / "failed", failed)
+        failed_dir = self.state / "failed"
+        failed_dir.mkdir()
+        os.chmod(failed_dir, 0o700)
+        failed_sup = make_supervisor(failed_dir, failed)
         self.assertEqual(failed_sup.dispatch({"cmd": "takeover.start"}, 0)["result"],
                          "takeover_active")
         failed_sock = self._serve(failed_sup)
@@ -532,8 +552,10 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(failed_sup.status()["phase"], d.PHASE_NEEDS_ROLLBACK)
 
         restored = Table(dns_dirty_window=(1, 10 ** 9))
-        (self.state / "restored").mkdir()
-        restored_sup = make_supervisor(self.state / "restored", restored)
+        restored_dir = self.state / "restored"
+        restored_dir.mkdir()
+        os.chmod(restored_dir, 0o700)
+        restored_sup = make_supervisor(restored_dir, restored)
         self.assertEqual(restored_sup.dispatch({"cmd": "takeover.start"}, 0)["result"],
                          "takeover_active")
         restored_sock = d.DaemonIPCServer(
@@ -863,28 +885,25 @@ class DaemonInstallTests(unittest.TestCase):
         self.addCleanup(holder.cleanup)
         self.base = Path(holder.name)
         self.checkout = self.base / "repo"
-        (self.checkout / "scripts").mkdir(parents=True)
+        _mkdir_private(self.checkout / "scripts", self.base)
         for name in self.SCRIPTS:
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         sp.run(["git", "init", "--quiet", str(self.checkout)], check=True, capture_output=True)
-        (self.checkout / "examples").mkdir()
+        _mkdir_private(self.checkout / "examples", self.base)
         shutil.copy2(ROOT / "examples/macos-mihomo-coexist.experiment.json",
                      self.checkout / "examples/macos-mihomo-coexist.experiment.json")
         import manager
-        self.config_dir = self.base / "config/nmd"
-        self.state_dir = self.base / "state/nmd-monitor"
-        self.config_dir.mkdir(parents=True)
+        self.config_dir = _mkdir_private(self.base / "config/nmd", self.base)
+        self.state_dir = _mkdir_private(self.base / "state/nmd-monitor", self.base)
         self.user_agents = self.base / "home/Library/LaunchAgents"
-        self.root_daemons = self.base / "Library/LaunchDaemons"
-        self.root_daemons.mkdir(parents=True)
+        self.root_daemons = _mkdir_private(self.base / "Library/LaunchDaemons", self.base)
         for key, value in (("home", self.checkout), ("scope", "user"),
                            ("configDir", self.config_dir), ("stateDir", self.state_dir),
                            ("daemonInstalled", "false")):
             manager.setting(self.checkout, key, value)
         d.write_daemon_config(self.config_dir / "daemon.json", CONFIG)
         # Fake sudo: logs argv, answers install-root with a canned fingerprint.
-        self.bin = self.base / "bin"
-        self.bin.mkdir()
+        self.bin = _mkdir_private(self.base / "bin", self.base)
         self.sudo_log = self.base / "sudo.log"
         root_plist = self.root_daemons / f"{d.LABEL}.plist"
         (self.bin / "sudo").write_text(
@@ -971,7 +990,7 @@ class DaemonInstallTests(unittest.TestCase):
             for call in self.launchctl))
 
     def test_foreign_user_plist_blocks_install(self):
-        self.user_agents.mkdir(parents=True)
+        _mkdir_private(self.user_agents, self.base)
         (self.user_agents / f"{d.LABEL}.plist").write_text("foreign", encoding="utf-8")
         with self.assertRaises(d.DaemonError):
             self.run_cli("install")

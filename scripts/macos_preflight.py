@@ -425,6 +425,39 @@ def _lsof_argv(pid, port):
         f"-iTCP@127.0.0.1:{port}", "-sTCP:LISTEN", "-F", "n"]
 
 
+_LSOF_STAT_WARNING = re.compile(
+    r"lsof: WARNING: can't stat\(\) \S+ file system \S+\Z")
+_LSOF_STAT_INCOMPLETE = re.compile(r"Output information may be incomplete\.\Z")
+
+
+def _lsof_stderr_blocks_miss(stderr):
+    """True unless stderr is empty or only filesystem-stat warnings.
+
+    A rejected query, including ``unacceptable port specification``, stays
+    unreadable. ``can't stat() … file system`` followed by its
+    incomplete-output line is noise from mounts such as Docker overlay and
+    nsfs. It does not mean ``TCP@127.0.0.1`` was rejected, and it does not
+    add another address.
+    """
+    if not isinstance(stderr, str) or not stderr.strip():
+        return False
+    expect_incomplete = False
+    for raw in stderr.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if expect_incomplete:
+            if _LSOF_STAT_INCOMPLETE.fullmatch(line):
+                expect_incomplete = False
+                continue
+            return True
+        if _LSOF_STAT_WARNING.fullmatch(line):
+            expect_incomplete = True
+            continue
+        return True
+    return expect_incomplete
+
+
 def _lsof_loopback(text, port):
     """True when the only ``lsof -F n`` name is this loopback listener."""
     if not isinstance(text, str):
@@ -494,10 +527,10 @@ def inspect_dashboard_owner(port, config_path):
     heard = _lsof_loopback(listed["stdout"], port)
     if heard is True and listed["code"] == 0:
         return {"status": "match", "reason": "running"}
-    # A clean miss is exit 1 with empty stdout and empty stderr. Anything
-    # else (a usage error, an extra address, a non-zero success) was not read.
+    # A clean miss is exit 0 or 1, no address, and no rejected query.
+    # Filesystem-stat warnings are not a rejection. Anything else was not read.
     if (heard is not False or listed["code"] not in (0, 1)
-            or listed["stderr"].strip()):
+            or _lsof_stderr_blocks_miss(listed["stderr"])):
         return {"status": "unknown", "reason": "listener_unreadable"}
     return {"status": "other", "reason": "busy"}
 

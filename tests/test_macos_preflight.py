@@ -1176,6 +1176,41 @@ class CollectTests(_Tree):
         self.assertNotIn("采集器已运行", check["summary"])
         self.assertNotIn("停掉占用它的程序", check.get("remediation") or "")
 
+    def test_filesystem_stat_warnings_are_not_a_rejected_query(self):
+        self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
+        script = self.base / "scripts" / "nmd_daemon.py"
+        script.parent.mkdir()
+        script.write_text("# nmd\n", encoding="utf-8")
+        config_path = self.config_dir / "daemon.json"
+        self._agent_plist(script, config_path)
+        warning = (
+            "lsof: WARNING: can't stat() overlay file system "
+            "/var/lib/docker/rootfs/overlayfs/abc\n"
+            "      Output information may be incomplete.\n"
+            "lsof: WARNING: can't stat() nsfs file system /run/docker/netns/default\n"
+            "      Output information may be incomplete.\n")
+
+        def runner(argv):
+            if argv[0] == "/bin/launchctl":
+                return {"code": 0, "error": None, "stderr": "",
+                        "stdout": self._job_text(script, config_path)}
+            if "-iTCP@127.0.0.1:8765" in argv:
+                return {"code": 1, "error": None, "stdout": "", "stderr": warning}
+            return {
+                "code": 1, "error": None, "stdout": "",
+                "stderr": warning + (
+                    "lsof: unacceptable port specification in: "
+                    "-i TCP:127.0.0.1:9\n"),
+            }
+
+        with self.context(), patch.object(pf, "probe_listen", return_value="busy"), \
+                patch.object(pf, "_bounded_text", side_effect=runner):
+            report = pf.run("readonly")
+            rejected = pf.inspect_dashboard_owner(9, config_path)
+        self.assertEqual(one(report, "dashboard_port")["status"], "fail")
+        self.assertEqual(one(report, "dashboard_port")["reason"], "busy")
+        self.assertEqual(rejected, {"status": "unknown", "reason": "listener_unreadable"})
+
     def test_extra_lsof_name_stays_unknown(self):
         self.write_config(mihomo_path=str(self.base / "missing-mihomo"), port=8765)
         script = self.base / "scripts" / "nmd_daemon.py"

@@ -586,6 +586,7 @@ class _Checkout(unittest.TestCase):
         self.config_dir = _private(self.base / "config")
         self.state_dir = _private(self.base / "state")
         self.checkout.mkdir()
+        os.chmod(self.checkout, 0o700)
         env = patch.dict(os.environ, {
             "HOME": str(self.base / "home"),
             "XDG_CONFIG_HOME": str(self.base / "xdg-config"),
@@ -758,7 +759,9 @@ class LifecycleTests(_Checkout):
         self.write_config(on_boot=True)
         home = Path(os.environ["HOME"])
         home.mkdir(parents=True, exist_ok=True)
+        os.chmod(home, 0o700)
         (home / ".config").mkdir(mode=0o700)
+        os.chmod(home / ".config", 0o700)
         directory = _private(home / ".config" / "mihomo")
         bad = b"\x00" * 64
         (directory / "geosite.dat").write_bytes(bad)

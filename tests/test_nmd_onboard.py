@@ -393,7 +393,8 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(self.env.read_text(encoding="utf-8"), body)
 
     def test_linux_placeholder_public_address_stops_before_fetch(self):
-        self.env.parent.mkdir(parents=True, exist_ok=True)
+        self.env.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.env.parent, 0o700)
         self.env.write_text("NMD_VPS_TS_IP=100.64.0.1\nNMD_VPS_PUB=203.0.113.10\n",
                             encoding="utf-8")
         os.chmod(self.env, 0o600)
