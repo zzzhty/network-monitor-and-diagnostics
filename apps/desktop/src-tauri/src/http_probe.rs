@@ -2,12 +2,22 @@
 //!
 //! Fixed host (127.0.0.1), no TLS, no redirects, no request bodies: exactly
 //! what reading `/api/*` from the shell requires, with no HTTP dependency.
+//!
+//! `timeout` bounds the read and the write after the handshake. The handshake
+//! has its own cap: `TcpStream::connect` applies neither timeout, and startup
+//! probes every dashboard port before it will spawn. On the windows-2022
+//! desktop-shell job for 6e08315, that scan spent 64.73s inside
+//! `ensure_server_reports_missing_cli_deterministically` (about two seconds
+//! per port). A loopback listener accepts well inside the handshake budget.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
+/// Loopback handshake cap. A closed port refuses immediately; a port that
+/// never completes the handshake must not inherit the multi-second read budget.
+const CONNECT_BUDGET: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub struct Response {
@@ -24,7 +34,9 @@ pub fn get(port: u16, path: &str, timeout: Duration) -> Result<Response, String>
         .map_err(|_| "connect_failed")?
         .next()
         .ok_or("no_address")?;
-    let mut stream = TcpStream::connect(address).map_err(|_| "connect_failed")?;
+    let connect_budget = timeout.min(CONNECT_BUDGET);
+    let mut stream =
+        TcpStream::connect_timeout(&address, connect_budget).map_err(|_| "connect_failed")?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|_| "timeout_setup")?;
@@ -95,6 +107,21 @@ mod tests {
     fn connection_failures_map_to_fixed_errors() {
         let error = get(1, "/api/snapshot", Duration::from_millis(300)).unwrap_err();
         assert_eq!(error, "connect_failed");
+    }
+
+    #[test]
+    fn refused_connect_does_not_consume_the_read_timeout() {
+        // Port 1 stays closed. The read budget is intentionally long: before
+        // connect_timeout, Windows spent about two seconds in connect and
+        // never applied this 30s value. The handshake cap is 200ms.
+        let started = std::time::Instant::now();
+        let error = get(1, "/api/snapshot", Duration::from_secs(30)).unwrap_err();
+        assert_eq!(error, "connect_failed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "refused connect waited {elapsed:?}"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ HTTP 路径，壳只是只读消费者加一个子进程的管理者。
 | 壳做 | 壳不做 |
 |---|---|
 | 窗口加载 `http://127.0.0.1:<port>/` | 不重实现任何来源/出口逻辑 |
-| 启动时复用已有的 dashboard；没有才 spawn `nmd gui`（固定 argv、无 shell、stdin 关闭） | 绝不杀非自己启动的服务 |
+| 启动时复用已有的 dashboard；没有才 spawn `nmd gui`（固定 argv、无 shell、stdin 关闭）。复用同时探测 8765 起的 32 个回环端口，取最小的 `nmd-observability`。握手有独立短超时，一个不响应的端口不会按端口个数把启动时间累加起来 | 绝不杀非自己启动的服务 |
 | 托盘：显示/隐藏、退出；tooltip 显示当前出口显示名（10s 只读轮询 `/api/sources`） | 不绕过 Host/Origin/键集等任何后端防护 |
 | 系统通知：`auto_events` 的新事件（去重、启动静默窗，10s 只读轮询 `/api/snapshot`） | 不打包/不接入 install.sh（Phase 2 再议） |
 | 退出（含 SIGTERM/SIGINT）时只回收自己启动的子进程 | 不新增写端点 |

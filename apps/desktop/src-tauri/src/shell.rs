@@ -30,8 +30,31 @@ pub fn component_of(port: u16) -> Option<String> {
 }
 
 pub fn find_existing_server() -> Option<u16> {
-    (PORT_RANGE_START..PORT_RANGE_START + PORT_RANGE)
-        .find(|&port| component_of(port).as_deref() == Some("nmd-observability"))
+    select_port(&|port| component_of(port).as_deref() == Some("nmd-observability"))
+}
+
+/// Lowest port from 8765 through 8796 for which `probe` is true.
+///
+/// Probes run together and the result is still the lowest match, the same
+/// port a sequential search would return. A sequential walk multiplies one
+/// stalled handshake by all 32 ports: the windows-2022 shell job on 6e08315
+/// spent 64.73s failing the missing-CLI scan that way.
+fn select_port(probe: &(impl Fn(u16) -> bool + Sync)) -> Option<u16> {
+    std::thread::scope(|scope| {
+        let guards: Vec<_> = (0..PORT_RANGE)
+            .map(|offset| {
+                let port = PORT_RANGE_START + offset;
+                scope.spawn(move || probe(port))
+            })
+            .collect();
+        let mut found = None;
+        for (index, guard) in guards.into_iter().enumerate() {
+            if guard.join().expect("dashboard probe") && found.is_none() {
+                found = Some(PORT_RANGE_START + u16::try_from(index).expect("port offset"));
+            }
+        }
+        found
+    })
 }
 
 pub fn resolve_nmd() -> Option<PathBuf> {
@@ -139,6 +162,7 @@ mod tests {
 
     #[test]
     fn ensure_server_reports_missing_cli_deterministically() {
+        let started = std::time::Instant::now();
         match ensure_server_with(|| None) {
             Err(message) => assert_eq!(message, "nmd_not_found"),
             Ok(Started::Reused(port)) => {
@@ -148,6 +172,32 @@ mod tests {
             }
             Ok(Started::Spawned { .. }) => panic!("must never spawn with an unresolvable nmd"),
         }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "missing-cli startup scan took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn port_scan_keeps_the_lowest_match_without_serializing_slow_probes() {
+        let hit = PORT_RANGE_START + 4;
+        assert_eq!(select_port(&|port| port == hit), Some(hit));
+        assert_eq!(select_port(&|_| false), None);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            select_port(&|_| {
+                std::thread::sleep(Duration::from_millis(200));
+                false
+            }),
+            None
+        );
+        let elapsed = started.elapsed();
+        // 32 sequential 200ms probes would take more than six seconds.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "parallel port scan took {elapsed:?}"
+        );
     }
 
     #[test]
