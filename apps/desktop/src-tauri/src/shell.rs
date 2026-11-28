@@ -20,8 +20,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Readiness is defined by the dashboard's own machine contract: only the real
 /// NMD dashboard (component field) counts, never an unrelated local service.
-pub fn component_of(port: u16) -> Option<String> {
-    let response = http_probe::get(port, "/api/capabilities", PROBE_TIMEOUT).ok()?;
+fn component_from(response: http_probe::Response) -> Option<String> {
     if response.status != 200 {
         return None;
     }
@@ -29,28 +28,46 @@ pub fn component_of(port: u16) -> Option<String> {
     value.get("component")?.as_str().map(str::to_owned)
 }
 
+pub fn component_of(port: u16) -> Option<String> {
+    http_probe::get(port, "/api/capabilities", PROBE_TIMEOUT)
+        .ok()
+        .and_then(component_from)
+}
+
 pub fn find_existing_server() -> Option<u16> {
-    select_port(&|port| component_of(port).as_deref() == Some("nmd-observability"))
+    select_port(&|port, stop| {
+        http_probe::get_cancellable(port, "/api/capabilities", PROBE_TIMEOUT, stop)
+            .ok()
+            .and_then(component_from)
+            .as_deref()
+            == Some("nmd-observability")
+    })
 }
 
 /// Lowest port from 8765 through 8796 for which `probe` is true.
 ///
-/// Probes run together and the result is still the lowest match, the same
-/// port a sequential search would return. A sequential walk multiplies one
-/// stalled handshake by all 32 ports: the windows-2022 shell job on 6e08315
-/// spent 64.73s failing the missing-CLI scan that way.
-fn select_port(probe: &(impl Fn(u16) -> bool + Sync)) -> Option<u16> {
+/// Probes run together and the result is still the lowest match. A sequential
+/// walk multiplies one stalled handshake by all 32 ports: the windows-2022
+/// shell job on 6e08315 spent 64.73s failing the missing-CLI scan that way.
+///
+/// Once a lower port matches, `stop` is set. `probe` must return when it sees
+/// that flag. The scope joins every thread before returning, so a higher port
+/// that ignores the flag keeps the scan alive.
+fn select_port(probe: &(impl Fn(u16, &AtomicBool) -> bool + Sync)) -> Option<u16> {
+    let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let stop = &stop;
         let guards: Vec<_> = (0..PORT_RANGE)
             .map(|offset| {
                 let port = PORT_RANGE_START + offset;
-                scope.spawn(move || probe(port))
+                scope.spawn(move || probe(port, stop))
             })
             .collect();
         let mut found = None;
         for (index, guard) in guards.into_iter().enumerate() {
             if guard.join().expect("dashboard probe") && found.is_none() {
                 found = Some(PORT_RANGE_START + u16::try_from(index).expect("port offset"));
+                stop.store(true, Ordering::Release);
             }
         }
         found
@@ -182,11 +199,11 @@ mod tests {
     #[test]
     fn port_scan_keeps_the_lowest_match_without_serializing_slow_probes() {
         let hit = PORT_RANGE_START + 4;
-        assert_eq!(select_port(&|port| port == hit), Some(hit));
-        assert_eq!(select_port(&|_| false), None);
+        assert_eq!(select_port(&|port, _| port == hit), Some(hit));
+        assert_eq!(select_port(&|_, _| false), None);
         let started = std::time::Instant::now();
         assert_eq!(
-            select_port(&|_| {
+            select_port(&|_, _| {
                 std::thread::sleep(Duration::from_millis(200));
                 false
             }),
@@ -197,6 +214,31 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "parallel port scan took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_lower_match_does_not_wait_for_a_higher_port() {
+        let hit = PORT_RANGE_START;
+        let started = std::time::Instant::now();
+        let found = select_port(&|port, stop| {
+            if port == hit {
+                return true;
+            }
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(3) {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        });
+        assert_eq!(found, Some(hit));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "higher ports held the scan for {elapsed:?}"
         );
     }
 
